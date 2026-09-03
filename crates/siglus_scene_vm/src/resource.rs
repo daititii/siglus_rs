@@ -18,6 +18,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use std::path::Component;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::ffi::{OsStr, OsString};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::time::SystemTime;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::wasm_vfs::SiglusVfs;
 
@@ -60,7 +65,21 @@ pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     let Some(resolved) = resolve_windows_case_insensitive_file(path)? else {
         bail!("file not found: {}", path.display());
     };
-    Ok(fs::read(resolved)?)
+    match fs::read(&resolved) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // A positive cache entry can become stale if an external process
+            // replaces/removes a resource while the engine is running. Drop
+            // the affected directory state and resolve once more.
+            invalidate_game_path_cache(path);
+            invalidate_game_path_cache(&resolved);
+            let Some(re_resolved) = resolve_windows_case_insensitive_file(path)? else {
+                bail!("file not found: {}", path.display());
+            };
+            Ok(fs::read(re_resolved)?)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -74,13 +93,326 @@ pub fn read_file_to_string(path: &Path) -> Result<String> {
     Ok(String::from_utf8(read_file_bytes(path)?)?)
 }
 
-fn path_component_eq_windows(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    unix
+))]
+type FoldedPathComponent = Vec<u8>;
+
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    windows
+))]
+type FoldedPathComponent = Vec<u16>;
+
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(any(unix, windows))
+))]
+type FoldedPathComponent = String;
+
+/// Fold only ASCII case while preserving every non-ASCII code unit/byte.
+///
+/// Siglus asset names are overwhelmingly ASCII + Japanese.  This deliberately
+/// avoids locale-sensitive Unicode lower-casing/normalization while matching
+/// the case-insensitive behavior that matters for original Windows game data.
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    unix
+))]
+fn fold_windows_component(name: &OsStr) -> FoldedPathComponent {
+    use std::os::unix::ffi::OsStrExt;
+
+    name.as_bytes()
+        .iter()
+        .map(|b| b.to_ascii_lowercase())
+        .collect()
+}
+
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    windows
+))]
+fn fold_windows_component(name: &OsStr) -> FoldedPathComponent {
+    use std::os::windows::ffi::OsStrExt;
+
+    name.encode_wide()
+        .map(|unit| {
+            if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                unit + (b'a' - b'A') as u16
+            } else {
+                unit
+            }
+        })
+        .collect()
+}
+
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(any(unix, windows))
+))]
+fn fold_windows_component(name: &OsStr) -> FoldedPathComponent {
+    name.to_string_lossy()
+        .chars()
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Debug, Clone)]
+enum FoldedDirectoryEntry {
+    Unique(OsString),
+    Conflict(Vec<OsString>),
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Debug)]
+struct DirectoryCaseIndex {
+    modified: Option<SystemTime>,
+    entries: HashMap<FoldedPathComponent, FoldedDirectoryEntry>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Debug, Default)]
+struct NativePathResolverCache {
+    /// Positive full-file resolutions.  We intentionally do not cache misses:
+    /// files such as captures/save thumbnails can be created while the engine
+    /// is running.
+    positive_files: HashMap<PathBuf, PathBuf>,
+    /// Lazy per-directory case-folded entry maps.  A directory is enumerated
+    /// only after exact lookup failed for a component under that directory.
+    directories: HashMap<PathBuf, DirectoryCaseIndex>,
+}
+
+/// Native Windows-compatible path resolver cache.
+///
+/// This is deliberately a directory cache, not a startup-time project-wide
+/// file database.  Keys are absolute directory/request paths, so independent
+/// game roots coexist without sharing lookup state.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+static NATIVE_PATH_RESOLVER_CACHE: std::sync::Mutex<Option<NativePathResolverCache>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn native_cache_key(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn directory_modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn scan_directory_case_index(parent: &Path) -> Result<Option<DirectoryCaseIndex>> {
+    let read_dir = match fs::read_dir(parent) {
+        Ok(v) => v,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut entries: HashMap<FoldedPathComponent, FoldedDirectoryEntry> = HashMap::new();
+    for entry in read_dir {
+        let entry = entry?;
+        let name = entry.file_name();
+        let key = fold_windows_component(&name);
+        use std::collections::hash_map::Entry;
+        match entries.entry(key) {
+            Entry::Vacant(v) => {
+                v.insert(FoldedDirectoryEntry::Unique(name));
+            }
+            Entry::Occupied(mut o) => {
+                let value = o.get_mut();
+                match value {
+                    FoldedDirectoryEntry::Unique(existing) => {
+                        if existing != &name {
+                            let first = existing.clone();
+                            *value = FoldedDirectoryEntry::Conflict(vec![first, name]);
+                        }
+                    }
+                    FoldedDirectoryEntry::Conflict(names) => {
+                        if !names.iter().any(|v| v == &name) {
+                            names.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for value in entries.values_mut() {
+        if let FoldedDirectoryEntry::Conflict(names) = value {
+            names.sort();
+            names.dedup();
+        }
+    }
+
+    Ok(Some(DirectoryCaseIndex {
+        modified: directory_modified(parent),
+        entries,
+    }))
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn cached_directory_entry(
+    parent: &Path,
+    requested: &OsStr,
+    force_refresh: bool,
+) -> Result<Option<FoldedDirectoryEntry>> {
+    let parent_key = native_cache_key(parent);
+    let folded = fold_windows_component(requested);
+
+    let (has_index, cached_modified, cached_entry) = {
+        let mut guard = NATIVE_PATH_RESOLVER_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = guard.get_or_insert_with(NativePathResolverCache::default);
+        match cache.directories.get(&parent_key) {
+            Some(index) => (
+                true,
+                index.modified,
+                index.entries.get(&folded).cloned(),
+            ),
+            None => (false, None, None),
+        }
+    };
+
+    if !force_refresh {
+        if let Some(entry) = cached_entry {
+            return Ok(Some(entry));
+        }
+        if has_index && directory_modified(parent) == cached_modified {
+            return Ok(None);
+        }
+    }
+
+    let Some(index) = scan_directory_case_index(parent)? else {
+        let mut guard = NATIVE_PATH_RESOLVER_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = guard.get_or_insert_with(NativePathResolverCache::default);
+        cache.directories.remove(&parent_key);
+        return Ok(None);
+    };
+    let result = index.entries.get(&folded).cloned();
+
+    let mut guard = NATIVE_PATH_RESOLVER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(NativePathResolverCache::default);
+    cache.directories.insert(parent_key, index);
+    Ok(result)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn resolve_cached_directory_entry(
+    parent: &Path,
+    requested: &OsStr,
+) -> Result<Option<PathBuf>> {
+    let mut refreshed = false;
+    loop {
+        let Some(entry) = cached_directory_entry(parent, requested, refreshed)? else {
+            return Ok(None);
+        };
+        match entry {
+            FoldedDirectoryEntry::Unique(actual_name) => {
+                let candidate = parent.join(actual_name);
+                if candidate.exists() {
+                    return Ok(Some(candidate));
+                }
+                if refreshed {
+                    return Ok(None);
+                }
+                // The directory changed after it was indexed.  Rebuild once;
+                // this is also the external-mutation fallback for stale hits.
+                refreshed = true;
+            }
+            FoldedDirectoryEntry::Conflict(names) => {
+                bail!(
+                    "case-insensitive path conflict for {} under {}: {}",
+                    requested.to_string_lossy(),
+                    parent.display(),
+                    names
+                        .iter()
+                        .map(|name| parent.join(name).display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn positive_file_cache_get(path: &Path) -> Option<PathBuf> {
+    let key = native_cache_key(path);
+    let mut guard = NATIVE_PATH_RESOLVER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(NativePathResolverCache::default);
+    cache.positive_files.get(&key).cloned()
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn positive_file_cache_insert(path: &Path, resolved: &Path) {
+    let key = native_cache_key(path);
+    let mut guard = NATIVE_PATH_RESOLVER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(NativePathResolverCache::default);
+    cache.positive_files.insert(key, resolved.to_path_buf());
+}
+
+/// Invalidate resolver state for a file/directory that was created, removed or
+/// renamed by the engine.  External mutations are detected lazily from parent
+/// directory metadata on misses/stale directory hits; engine-owned writes use
+/// this hook so even filesystems with coarse directory mtimes remain correct.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn invalidate_game_path_cache(path: &Path) {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent_key = native_cache_key(parent);
+    let path_key = native_cache_key(path);
+
+    let mut guard = NATIVE_PATH_RESOLVER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(NativePathResolverCache::default);
+    cache.directories.retain(|dir, _| {
+        dir != &parent_key && dir != &path_key && !dir.starts_with(&path_key)
+    });
+    cache.positive_files.retain(|requested, resolved| {
+        if requested == &path_key || requested.starts_with(&path_key) {
+            return false;
+        }
+        let resolved_key = native_cache_key(resolved);
+        let requested_parent = requested.parent();
+        let resolved_parent = resolved_key.parent();
+        requested_parent != Some(parent_key.as_path())
+            && resolved_parent != Some(parent_key.as_path())
+            && !resolved_key.starts_with(&path_key)
+    });
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) fn invalidate_game_path_cache(_path: &Path) {
+    // Browser File objects are registered as an immutable snapshot for one
+    // launch. Runtime-generated browser files are not currently inserted into
+    // that JavaScript index.
 }
 
 pub(crate) fn resolve_windows_case_insensitive_path(path: &Path) -> Result<Option<PathBuf>> {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
+        // `siglusFileExists` already uses the browser-side case-insensitive
+        // index built from the selected directory, so no Rust-side directory
+        // walk is necessary here.
         if wasm_path_exists(path) {
             return Ok(Some(path.to_path_buf()));
         }
@@ -88,63 +420,40 @@ pub(crate) fn resolve_windows_case_insensitive_path(path: &Path) -> Result<Optio
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    if path.exists() {
-        return Ok(Some(path.to_path_buf()));
-    }
+    {
+        if path.exists() {
+            return Ok(Some(path.to_path_buf()));
+        }
 
-    let mut cur = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => cur.push(prefix.as_os_str()),
-            Component::RootDir => cur.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => cur.push(".."),
-            Component::Normal(name) => {
-                let exact = cur.join(name);
-                if exact.exists() {
-                    cur = exact;
-                    continue;
-                }
-
-                let parent = if cur.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    cur.as_path()
-                };
-                if !parent.is_dir() {
-                    return Ok(None);
-                }
-
-                let mut matches = Vec::new();
-                for entry in fs::read_dir(parent)? {
-                    let entry = entry?;
-                    if path_component_eq_windows(&entry.file_name(), name) {
-                        matches.push(entry.path());
+        let mut cur = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => cur.push(prefix.as_os_str()),
+                Component::RootDir => cur.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => cur.push(".."),
+                Component::Normal(name) => {
+                    let exact = cur.join(name);
+                    if exact.exists() {
+                        cur = exact;
+                        continue;
                     }
-                }
 
-                match matches.len() {
-                    0 => return Ok(None),
-                    1 => cur = matches.remove(0),
-                    _ => {
-                        matches.sort();
-                        bail!(
-                            "case-insensitive path conflict for {} under {}: {}",
-                            name.to_string_lossy(),
-                            parent.display(),
-                            matches
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                    }
+                    let parent = if cur.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        cur.as_path()
+                    };
+                    let Some(actual) = resolve_cached_directory_entry(parent, name)? else {
+                        return Ok(None);
+                    };
+                    cur = actual;
                 }
             }
         }
-    }
 
-    Ok(cur.exists().then_some(cur))
+        Ok(cur.exists().then_some(cur))
+    }
 }
 
 pub(crate) fn resolve_windows_case_insensitive_file(path: &Path) -> Result<Option<PathBuf>> {
@@ -155,52 +464,22 @@ pub(crate) fn resolve_windows_case_insensitive_file(path: &Path) -> Result<Optio
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {
-        if let Some(cached) = resolve_game_file_cached(path) {
-            return Ok(cached);
+        if let Some(cached) = positive_file_cache_get(path) {
+            return Ok(Some(cached));
         }
-        let resolved = resolve_windows_case_insensitive_file_uncached(path);
-        if let Ok(Some(p)) = &resolved {
-            cache_resolved_game_file(path, Some(p.clone()));
+        if path.is_file() {
+            positive_file_cache_insert(path, path);
+            return Ok(Some(path.to_path_buf()));
         }
-        resolved
+        let Some(resolved) = resolve_windows_case_insensitive_path(path)? else {
+            return Ok(None);
+        };
+        if !resolved.is_file() {
+            return Ok(None);
+        }
+        positive_file_cache_insert(path, &resolved);
+        Ok(Some(resolved))
     }
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-fn resolve_windows_case_insensitive_file_uncached(path: &Path) -> Result<Option<PathBuf>> {
-    if path.is_file() {
-        return Ok(Some(path.to_path_buf()));
-    }
-    let Some(resolved) = resolve_windows_case_insensitive_path(path)? else {
-        return Ok(None);
-    };
-    Ok(resolved.is_file().then_some(resolved))
-}
-
-/// Cache of case-insensitive game file resolutions. Resource lookups run on
-/// every frame for animated sprites; re-stat-ing the same path on FUSE-backed
-/// Android storage is extremely slow.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-static GAME_FILE_RESOLVE_CACHE: std::sync::Mutex<
-    Option<HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
-> = std::sync::Mutex::new(None);
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-fn resolve_game_file_cached(path: &Path) -> Option<Option<PathBuf>> {
-    let mut guard = GAME_FILE_RESOLVE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.get(path).cloned()
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-fn cache_resolved_game_file(path: &Path, resolved: Option<PathBuf>) {
-    let mut guard = GAME_FILE_RESOLVE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(path.to_path_buf(), resolved);
 }
 
 /// Resolve an existing game path using the Windows case-insensitive semantics
@@ -250,7 +529,18 @@ pub(crate) fn open_game_file(path: &Path) -> Result<fs::File> {
     let Some(resolved) = resolve_windows_case_insensitive_file(path)? else {
         bail!("file not found: {}", path.display());
     };
-    Ok(fs::File::open(resolved)?)
+    match fs::File::open(&resolved) {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            invalidate_game_path_cache(path);
+            invalidate_game_path_cache(&resolved);
+            let Some(re_resolved) = resolve_windows_case_insensitive_file(path)? else {
+                bail!("file not found: {}", path.display());
+            };
+            Ok(fs::File::open(re_resolved)?)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Return the size of an existing game file while preserving the same
@@ -271,7 +561,18 @@ pub(crate) fn game_file_len(path: &Path) -> Result<u64> {
         let Some(resolved) = resolve_windows_case_insensitive_file(path)? else {
             bail!("file not found: {}", path.display());
         };
-        Ok(fs::metadata(resolved)?.len())
+        match fs::metadata(&resolved) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                invalidate_game_path_cache(path);
+                invalidate_game_path_cache(&resolved);
+                let Some(re_resolved) = resolve_windows_case_insensitive_file(path)? else {
+                    bail!("file not found: {}", path.display());
+                };
+                Ok(fs::metadata(re_resolved)?.len())
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -673,24 +974,30 @@ pub fn find_audio_path_with_append_dir(
     );
 }
 
-/// Append-dir list cache. `ordered_append_dirs` is reached from per-frame
-/// resource lookups; re-parsing Select.ini and case-fold directory scans on
-/// every frame costs hundreds of milliseconds on FUSE-backed Android storage.
-static APPEND_DIRS_CACHE: std::sync::Mutex<Option<(std::path::PathBuf, Vec<String>)>> =
+/// Per-project append-dir list cache. `Select.ini` is configuration state, not
+/// a live resource directory; parsing it once per concrete project root avoids
+/// repeated filesystem work without turning file-existence misses into global
+/// truths.
+static APPEND_DIRS_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, Vec<String>>>> =
     std::sync::Mutex::new(None);
 
 pub(crate) fn ordered_append_dirs(project_dir: &Path, current_append_dir: &str) -> Vec<String> {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let project_key = native_cache_key(project_dir);
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let project_key = project_dir.to_path_buf();
+
     let mut dirs = {
-        let mut guard = APPEND_DIRS_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        match &*guard {
-            Some((cached_project, cached_dirs)) if cached_project == project_dir => {
-                cached_dirs.clone()
-            }
-            _ => {
-                let dirs = parse_select_ini_append_dirs(project_dir);
-                *guard = Some((project_dir.to_path_buf(), dirs.clone()));
-                dirs
-            }
+        let mut guard = APPEND_DIRS_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some(cached_dirs) = cache.get(&project_key) {
+            cached_dirs.clone()
+        } else {
+            let dirs = parse_select_ini_append_dirs(project_dir);
+            cache.insert(project_key, dirs.clone());
+            dirs
         }
     };
     if dirs.is_empty() {

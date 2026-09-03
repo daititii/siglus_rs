@@ -397,7 +397,17 @@ impl BgmEngine {
     }
 
     pub fn set_current_append_dir(&mut self, append_dir: impl Into<String>) {
-        self.current_append_dir = append_dir.into();
+        let append_dir = append_dir.into();
+        if self.current_append_dir != append_dir {
+            self.current_append_dir = append_dir;
+        }
+    }
+
+    pub fn set_current_append_dir_ref(&mut self, append_dir: &str) {
+        if self.current_append_dir != append_dir {
+            self.current_append_dir.clear();
+            self.current_append_dir.push_str(append_dir);
+        }
     }
 
     pub fn volume_raw(&self) -> u8 {

@@ -610,6 +610,7 @@ struct PipelineKey {
     blend: SpriteBlend,
     alpha_blend: bool,
     use_depth: bool,
+    depth_write: bool,
     depth_attachment: bool,
     cull_back: bool,
     mesh_fx_variant: u64,
@@ -942,6 +943,16 @@ fn uses_depth_pipeline(sprite: &crate::layer::Sprite) -> bool {
         || sprite.rotate_y.abs() > f32::EPSILON
 }
 
+fn depth_write_enabled(use_depth: bool, alpha_blend: bool) -> bool {
+    use_depth && !alpha_blend
+}
+
+fn d3d_front_face() -> wgpu::FrontFace {
+    // Tona3 enables D3DCULL_CCW, which removes counter-clockwise triangles;
+    // Direct3D's surviving/front triangles are therefore clockwise.
+    wgpu::FrontFace::Cw
+}
+
 fn pipeline_cull_back(sprite: &crate::layer::Sprite, material_cull_disable: bool) -> bool {
     uses_depth_pipeline(sprite) && sprite.culling && !material_cull_disable
 }
@@ -1097,6 +1108,7 @@ fn shadow_pipeline_key(src: PipelineKey, pipeline_name: Option<&str>) -> Pipelin
         blend: SpriteBlend::Normal,
         alpha_blend: false,
         use_depth: true,
+        depth_write: true,
         depth_attachment: true,
         cull_back: src.cull_back,
         mesh_fx_variant: src.mesh_fx_variant,
@@ -1185,19 +1197,28 @@ fn transform_model_point_world(
     anchor_x: f32,
     anchor_y: f32,
 ) -> [f32; 3] {
-    let mut p = RVec3::new(
-        local[0] - sprite.pivot_x,
-        local[1] - sprite.pivot_y,
-        local[2] - sprite.pivot_z,
-    );
+    // tona3's mesh world matrix is exactly Scale * Rotation * Translation;
+    // rp.center is used to build polygon vertices but is not part of a mesh
+    // transform.  Billboards still use their image-space center below.
+    let mesh = sprite.mesh_kind != 0 && !sprite.billboard;
+    let mut p = if mesh {
+        RVec3::new(local[0], local[1], local[2])
+    } else {
+        RVec3::new(
+            local[0] - sprite.pivot_x,
+            local[1] - sprite.pivot_y,
+            local[2] - sprite.pivot_z,
+        )
+    };
     p.x *= sprite.scale_x;
     p.y *= sprite.scale_y;
     p.z *= sprite.scale_z;
     if sprite.billboard {
         let (_, _, right, up) = sprite_camera_basis(sprite);
         let (s, c) = sprite.rotate.sin_cos();
-        let rx = p.x * c - p.y * s;
-        let ry = p.x * s + p.y * c;
+        let image_y = -p.y;
+        let rx = p.x * c - image_y * s;
+        let ry = p.x * s + image_y * c;
         let anchor = RVec3::new(
             anchor_x + sprite.pivot_x,
             anchor_y + sprite.pivot_y,
@@ -1210,14 +1231,20 @@ fn transform_model_point_world(
         ));
         return [out.x, out.y, out.z];
     }
+    // D3DXMatrixRotationYawPitchRoll(yaw, pitch, roll) applies roll,
+    // then pitch, then yaw to row vectors.
+    p = rrotate_z(p, sprite.rotate);
     p = rrotate_x(p, sprite.rotate_x);
     p = rrotate_y(p, sprite.rotate_y);
-    p = rrotate_z(p, sprite.rotate);
-    p = p.add(RVec3::new(
-        anchor_x + sprite.pivot_x,
-        anchor_y + sprite.pivot_y,
-        sprite.z + sprite.pivot_z,
-    ));
+    p = if mesh {
+        p.add(RVec3::new(anchor_x, anchor_y, sprite.z))
+    } else {
+        p.add(RVec3::new(
+            anchor_x + sprite.pivot_x,
+            anchor_y + sprite.pivot_y,
+            sprite.z + sprite.pivot_z,
+        ))
+    };
     [p.x, p.y, p.z]
 }
 
@@ -1236,9 +1263,9 @@ fn transform_model_normal_world(sprite: &crate::layer::Sprite, normal: [f32; 3])
         .normalize();
         return [out.x, out.y, out.z];
     }
+    n = rrotate_z(n, sprite.rotate);
     n = rrotate_x(n, sprite.rotate_x);
     n = rrotate_y(n, sprite.rotate_y);
-    n = rrotate_z(n, sprite.rotate);
     n = n.normalize();
     [n.x, n.y, n.z]
 }
@@ -1527,12 +1554,12 @@ fn vertex_uniform_for_mesh(
     } else {
         1.0
     };
-    let hfov = sprite
+    let vfov = sprite
         .camera_view_angle_deg
         .to_radians()
         .clamp(1e-3, std::f32::consts::PI - 1e-3);
-    let tan_half_h = (hfov * 0.5).tan().max(1e-3);
-    let tan_half_v = (tan_half_h / aspect.max(1e-3)).max(1e-3);
+    let tan_half_v = (vfov * 0.5).tan().max(1e-3);
+    let tan_half_h = (tan_half_v * aspect.max(1e-3)).max(1e-3);
     let (shadow_eye, shadow_forward, shadow_right, shadow_up, shadow_params) =
         shadow_uniform_data(sprite);
     VsUniform {
@@ -2148,9 +2175,9 @@ impl Renderer {
         let default_aux = create_solid_texture(&device, &queue, [255, 255, 255, 255])?;
         let fog_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("siglus-cfx-fog-sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
@@ -2159,10 +2186,10 @@ impl Renderer {
             ..Default::default()
         });
         let mesh_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("siglus-tona3-mesh-wrap-sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
+            label: Some("siglus-tona3-mesh-clamp-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Linear,
@@ -2479,14 +2506,15 @@ impl Renderer {
         view: &wgpu::TextureView,
     ) -> Result<()> {
         let _ = self.prepare_draws(images, sprites, true)?;
-        let draws_for_pass = self.draws.clone();
+        let draw_count = self.draws.len();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("siglus-direct-present-encoder"),
             });
 
-        let shadow_indices: Vec<usize> = draws_for_pass
+        let shadow_indices: Vec<usize> = self
+            .draws
             .iter()
             .enumerate()
             .filter_map(|(idx, cmd)| cmd.shadow_cast.then_some(idx))
@@ -2520,7 +2548,7 @@ impl Renderer {
             &mut encoder,
             ColorTarget::External(view),
             DepthTarget::Surface,
-            0..draws_for_pass.len(),
+            0..draw_count,
             wgpu::LoadOp::Clear(wgpu::Color::BLACK),
             true,
             None,
@@ -2749,20 +2777,28 @@ impl Renderer {
                 || has_tonecurve
                 || has_wipe_src
                 || sprite.wipe_fx_mode != 0;
+            let alpha_blend = if matches!(technique.special, TechniqueSpecial::Overlay) {
+                false
+            } else {
+                sprite.alpha_blend || requires_alpha_composition
+            };
             let pipeline_key = PipelineKey {
                 technique,
                 blend: sprite.blend,
-                alpha_blend: if matches!(technique.special, TechniqueSpecial::Overlay) {
-                    false
-                } else {
-                    sprite.alpha_blend || requires_alpha_composition
-                },
+                alpha_blend,
                 use_depth,
+                depth_write: depth_write_enabled(use_depth, alpha_blend),
                 depth_attachment: true,
                 cull_back: pipeline_cull_back(sprite, false),
                 mesh_fx_variant: 0,
                 pipeline_name: String::new(),
-                program: pipeline_program_for_special(technique.special),
+                // Mesh batches select the concrete program from each primitive
+                // below; this base key is never submitted for that path.
+                program: if mesh_batches.is_some() {
+                    EffectProgram::Sprite2D
+                } else {
+                    pipeline_program_for_special(technique.special)
+                },
             };
 
             if let Some(mesh_batches) = mesh_batches {
@@ -2800,16 +2836,20 @@ impl Renderer {
                         } else {
                             MeshDrawKind::SpriteQuad
                         };
+                    let batch_alpha_blend = if matches!(
+                        batch_technique.special,
+                        TechniqueSpecial::Overlay
+                    ) {
+                        false
+                    } else {
+                        sprite.alpha_blend || requires_alpha_composition
+                    };
                     let batch_pipeline_key = PipelineKey {
                         technique: batch_technique,
                         blend: sprite.blend,
-                        alpha_blend: if matches!(batch_technique.special, TechniqueSpecial::Overlay)
-                        {
-                            false
-                        } else {
-                            sprite.alpha_blend || requires_alpha_composition
-                        },
+                        alpha_blend: batch_alpha_blend,
                         use_depth,
+                        depth_write: depth_write_enabled(use_depth, batch_alpha_blend),
                         depth_attachment: true,
                         cull_back: pipeline_cull_back(sprite, batch.material.cull_disable),
                         mesh_fx_variant: crate::mesh3d::mesh_effect_variant_bits_from_runtime_desc(
@@ -3423,6 +3463,7 @@ impl Renderer {
             blend: SpriteBlend::Normal,
             alpha_blend: false,
             use_depth: false,
+            depth_write: false,
             depth_attachment: false,
             cull_back: false,
             mesh_fx_variant: 0,
@@ -3470,6 +3511,7 @@ impl Renderer {
             blend: SpriteBlend::Normal,
             alpha_blend: false,
             use_depth: false,
+            depth_write: false,
             depth_attachment: false,
             cull_back: false,
             mesh_fx_variant: 0,
@@ -3507,14 +3549,15 @@ impl Renderer {
         initial: Option<BackdropTarget>,
     ) -> Result<BackdropTarget> {
         let blit_range = self.prepare_draws(images, sprites, false)?;
-        let draws_for_pass = self.draws.clone();
+        let draw_count = self.draws.len();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("siglus-offscreen-scene-encoder"),
             });
 
-        let shadow_indices: Vec<usize> = draws_for_pass
+        let shadow_indices: Vec<usize> = self
+            .draws
             .iter()
             .enumerate()
             .filter_map(|(idx, cmd)| cmd.shadow_cast.then_some(idx))
@@ -3562,15 +3605,15 @@ impl Renderer {
         )?;
 
         let mut index = 0usize;
-        while index < draws_for_pass.len() {
+        while index < draw_count {
             let is_overlay = matches!(
-                draws_for_pass[index].pipeline_key.technique.special,
+                self.draws[index].pipeline_key.technique.special,
                 TechniqueSpecial::Overlay
             );
             let start = index;
-            while index < draws_for_pass.len()
+            while index < draw_count
                 && matches!(
-                    draws_for_pass[index].pipeline_key.technique.special,
+                    self.draws[index].pipeline_key.technique.special,
                     TechniqueSpecial::Overlay
                 ) == is_overlay
             {
@@ -4475,7 +4518,7 @@ impl Renderer {
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
+                    front_face: d3d_front_face(),
                     cull_mode: if key.cull_back {
                         Some(wgpu::Face::Back)
                     } else {
@@ -4491,7 +4534,7 @@ impl Renderer {
                     } else {
                         wgpu::TextureFormat::Depth32Float
                     },
-                    depth_write_enabled: key.use_depth,
+                    depth_write_enabled: key.depth_write,
                     depth_compare: if key.use_depth {
                         wgpu::CompareFunction::LessEqual
                     } else {
@@ -4783,6 +4826,7 @@ impl Renderer {
             blend: SpriteBlend::Normal,
             alpha_blend: false,
             use_depth: false,
+            depth_write: false,
             depth_attachment: false,
             cull_back: false,
             mesh_fx_variant: 0,
@@ -6091,6 +6135,23 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+#[cfg(test)]
+mod depth_state_tests {
+    use super::{d3d_front_face, depth_write_enabled};
+
+    #[test]
+    fn translucent_3d_sprites_test_depth_without_writing_it() {
+        assert!(depth_write_enabled(true, false));
+        assert!(!depth_write_enabled(true, true));
+        assert!(!depth_write_enabled(false, false));
+    }
+
+    #[test]
+    fn tona3_ccw_cull_uses_clockwise_front_faces() {
+        assert!(matches!(d3d_front_face(), wgpu::FrontFace::Cw));
+    }
+}
+
 fn texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -6766,13 +6827,15 @@ fn project_main(world: vec3<f32>) -> vec4<f32> {
     let cx = dot(rel, vs_u.camera_right.xyz);
     let cy = dot(rel, vs_u.camera_up.xyz);
     let cz = dot(rel, vs_u.camera_forward.xyz);
-    if (cz <= 1e-3) {
-      return vec4<f32>(2.0, 2.0, 2.0, 1.0);
-    }
-    let x_ndc = cx / (cz * max(vs_u.camera_params.x, 1e-3));
-    let y_ndc = cy / (cz * max(vs_u.camera_params.y, 1e-3));
-    let z_ndc = clamp((cz - 1.0) / 10000.0, 0.0, 1.0);
-    return vec4<f32>(x_ndc, y_ndc, z_ndc, 1.0);
+    let near = 1.0;
+    let far = 10000.0;
+    let x_clip = cx / max(vs_u.camera_params.x, 1e-3);
+    let y_clip = cy / max(vs_u.camera_params.y, 1e-3);
+    let z_clip = far / (far - near) * cz - near * far / (far - near);
+    // Preserve camera-space Z in clip W.  D3DXMatrixPerspectiveOffCenterLH
+    // does this in the original renderer; using pre-divided NDC with W=1
+    // makes texture coordinates interpolate affinely across 3D triangles.
+    return vec4<f32>(x_clip, y_clip, z_clip, cz);
   }
   let x_ndc = (world.x / max(vs_u.camera_params.z, 1.0)) * 2.0 - 1.0;
   let y_ndc = 1.0 - (world.y / max(vs_u.camera_params.w, 1.0)) * 2.0;

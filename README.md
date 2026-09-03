@@ -68,7 +68,7 @@ For full retail versions, a game-specific secondary key is usually required.
 
 There are several practical ways to obtain the key:
 
-1. Static extraction, when the game executable is not encrypted or obfuscated:
+1. Static extraction, when the game executable is not encrypted or obfuscated (recommended). The general idea can be found in this repository:
 
    https://github.com/xmoezzz/siglus_static_key_tool
 

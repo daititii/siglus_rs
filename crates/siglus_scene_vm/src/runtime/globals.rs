@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::assets::RgbaImage;
 use crate::runtime::gan::GanState;
@@ -928,7 +929,7 @@ pub struct SoundRoutingState {
     /// Cached `#CHRKOE.i` character-number lists parsed from the immutable
     /// Gameexe table. Re-parsing these entries on every routing update was the
     /// dominant per-frame allocation hotspot on mobile.
-    pub chrkoe_chara_lists_cache: Vec<Vec<i64>>,
+    pub chrkoe_chara_lists_cache: Arc<Vec<Vec<i64>>>,
 }
 
 impl Default for SoundRoutingState {
@@ -945,7 +946,7 @@ impl Default for SoundRoutingState {
             bgmfade2_cur_time: 0,
             bgmfade2_start_value: 255,
             bgmfade2_total_volume: 255,
-            chrkoe_chara_lists_cache: Vec::new(),
+            chrkoe_chara_lists_cache: Arc::new(Vec::new()),
         }
     }
 }
@@ -6044,6 +6045,10 @@ pub struct StageFormState {
 
     /// Stable slot assignment for embedded object lists and nested child objects.
     pub embedded_object_slots: HashMap<String, usize>,
+    /// Reverse membership index used by every-frame object scans.  The string
+    /// map above preserves stable semantic keys; this map makes the hot-path
+    /// "is this top-level slot actually an embedded backing slot?" query O(1).
+    pub embedded_object_slots_by_stage: HashMap<i64, HashSet<usize>>,
     pub next_embedded_object_slot: HashMap<i64, usize>,
     pub next_nested_object_slot: HashMap<i64, usize>,
 }
@@ -6954,11 +6959,26 @@ impl StageFormState {
             .unwrap_or(0)
     }
 
+    #[inline(always)]
     pub fn is_embedded_object_slot(&self, stage_idx: i64, slot: usize) -> bool {
+        self.embedded_object_slots_by_stage
+            .get(&stage_idx)
+            .is_some_and(|slots| slots.contains(&slot))
+    }
+
+    pub fn register_embedded_object_slot(&mut self, stage_idx: i64, key: String, slot: usize) {
+        self.embedded_object_slots.insert(key, slot);
+        self.embedded_object_slots_by_stage
+            .entry(stage_idx)
+            .or_default()
+            .insert(slot);
+    }
+
+    pub fn clear_embedded_object_slots_for_stage(&mut self, stage_idx: i64) {
         let prefix = format!("{stage_idx}:");
         self.embedded_object_slots
-            .iter()
-            .any(|(key, &mapped_slot)| mapped_slot == slot && key.starts_with(&prefix))
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.embedded_object_slots_by_stage.remove(&stage_idx);
     }
 }
 
@@ -7243,17 +7263,12 @@ impl GlobalState {
             if object_stage_id == 2 && !wipe_active {
                 continue;
             }
-            let embedded_prefix = format!("{object_stage_id}:");
-            let embedded_slots: HashSet<usize> = st
-                .embedded_object_slots
-                .iter()
-                .filter_map(|(key, &slot)| key.starts_with(&embedded_prefix).then_some(slot))
-                .collect();
+            let embedded_slots = st.embedded_object_slots_by_stage.get(&object_stage_id);
             let Some(objs) = st.object_lists.get_mut(&object_stage_id) else {
                 continue;
             };
             for (obj_idx, obj) in objs.iter_mut().enumerate() {
-                if embedded_slots.contains(&obj_idx) {
+                if embedded_slots.is_some_and(|slots| slots.contains(&obj_idx)) {
                     continue;
                 }
                 obj.tick(past_game_time, past_real_time);

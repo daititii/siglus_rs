@@ -458,7 +458,7 @@ pub struct AssetTables {
     pub cgtable_flag_cnt: Option<usize>,
     pub cg_flags: Vec<u8>,
 
-    pub databases: Vec<DbsDatabase>,
+    pub databases: Vec<Option<DbsDatabase>>,
 
     pub thumb_table: Option<ThumbTable>,
 }
@@ -598,6 +598,10 @@ impl AssetTables {
 
             // DATABASE
             let db_cnt = cfg.indexed_count("DATABASE");
+            // The original C_elm_database_list owns a fixed DATABASE[i] slot
+            // for every configured index. A missing/unreadable .dbs leaves
+            // that slot uninitialized; it must not shift following indices.
+            out.databases = vec![None; db_cnt];
             for i in 0..db_cnt {
                 let key = format!("DATABASE.{i}");
                 let Some(name) = cfg
@@ -615,7 +619,7 @@ impl AssetTables {
                     continue;
                 };
                 match crate::resource::read_file_bytes(&path).and_then(|bytes| DbsDatabase::from_bytes(&bytes)) {
-                    Ok(db) => out.databases.push(db),
+                    Ok(db) => out.databases[i] = Some(db),
                     Err(e) => unknown.record_note(&format!("dbs.load.failed:{path:?}:{e}")),
                 }
             }

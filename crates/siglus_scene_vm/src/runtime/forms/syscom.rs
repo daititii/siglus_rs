@@ -969,7 +969,7 @@ fn write_slot_thumb_for_save_no(ctx: &mut CommandContext, save_no: usize) {
             config.thumb_type
         );
     }
-    let _ = fs::remove_file(&path);
+    remove_game_file(&path);
     let result = match config.thumb_type {
         SaveThumbType::Bmp => write_rgba_bmp_top_down(&path, &img),
         SaveThumbType::Png => write_rgba_png_opaque(&path, &img),
@@ -2074,7 +2074,7 @@ fn remove_thumb_file(project_dir: &Path, save_cnt: usize, quick_cnt: usize, quic
         return;
     }
     let save_no = slot_thumb_save_no(save_cnt, quick_cnt, quick, idx);
-    let _ = fs::remove_file(thumb_path_for_no_with_config(project_dir, config, save_no));
+    remove_game_file(&thumb_path_for_no_with_config(project_dir, config, save_no));
 }
 
 fn copy_thumb_file(project_dir: &Path, save_cnt: usize, quick_cnt: usize, quick: bool, config: SaveThumbConfig, src: usize, dst: usize) {
@@ -2089,9 +2089,9 @@ fn copy_thumb_file(project_dir: &Path, save_cnt: usize, quick_cnt: usize, quick:
         if let Some(parent) = dst_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::copy(src_path, dst_path);
+        copy_game_file(&src_path, &dst_path);
     } else {
-        let _ = fs::remove_file(dst_path);
+        remove_game_file(&dst_path);
     }
 }
 
@@ -2112,25 +2112,25 @@ fn swap_thumb_file(project_dir: &Path, save_cnt: usize, quick_cnt: usize, quick:
     let a_exists = pa_existing.is_some();
     let b_exists = pb_existing.is_some();
     if let Some(existing) = pa_existing.as_ref() {
-        let _ = fs::rename(existing, &tmp);
+        rename_game_file(existing, &tmp);
     }
     if let Some(existing) = pb_existing.as_ref() {
         if let Some(parent) = pa.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::rename(existing, &pa);
+        rename_game_file(existing, &pa);
     } else {
-        let _ = fs::remove_file(&pa);
+        remove_game_file(&pa);
     }
     if a_exists {
         if let Some(parent) = pb.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::rename(&tmp, &pb);
+        rename_game_file(&tmp, &pb);
     } else {
-        let _ = fs::remove_file(&pb);
+        remove_game_file(&pb);
     }
-    let _ = fs::remove_file(&tmp);
+    remove_game_file(&tmp);
 }
 
 fn copy_save_file(project_dir: &Path, quick: bool, save_cnt: usize, quick_cnt: usize, src: usize, dst: usize) {
@@ -2140,9 +2140,9 @@ fn copy_save_file(project_dir: &Path, quick: bool, save_cnt: usize, quick_cnt: u
         if let Some(parent) = dst_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::copy(src_path, dst_path);
+        copy_game_file(&src_path, &dst_path);
     } else {
-        let _ = fs::remove_file(dst_path);
+        remove_game_file(&dst_path);
     }
 }
 
@@ -2158,25 +2158,25 @@ fn swap_save_file(project_dir: &Path, quick: bool, save_cnt: usize, quick_cnt: u
     let a_exists = pa_existing.is_some();
     let b_exists = pb_existing.is_some();
     if let Some(existing) = pa_existing.as_ref() {
-        let _ = fs::rename(existing, &tmp);
+        rename_game_file(existing, &tmp);
     }
     if let Some(existing) = pb_existing.as_ref() {
         if let Some(parent) = pa.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::rename(existing, &pa);
+        rename_game_file(existing, &pa);
     } else {
-        let _ = fs::remove_file(&pa);
+        remove_game_file(&pa);
     }
     if a_exists {
         if let Some(parent) = pb.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::rename(&tmp, &pb);
+        rename_game_file(&tmp, &pb);
     } else {
-        let _ = fs::remove_file(&pb);
+        remove_game_file(&pb);
     }
-    let _ = fs::remove_file(&tmp);
+    remove_game_file(&tmp);
 }
 
 fn copy_slot(
@@ -2237,7 +2237,7 @@ fn delete_slot(
     let existed = slots.get(idx).map(|s| s.exist).unwrap_or(false);
     *ensure_slot(slots, idx) = SaveSlotState::default();
     let path = slot_path_with_counts(project_dir, quick, idx, save_cnt, quick_cnt);
-    let _ = fs::remove_file(path);
+    remove_game_file(&path);
     remove_thumb_file(project_dir, save_cnt, quick_cnt, quick, thumb_config, idx);
     existed
 }
@@ -2307,7 +2307,10 @@ fn save_capture_flags_sidecar(ctx: &CommandContext, image_path: &Path, params: &
     if let Some(parent) = image_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(capture_flags_path(image_path), out);
+    let sidecar = capture_flags_path(image_path);
+    if fs::write(&sidecar, out).is_ok() {
+        mark_game_file_written(&sidecar);
+    }
 }
 
 fn load_capture_flags_sidecar(
@@ -2411,7 +2414,9 @@ fn write_msg_back(ctx: &CommandContext) {
         }
         out.push('\n');
     }
-    let _ = std::fs::write(path, out);
+    if std::fs::write(&path, out).is_ok() {
+        mark_game_file_written(&path);
+    }
 }
 
 fn open_msg_back_proc(ctx: &mut CommandContext) -> bool {
@@ -3555,18 +3560,14 @@ pub(crate) fn update_audio_routing(
     use crate::audio::TrackKind;
 
     let config = &ctx.globals.syscom.original_config;
-    let chrkoe_lists: Vec<Vec<i64>> = {
-        let routing = &mut ctx.globals.sound_routing;
-        if routing.chrkoe_chara_lists_cache.len() < config.chrkoe.len() {
-            drop(routing);
+    let chrkoe_lists = {
+        if ctx.globals.sound_routing.chrkoe_chara_lists_cache.len() < config.chrkoe.len() {
             let lists = (0..config.chrkoe.len())
                 .map(|index| chrkoe_chara_numbers(ctx, index))
                 .collect::<Vec<Vec<i64>>>();
-            ctx.globals.sound_routing.chrkoe_chara_lists_cache = lists.clone();
-            lists
-        } else {
-            routing.chrkoe_chara_lists_cache[..config.chrkoe.len()].to_vec()
+            ctx.globals.sound_routing.chrkoe_chara_lists_cache = std::sync::Arc::new(lists);
         }
+        std::sync::Arc::clone(&ctx.globals.sound_routing.chrkoe_chara_lists_cache)
     };
     let all_total = if config.play_all_sound_check {
         config.all_sound_user_volume.clamp(0, 255)
@@ -3598,7 +3599,7 @@ pub(crate) fn update_audio_routing(
     for (channel, state) in source_channels {
         let routed = pcmch_routed_volume(
             &config,
-            &chrkoe_lists,
+            chrkoe_lists.as_slice(),
             &state,
             all_total,
             &category_total,
@@ -3617,7 +3618,7 @@ pub(crate) fn update_audio_routing(
     let koe_chara_no = ctx.globals.sound_routing.koe_chara_no;
     let koe_ex_flag = ctx.globals.sound_routing.koe_ex_flag;
     let (koe_chara_onoff, koe_chara_volume) =
-        chrkoe_route(&config, &chrkoe_lists, koe_chara_no);
+        chrkoe_route(&config, chrkoe_lists.as_slice(), koe_chara_no);
     let mut koe_buf_total = if koe_ex_flag {
         mul_raw(all_total, config.sound_user_volume[1])
     } else {
@@ -3751,7 +3752,7 @@ pub(crate) fn update_audio_routing(
     for (channel, state) in normal_channels {
         let routed = pcmch_routed_volume(
             &config,
-            &chrkoe_lists,
+            chrkoe_lists.as_slice(),
             &state,
             all_total,
             &category_total,
@@ -3777,7 +3778,7 @@ pub(crate) fn update_audio_routing(
         for (channel, state) in sources {
             let routed = pcmch_routed_volume(
                 &config,
-                &chrkoe_lists,
+                chrkoe_lists.as_slice(),
                 &state,
                 all_total,
                 &category_total,
@@ -3814,6 +3815,26 @@ fn join_game_path(base: &Path, raw: &str) -> PathBuf {
     }
 }
 
+fn remove_game_file(path: &Path) {
+    let _ = fs::remove_file(path);
+    crate::resource::invalidate_game_path_cache(path);
+}
+
+fn copy_game_file(src: &Path, dst: &Path) {
+    let _ = fs::copy(src, dst);
+    crate::resource::invalidate_game_path_cache(dst);
+}
+
+fn rename_game_file(src: &Path, dst: &Path) {
+    let _ = fs::rename(src, dst);
+    crate::resource::invalidate_game_path_cache(src);
+    crate::resource::invalidate_game_path_cache(dst);
+}
+
+fn mark_game_file_written(path: &Path) {
+    crate::resource::invalidate_game_path_cache(path);
+}
+
 fn opaque_rgba(img: &RgbaImage) -> RgbaImage {
     let mut rgba = img.rgba.clone();
     for px in rgba.chunks_exact_mut(4) {
@@ -3836,6 +3857,7 @@ fn write_rgba_png(path: &Path, img: &RgbaImage) -> Result<()> {
         anyhow::bail!("invalid rgba buffer for {}x{} image", img.width, img.height);
     };
     buf.save(path)?;
+    mark_game_file_written(path);
     Ok(())
 }
 
@@ -3894,6 +3916,7 @@ fn write_rgba_bmp_top_down(path: &Path, img: &RgbaImage) -> Result<()> {
         out.push(px[3]);
     }
     fs::write(path, out)?;
+    mark_game_file_written(path);
     Ok(())
 }
 

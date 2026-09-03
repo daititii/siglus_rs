@@ -55,6 +55,30 @@ fn database_get_data(
     }
 }
 
+fn push_unloaded_database_result(ctx: &mut CommandContext, db_op: i32) {
+    if ctx.ids.database_get_str != 0 && db_op == ctx.ids.database_get_str {
+        ctx.push(Value::Str(String::new()));
+        return;
+    }
+
+    if ctx.ids.database_get_data != 0 && db_op == ctx.ids.database_get_data {
+        // GET_DATA is VOID. With no loaded database there is nothing to copy
+        // into the supplied refs, and no command return value is produced.
+        return;
+    }
+
+    if (ctx.ids.database_find_num != 0 && db_op == ctx.ids.database_find_num)
+        || (ctx.ids.database_find_str != 0 && db_op == ctx.ids.database_find_str)
+        || (ctx.ids.database_find_str_real != 0 && db_op == ctx.ids.database_find_str_real)
+    {
+        ctx.push(Value::Int(-1));
+        return;
+    }
+
+    // GET_NUM / CHECK_ITEM / CHECK_COLUMN return zero for an unloaded DB.
+    ctx.push(Value::Int(0));
+}
+
 pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Result<bool> {
     let parsed = prop_access::parse_element_chain_ctx(ctx, form_id, args);
     let (chain_pos, chain) = match parsed {
@@ -89,30 +113,29 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             }
 
             let db_no = chain[2];
+            let db_op = chain[3];
             if db_no < 0 {
-                ctx.push(Value::Int(0));
+                push_unloaded_database_result(ctx, db_op);
                 return Ok(true);
             }
 
             if ctx.globals.database_off {
-                let db_op = chain[3];
-                if ctx.ids.database_get_str != 0 && db_op == ctx.ids.database_get_str {
-                    ctx.push(Value::Str(String::new()));
-                } else {
-                    ctx.push(Value::Int(0));
-                }
+                push_unloaded_database_result(ctx, db_op);
                 return Ok(true);
             }
 
-            let db = match ctx.tables.databases.get(db_no as usize).cloned() {
+            let db = match ctx
+                .tables
+                .databases
+                .get(db_no as usize)
+                .and_then(|db| db.clone())
+            {
                 Some(db) => db,
                 None => {
-                    ctx.push(Value::Int(0));
+                    push_unloaded_database_result(ctx, db_op);
                     return Ok(true);
                 }
             };
-
-            let db_op = chain[3];
 
             if db_op == ctx.ids.database_get_num {
                 let item_call_no = p_i32(0);
@@ -140,7 +163,6 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                 let item_call_no = p_i32(0);
                 let refs = if params.len() > 1 { &params[1..] } else { &[] };
                 database_get_data(ctx, &db, item_call_no, refs);
-                ctx.push(Value::Int(0));
                 return Ok(true);
             }
 

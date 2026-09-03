@@ -41,7 +41,11 @@ const TILE: [u8; TILE_WIDTH * TILE_HEIGHT] = [
     255,
 ];
 
-const XORCODE: [u32; 3] = [0x753A4098, 0x4A673CCC, 0xFE6215AF];
+const XORCODE: [u32; 3] = [
+    0x7190C70E,
+    0x499BF135,
+    0x89F4622D
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct DbsRowHeader {

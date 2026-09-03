@@ -212,10 +212,16 @@ pub fn decode_g00(data: &[u8]) -> Result<DecodedG00> {
             if off > data.len() {
                 bail!("g00 type3 header out of bounds");
             }
-            let jpeg = &data[off..];
-            let img = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
-                .or_else(|_| image::load_from_memory(jpeg))
-                .context("decode g00 jpeg")?;
+            let jpeg = siglus_assets::g00::decode_type3_jpeg_payload(&data[off..]);
+            if !jpeg.starts_with(&[0xFF, 0xD8]) {
+                bail!(
+                    "g00 type3 XOR decode did not produce JPEG SOI: got={:02X?}",
+                    &jpeg[..jpeg.len().min(2)]
+                );
+            }
+            let img = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+                .or_else(|_| image::load_from_memory(&jpeg))
+                .context("decode g00 type3 jpeg after XOR")?;
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
             if w != width || h != height {

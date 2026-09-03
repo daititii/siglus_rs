@@ -95,9 +95,11 @@ fn transform_local_point(sprite: &Sprite, px: f32, py: f32, dst_x: f32, dst_y: f
     p.x *= sprite.scale_x;
     p.y *= sprite.scale_y;
     p.z *= sprite.scale_z;
+    // D3DXMatrixRotationYawPitchRoll(yaw, pitch, roll) applies roll,
+    // then pitch, then yaw to row vectors.
+    p = rotate_z(p, sprite.rotate);
     p = rotate_x(p, sprite.rotate_x);
     p = rotate_y(p, sprite.rotate_y);
-    p = rotate_z(p, sprite.rotate);
     p.add(Vec3::new(anchor_x, anchor_y, sprite.z + sprite.pivot_z))
 }
 
@@ -126,7 +128,8 @@ fn camera_basis(sprite: &Sprite) -> (Vec3, Vec3, Vec3, Vec3) {
 fn transform_billboard_point(sprite: &Sprite, px: f32, py: f32, dst_x: f32, dst_y: f32) -> Vec3 {
     let (_, _, right, up) = camera_basis(sprite);
     let lx = (px - sprite.pivot_x) * sprite.scale_x;
-    let ly = (py - sprite.pivot_y) * sprite.scale_y;
+    // Texture-space Y grows downward, while WORLD Y grows upward.
+    let ly = -(py - sprite.pivot_y) * sprite.scale_y;
     let (s, c) = sprite.rotate.sin_cos();
     let rx = lx * c - ly * s;
     let ry = lx * s + ly * c;
@@ -167,19 +170,21 @@ fn project_point(sprite: &Sprite, p: Vec3, win_w: f32, win_h: f32) -> Option<Pro
     } else {
         1.0
     };
-    let hfov = sprite
+    let vfov = sprite
         .camera_view_angle_deg
         .to_radians()
         .clamp(1e-3, std::f32::consts::PI - 1e-3);
-    let tan_half_h = (hfov * 0.5).tan().max(1e-3);
-    let tan_half_v = (tan_half_h / aspect.max(1e-3)).max(1e-3);
+    let tan_half_v = (vfov * 0.5).tan().max(1e-3);
+    let tan_half_h = (tan_half_v * aspect.max(1e-3)).max(1e-3);
 
     let x_ndc = cx / (cz * tan_half_h);
     let y_ndc = cy / (cz * tan_half_v);
 
     let sx = (x_ndc + 1.0) * 0.5 * win_w;
     let sy = (1.0 - y_ndc) * 0.5 * win_h;
-    let depth = ((cz - 1.0) / 20000.0).clamp(0.0, 1.0);
+    let near = 1.0;
+    let far = 10000.0;
+    let depth = (far / (far - near) - near * far / ((far - near) * cz)).clamp(0.0, 1.0);
     Some(ProjectedPoint {
         x: sx,
         y: sy,
@@ -263,13 +268,76 @@ pub fn project_model_point(
     p.x *= sprite.scale_x;
     p.y *= sprite.scale_y;
     p.z *= sprite.scale_z;
+    p = rotate_z(p, sprite.rotate);
     p = rotate_x(p, sprite.rotate_x);
     p = rotate_y(p, sprite.rotate_y);
-    p = rotate_z(p, sprite.rotate);
     p = p.add(Vec3::new(
         anchor_x + sprite.pivot_x,
         anchor_y + sprite.pivot_y,
         sprite.z + sprite.pivot_z,
     ));
     project_point(sprite, p, win_w, win_h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{project_point, rotate_x, rotate_y, rotate_z, sprite_quad_points, Vec3};
+    use crate::layer::Sprite;
+
+    fn camera_sprite() -> Sprite {
+        let mut sprite = Sprite::default();
+        sprite.camera_enabled = true;
+        sprite.camera_eye = [0.0, 0.0, 0.0];
+        sprite.camera_target = [0.0, 0.0, 1.0];
+        sprite.camera_up = [0.0, 1.0, 0.0];
+        sprite.camera_view_angle_deg = 60.0;
+        sprite
+    }
+
+    #[test]
+    fn yaw_pitch_roll_matches_d3dx_application_order() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let mut point = Vec3::new(1.0, 2.0, 3.0);
+        point = rotate_z(point, quarter);
+        point = rotate_x(point, quarter);
+        point = rotate_y(point, quarter);
+        assert!((point.x - 1.0).abs() < 1e-5);
+        assert!((point.y + 3.0).abs() < 1e-5);
+        assert!((point.z - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn billboard_texture_top_projects_above_its_bottom() {
+        let mut sprite = camera_sprite();
+        sprite.billboard = true;
+        sprite.z = 100.0;
+        let quad = sprite_quad_points(&sprite, 0.0, 0.0, 32.0, 64.0, 640.0, 480.0)
+            .unwrap();
+        assert!(quad[0].y < quad[3].y);
+    }
+
+    #[test]
+    fn world_view_angle_is_vertical_and_does_not_change_with_window_width() {
+        let sprite = camera_sprite();
+        let point = Vec3::new(0.0, 1.0, 10.0);
+        let narrow = project_point(&sprite, point, 640.0, 480.0).unwrap();
+        let wide = project_point(&sprite, point, 1280.0, 480.0).unwrap();
+        assert!((narrow.y - wide.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn world_depth_matches_d3d_lh_near_and_far_planes() {
+        let sprite = camera_sprite();
+        let near = project_point(&sprite, Vec3::new(0.0, 0.0, 1.0), 640.0, 480.0)
+            .unwrap();
+        let far = project_point(
+            &sprite,
+            Vec3::new(0.0, 0.0, 10000.0),
+            640.0,
+            480.0,
+        )
+        .unwrap();
+        assert!(near.depth.abs() < 1e-6);
+        assert!((far.depth - 1.0).abs() < 1e-6);
+    }
 }

@@ -21,7 +21,7 @@ let games = [];
 let running = false;
 
 const filesByPath = new Map();
-const filesByLowerPath = new Map();
+const filesByFoldedPath = new Map();
 const dirChildren = new Map();
 let filesMetadata = [];
 
@@ -57,6 +57,15 @@ function normalizePath(path) {
     .split("/")
     .filter((part) => part.length > 0 && part !== ".")
     .join("/");
+}
+
+function foldWindowsAsciiPath(path) {
+  let out = "";
+  for (let i = 0; i < path.length; i += 1) {
+    const code = path.charCodeAt(i);
+    out += code >= 0x41 && code <= 0x5a ? String.fromCharCode(code + 0x20) : path[i];
+  }
+  return out;
 }
 
 function splitPath(path) {
@@ -296,7 +305,7 @@ function registerDir(path) {
 
 function registerGameEntries(game) {
   filesByPath.clear();
-  filesByLowerPath.clear();
+  filesByFoldedPath.clear();
   dirChildren.clear();
   filesMetadata = [];
 
@@ -304,15 +313,15 @@ function registerGameEntries(game) {
     const path = normalizePath(entry.gamePath);
     if (!path) continue;
 
-    const lower = path.toLowerCase();
-    if (filesByLowerPath.has(lower)) {
-      const other = filesByLowerPath.get(lower).__siglusPath;
+    const folded = foldWindowsAsciiPath(path);
+    if (filesByFoldedPath.has(folded)) {
+      const other = filesByFoldedPath.get(folded).__siglusPath;
       throw new Error(`case-insensitive path conflict: ${other} vs ${path}`);
     }
 
     entry.file.__siglusPath = path;
     filesByPath.set(path, entry.file);
-    filesByLowerPath.set(lower, entry.file);
+    filesByFoldedPath.set(folded, entry.file);
     registerDir(path);
     filesMetadata.push({ path, size: entry.file.size, lastModified: entry.file.lastModified || 0 });
   }
@@ -335,7 +344,7 @@ function resolveSiglusFile(path) {
   let file = filesByPath.get(normalized);
   if (file) return file;
 
-  file = filesByLowerPath.get(normalized.toLowerCase());
+  file = filesByFoldedPath.get(foldWindowsAsciiPath(normalized));
   return file || null;
 }
 

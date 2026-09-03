@@ -3077,42 +3077,42 @@ impl Default for RuntimeConstants {
             stage_elm_object: elm_value::STAGE_OBJECT,
             stage_elm_world: elm_value::STAGE_WORLD,
 
-            worldlist_create: 0,
-            worldlist_destroy: 0,
+            worldlist_create: elm_value::WORLDLIST_CREATE_WORLD,
+            worldlist_destroy: elm_value::WORLDLIST_DESTROY_WORLD,
 
-            world_init: 0,
-            world_get_no: 0,
+            world_init: elm_value::WORLD_INIT,
+            world_get_no: elm_value::WORLD_GET_NO,
             world_mode: 0,
-            world_camera_eye_x: 0,
-            world_camera_eye_y: 0,
-            world_camera_eye_z: 0,
-            world_camera_pint_x: 0,
-            world_camera_pint_y: 0,
-            world_camera_pint_z: 0,
-            world_camera_up_x: 0,
-            world_camera_up_y: 0,
-            world_camera_up_z: 0,
-            world_camera_eye_x_eve: 0,
-            world_camera_eye_y_eve: 0,
-            world_camera_eye_z_eve: 0,
-            world_camera_pint_x_eve: 0,
-            world_camera_pint_y_eve: 0,
-            world_camera_pint_z_eve: 0,
-            world_camera_up_x_eve: 0,
-            world_camera_up_y_eve: 0,
-            world_camera_up_z_eve: 0,
-            world_camera_view_angle: 0,
-            world_set_camera_eye: 0,
-            world_calc_camera_eye: 0,
-            world_set_camera_pint: 0,
-            world_calc_camera_pint: 0,
-            world_set_camera_up: 0,
-            world_mono: 0,
-            world_set_camera_eve_xz_rotate: 0,
-            world_order: 0,
-            world_layer: 0,
-            world_wipe_copy: 0,
-            world_wipe_erase: 0,
+            world_camera_eye_x: elm_value::WORLD_CAMERA_EYE_X,
+            world_camera_eye_y: elm_value::WORLD_CAMERA_EYE_Y,
+            world_camera_eye_z: elm_value::WORLD_CAMERA_EYE_Z,
+            world_camera_pint_x: elm_value::WORLD_CAMERA_PINT_X,
+            world_camera_pint_y: elm_value::WORLD_CAMERA_PINT_Y,
+            world_camera_pint_z: elm_value::WORLD_CAMERA_PINT_Z,
+            world_camera_up_x: elm_value::WORLD_CAMERA_UP_X,
+            world_camera_up_y: elm_value::WORLD_CAMERA_UP_Y,
+            world_camera_up_z: elm_value::WORLD_CAMERA_UP_Z,
+            world_camera_eye_x_eve: elm_value::WORLD_CAMERA_EYE_X_EVE,
+            world_camera_eye_y_eve: elm_value::WORLD_CAMERA_EYE_Y_EVE,
+            world_camera_eye_z_eve: elm_value::WORLD_CAMERA_EYE_Z_EVE,
+            world_camera_pint_x_eve: elm_value::WORLD_CAMERA_PINT_X_EVE,
+            world_camera_pint_y_eve: elm_value::WORLD_CAMERA_PINT_Y_EVE,
+            world_camera_pint_z_eve: elm_value::WORLD_CAMERA_PINT_Z_EVE,
+            world_camera_up_x_eve: elm_value::WORLD_CAMERA_UP_X_EVE,
+            world_camera_up_y_eve: elm_value::WORLD_CAMERA_UP_Y_EVE,
+            world_camera_up_z_eve: elm_value::WORLD_CAMERA_UP_Z_EVE,
+            world_camera_view_angle: elm_value::WORLD_CAMERA_VIEW_ANGLE,
+            world_set_camera_eye: elm_value::WORLD_SET_CAMERA_EYE,
+            world_calc_camera_eye: elm_value::WORLD_CALC_CAMERA_EYE,
+            world_set_camera_pint: elm_value::WORLD_SET_CAMERA_PINT,
+            world_calc_camera_pint: elm_value::WORLD_CALC_CAMERA_PINT,
+            world_set_camera_up: elm_value::WORLD_SET_CAMERA_UP,
+            world_mono: elm_value::WORLD_MONO,
+            world_set_camera_eve_xz_rotate: elm_value::WORLD_SET_CAMERA_EVE_XZ_ROTATE,
+            world_order: elm_value::WORLD_ORDER,
+            world_layer: elm_value::WORLD_LAYER,
+            world_wipe_copy: elm_value::WORLD_WIPE_COPY,
+            world_wipe_erase: elm_value::WORLD_WIPE_ERASE,
 
             obj_disp: elm_value::OBJECT_DISP,
             obj_patno: elm_value::OBJECT_PATNO,
@@ -3330,7 +3330,7 @@ impl Default for RuntimeConstants {
 
 #[cfg(test)]
 mod id_match_tests {
-    use super::matches_element_id;
+    use super::{elm_value, matches_element_id, RuntimeConstants};
 
     #[test]
     fn canonical_zero_opcode_is_not_treated_as_missing() {
@@ -3343,5 +3343,16 @@ mod id_match_tests {
         assert!(matches_element_id(7, 7, 3));
         assert!(matches_element_id(3, 7, 3));
         assert!(!matches_element_id(8, 7, 3));
+    }
+
+    #[test]
+    fn world_commands_are_enabled_by_default() {
+        let ids = RuntimeConstants::default();
+        assert_eq!(ids.world_init, elm_value::WORLD_INIT);
+        assert_eq!(ids.world_set_camera_eye, elm_value::WORLD_SET_CAMERA_EYE);
+        assert_eq!(ids.world_set_camera_pint, elm_value::WORLD_SET_CAMERA_PINT);
+        assert_eq!(ids.world_calc_camera_pint, elm_value::WORLD_CALC_CAMERA_PINT);
+        assert_eq!(ids.world_set_camera_up, elm_value::WORLD_SET_CAMERA_UP);
+        assert_eq!(ids.world_camera_view_angle, elm_value::WORLD_CAMERA_VIEW_ANGLE);
     }
 }

@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::Instant;
@@ -41,7 +40,6 @@ use siglus_scene_vm::runtime::forms::syscom;
 use siglus_scene_vm::scene_stream::SceneStream;
 use siglus_scene_vm::vm::{SceneVm, VmConfig};
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// High-resolution Siglus titles should not have their requested client size
 /// multiplied by the platform HiDPI backing scale.  Keep <=720p titles on the
 /// existing logical-window path for compatibility, but request >720p windows
@@ -210,7 +208,6 @@ struct App {
     cursor_hidden: bool,
     last_mouse_move: Instant,
     redraw_count: u32,
-    next_frame_at: Instant,
     frame_dirty: bool,
     script_needs_pump: bool,
     script_resume_after_redraw: bool,
@@ -416,7 +413,6 @@ impl App {
             cursor_hidden: false,
             last_mouse_move: Instant::now(),
             redraw_count: 0,
-            next_frame_at: Instant::now(),
             frame_dirty: true,
             script_needs_pump: true,
             script_resume_after_redraw: false,
@@ -2433,13 +2429,11 @@ impl App {
             self.consume_syscom_pending_proc()?;
             self.ensure_requested_script_proc();
             self.script_needs_pump = true;
-            self.next_frame_at = Instant::now();
         }
         if wait_poll_needed {
             if let Some(vm) = self.vm.as_mut() {
                 if !vm.is_blocked() {
                     self.script_needs_pump = true;
-                    self.next_frame_at = Instant::now();
                 }
             }
         }
@@ -2471,21 +2465,16 @@ impl App {
             }
         }
 
-        let consumed_script_frame_boundary = self.script_resume_after_redraw;
         if self.script_resume_after_redraw {
             self.script_resume_after_redraw = false;
             self.script_needs_pump = true;
         }
 
         self.redraw_count = self.redraw_count.saturating_add(1);
-        // DISP/FRAME are frame_main_proc boundaries.  The original loop resumes
-        // SCRIPT on the following display frame; it does not run another DISP
-        // immediately in the same wall-clock frame.  Keep immediate pumping for
-        // non-frame transitions (completed waits/syscom), but always advance the
-        // frame deadline when a SCRIPT frame boundary was consumed.
-        if consumed_script_frame_boundary || !self.script_needs_pump {
-            self.next_frame_at = Instant::now() + FRAME_INTERVAL;
-        }
+        // DISP/FRAME are frame_main_proc boundaries. The original loop resumes
+        // SCRIPT after presentation rather than inserting a second fixed timer.
+        // `script_resume_after_redraw` above preserves that boundary while
+        // PresentMode::Fifo supplies the display pacing.
         if !render_suppressed {
             self.maybe_capture_current_frame()?;
         }
@@ -2695,7 +2684,6 @@ impl App {
         }
         self.frame_dirty = true;
         self.script_needs_pump = true;
-        self.next_frame_at = Instant::now();
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
@@ -3195,17 +3183,12 @@ impl ApplicationHandler for App {
 
         let capture_pending = self.args.capture_png.is_some() && !self.captured;
         let continuous_before = self.needs_continuous_frame();
-        let now = Instant::now();
         let wants_frame_or_script =
             self.frame_dirty
                 || self.script_needs_pump
                 || self.script_resume_after_redraw
                 || continuous_before
                 || capture_pending;
-        if wants_frame_or_script && !capture_pending && now < self.next_frame_at {
-            elwt.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
-            return;
-        }
 
         let should_pump_script = self.script_needs_pump || capture_pending;
         if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
@@ -3222,7 +3205,7 @@ impl ApplicationHandler for App {
                 self.script_resume_after_redraw,
                 continuous_before,
                 capture_pending,
-                now < self.next_frame_at,
+                false,
                 scene,
                 line,
                 blocked,
@@ -3263,17 +3246,6 @@ impl ApplicationHandler for App {
         }
 
         let continuous_after = self.needs_continuous_frame();
-        let now_after = Instant::now();
-        if !self.frame_dirty
-            && !self.script_needs_pump
-            && !self.script_resume_after_redraw
-            && !capture_pending
-            && continuous_after
-            && now_after < self.next_frame_at
-        {
-            elwt.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
-            return;
-        }
         if self.frame_dirty
             || self.script_needs_pump
             || self.script_resume_after_redraw
@@ -3289,12 +3261,13 @@ impl ApplicationHandler for App {
                 }
             }
             self.frame_dirty = false;
-            if capture_pending {
-                elwt.set_control_flow(ControlFlow::Wait);
-            } else {
-                let wake_at = self.next_frame_at.max(Instant::now());
-                elwt.set_control_flow(ControlFlow::WaitUntil(wake_at));
-            }
+            // The surface is configured with PresentMode::Fifo, matching the
+            // original engine's D3DPRESENT_INTERVAL_ONE behavior.  Do not add
+            // another fixed 16 ms delay after rendering: doing so turns the
+            // frame period into (CPU/GPU frame cost + 16 ms) and can collapse
+            // frame rate under load. request_redraw() is sufficient to wake
+            // the loop for the next frame; presentation provides the pacing.
+            elwt.set_control_flow(ControlFlow::Wait);
         } else {
             elwt.set_control_flow(ControlFlow::Wait);
         }
@@ -3305,15 +3278,16 @@ fn main() -> Result<()> {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
         .try_init();
     let args = Args::parse();
-    if args.capture_png.is_some() && args.exit_after_capture {
-        return run_headless_capture(args);
-    }
+    // Frame capture must use the renderer attached during `resumed`; the old
+    // exit-after-capture shortcut constructed only a VM and could never own a
+    // GPU FrameCaptureBackend.
     let el = EventLoop::new()?;
     let mut app = App::new(args);
     el.run_app(&mut app)?;
     Ok(())
 }
 
+#[allow(dead_code)]
 fn run_headless_capture(args: Args) -> Result<()> {
     let mut app = App::new(args);
     let vm = app.init_vm()?;

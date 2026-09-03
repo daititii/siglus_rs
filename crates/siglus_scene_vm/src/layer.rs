@@ -11,6 +11,35 @@ pub enum SpriteFit {
     PixelRect,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::LayerManager;
+
+    #[test]
+    fn resetting_transient_effects_preserves_mesh_payload() {
+        let mut layers = LayerManager::new();
+        let layer_id = layers.create_layer();
+        let sprite_id = layers.layer_mut(layer_id).unwrap().create_sprite();
+        let sprite = layers
+            .layer_mut(layer_id)
+            .unwrap()
+            .sprite_mut(sprite_id)
+            .unwrap();
+        sprite.mesh_kind = 1;
+        sprite.mesh_file_name = Some("room.x".to_owned());
+        sprite.shadow_cast = true;
+        sprite.shadow_receive = true;
+
+        layers.reset_runtime_effects();
+
+        let sprite = layers.layer(layer_id).unwrap().sprite(sprite_id).unwrap();
+        assert_eq!(sprite.mesh_kind, 1);
+        assert_eq!(sprite.mesh_file_name.as_deref(), Some("room.x"));
+        assert!(sprite.shadow_cast);
+        assert!(sprite.shadow_receive);
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct ClipRect {
     pub left: i32,
@@ -731,10 +760,6 @@ impl LayerManager {
                 s.fog_far = 0.0;
                 s.fog_scroll_x = 0.0;
                 s.fog_texture_image_id = None;
-                s.mesh_kind = 0;
-                s.mesh_file_name = None;
-                s.shadow_cast = false;
-                s.shadow_receive = false;
             }
         }
     }

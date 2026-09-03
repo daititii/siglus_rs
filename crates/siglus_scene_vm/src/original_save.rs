@@ -770,7 +770,9 @@ pub fn write_header_in_place(path: &Path, header: &OriginalSaveHeader) -> Result
         bail!("save file too short for header update: {}", path.display());
     }
     data[..SAVE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
-    fs::write(path, data).with_context(|| format!("write save file {}", path.display()))
+    fs::write(path, data).with_context(|| format!("write save file {}", path.display()))?;
+    crate::resource::invalidate_game_path_cache(path);
+    Ok(())
 }
 
 pub fn write_local_save_file(path: &Path, slot: &SaveSlotState, env: &OriginalLocalSaveEnvelope) -> Result<()> {
@@ -782,7 +784,9 @@ pub fn write_local_save_file(path: &Path, slot: &SaveSlotState, env: &OriginalLo
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create save dir {}", parent.display()))?;
     }
-    fs::write(path, out).with_context(|| format!("write save file {}", path.display()))
+    fs::write(path, out).with_context(|| format!("write save file {}", path.display()))?;
+    crate::resource::invalidate_game_path_cache(path);
+    Ok(())
 }
 
 pub fn write_slot_file(path: &Path, slot: &SaveSlotState) -> Result<()> {
@@ -821,7 +825,9 @@ pub fn write_global_save_file(project_dir: &Path, global_stream: &[u8]) -> Resul
     }
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write global save file {}", path.display()))
+    fs::write(&path, out).with_context(|| format!("write global save file {}", path.display()))?;
+    crate::resource::invalidate_game_path_cache(&path);
+    Ok(())
 }
 
 pub fn read_global_save_file(project_dir: &Path) -> Result<Vec<u8>> {
@@ -872,7 +878,9 @@ pub fn write_read_save_file(
     push_i32(&mut out, packed.len().min(i32::MAX as usize) as i32);
     push_i32(&mut out, scene_rows.len().min(i32::MAX as usize) as i32);
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write read save file {}", path.display()))
+    fs::write(&path, out).with_context(|| format!("write read save file {}", path.display()))?;
+    crate::resource::invalidate_game_path_cache(&path);
+    Ok(())
 }
 
 /// Read `savedata/read.sav` without assigning rows to current scene indices.
@@ -933,7 +941,9 @@ pub fn write_config_save_file(project_dir: &Path, config_stream: &[u8]) -> Resul
     }
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write config save file {}", path.display()))
+    fs::write(&path, out).with_context(|| format!("write config save file {}", path.display()))?;
+    crate::resource::invalidate_game_path_cache(&path);
+    Ok(())
 }
 
 pub fn read_config_save_file(project_dir: &Path) -> Result<(OriginalConfigSaveHeader, Vec<u8>)> {
