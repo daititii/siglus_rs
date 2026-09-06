@@ -1446,6 +1446,10 @@ impl App {
             };
             vm.restart_scene_name(&scene_name, start_z)?;
         }
+        if self.args.scene_id.is_none() && self.args.scene_name.is_none() {
+            siglus_scene_vm::runtime::forms::syscom::load_global_save(&mut vm.ctx)
+                .context("load global save during engine initialization")?;
+        }
         Ok(vm)
     }
 
@@ -1888,6 +1892,11 @@ impl App {
     }
 
     fn queue_return_to_menu_proc(&mut self, proc: SyscomPendingProc) {
+        // Original tnm_syscom_return_to_menu() persists global data only after
+        // the warning (if any) has been accepted, and before fade/scene return.
+        if let Some(vm) = self.vm.as_ref() {
+            syscom::write_global_save(&vm.ctx);
+        }
         let option = if proc.leave_msgbk { 1 } else { 0 };
         self.flow.pending_syscom_proc = Some(proc.clone());
         self.flow.push(ProcType::ReturnToMenu, option);

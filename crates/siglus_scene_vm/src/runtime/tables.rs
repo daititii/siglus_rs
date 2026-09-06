@@ -127,11 +127,14 @@ pub struct MwndTemplate {
     pub name_bracket: i64,
     pub name_moji_size: i64,
     pub name_moji_space: (i64, i64),
-    pub name_moji_cnt: (i64, i64),
+    pub name_moji_cnt: i64,
     pub name_window_pos: (i64, i64),
     pub name_window_size: (i64, i64),
     pub name_msg_pos: (i64, i64),
+    pub name_msg_pos_rep: (i64, i64),
     pub name_msg_margin: (i64, i64, i64, i64),
+    pub name_extend_type: i64,
+    pub name_window_align: i64,
     pub name_moji_color: i64,
     pub name_shadow_color: i64,
     pub name_fuchi_color: i64,
@@ -168,13 +171,16 @@ impl Default for MwndTemplate {
             name_disp_mode: 0,
             name_newline: 0,
             name_bracket: 0,
-            name_moji_size: 25,
-            name_moji_space: (-1, 10),
-            name_moji_cnt: (10, 1),
-            name_window_pos: (0, 0),
-            name_window_size: (0, 0),
-            name_msg_pos: (0, 0),
-            name_msg_margin: (0, 0, 0, 0),
+            name_moji_size: 16,
+            name_moji_space: (-1, 8),
+            name_moji_cnt: 8,
+            name_window_pos: (0, -100),
+            name_window_size: (300, 100),
+            name_msg_pos: (8, 8),
+            name_msg_pos_rep: (0, 0),
+            name_msg_margin: (8, 8, 8, 8),
+            name_extend_type: 0,
+            name_window_align: 0,
             name_moji_color: -1,
             name_shadow_color: -1,
             name_fuchi_color: -1,
@@ -806,9 +812,8 @@ fn load_mwnd_templates(cfg: &GameexeConfig) -> Vec<MwndTemplate> {
         if name_moji_space.len() >= 2 {
             t.name_moji_space = (name_moji_space[0], name_moji_space[1]);
         }
-        let name_moji_cnt = get_tuple("NAME_MOJI_CNT");
-        if name_moji_cnt.len() >= 2 {
-            t.name_moji_cnt = (name_moji_cnt[0], name_moji_cnt[1]);
+        if let Some(v) = get_i64("NAME_MOJI_CNT") {
+            t.name_moji_cnt = v;
         }
         let name_window_pos = get_tuple("NAME_WINDOW_POS");
         if name_window_pos.len() >= 2 {
@@ -818,11 +823,15 @@ fn load_mwnd_templates(cfg: &GameexeConfig) -> Vec<MwndTemplate> {
         if name_window_size.len() >= 2 {
             t.name_window_size = (name_window_size[0], name_window_size[1]);
         }
-        let name_msg_pos = get_tuple("NAME_MSG_POS");
+        let name_msg_pos = get_tuple("NAME_MESSAGE_POS");
         if name_msg_pos.len() >= 2 {
             t.name_msg_pos = (name_msg_pos[0], name_msg_pos[1]);
         }
-        let name_msg_margin = get_tuple("NAME_MSG_MARGIN");
+        let name_msg_pos_rep = get_tuple("NAME_MESSAGE_POS_REP");
+        if name_msg_pos_rep.len() >= 2 {
+            t.name_msg_pos_rep = (name_msg_pos_rep[0], name_msg_pos_rep[1]);
+        }
+        let name_msg_margin = get_tuple("NAME_MESSAGE_MARGIN");
         if name_msg_margin.len() >= 4 {
             t.name_msg_margin = (
                 name_msg_margin[0],
@@ -842,6 +851,12 @@ fn load_mwnd_templates(cfg: &GameexeConfig) -> Vec<MwndTemplate> {
         }
         if let Some(v) = get_i64("NAME_WAKU_NO") {
             t.name_waku_no = v;
+        }
+        if let Some(v) = get_i64("NAME_EXTEND_TYPE") {
+            t.name_extend_type = v;
+        }
+        if let Some(v) = get_i64("NAME_WINDOW_ALIGN") {
+            t.name_window_align = v;
         }
         if let Some(v) = get_i64("FACE_HIDE_NAME") {
             t.face_hide_name = v;

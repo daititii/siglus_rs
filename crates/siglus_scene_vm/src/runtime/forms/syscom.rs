@@ -1717,6 +1717,10 @@ fn write_read_flags(ctx: &CommandContext) -> Result<()> {
 }
 
 fn load_read_flags(ctx: &mut CommandContext) -> Result<()> {
+    let read_path = original_save::save_dir(&ctx.project_dir).join("read.sav");
+    if crate::resource::resolve_windows_case_insensitive_file(&read_path)?.is_none() {
+        return Ok(());
+    }
     let pck = load_scene_pack_for_read_flags(ctx)?;
     let scene_count = pck.header.scn_data_cnt.max(0) as usize;
     ctx.globals.read_flags.clear();
@@ -1850,85 +1854,67 @@ pub fn write_global_save(ctx: &CommandContext) {
     }
 }
 
-fn load_global_save(ctx: &mut CommandContext) -> Result<()> {
-    load_config_save(ctx)?;
-    let payload = match original_save::read_global_save_file(&ctx.project_dir) {
-        Ok(payload) => Some(payload),
-        Err(_) => None,
-    };
-    let Some(payload) = payload else {
-        load_read_flags(ctx)?;
-        return Ok(());
-    };
-    let fixed_flag_cnt = ctx
-        .tables
-        .gameexe
-        .as_ref()
-        .and_then(|cfg| {
-            cfg.get_usize("#GLOBAL_FLAG.CNT")
-                .or_else(|| cfg.get_usize("GLOBAL_FLAG.CNT"))
-        })
-        .map(|count| count.min(10000));
-    let mut rd = original_save::OriginalStreamReader::new(&payload);
-    let Ok(total_play_time) = rd.i64() else {
-        return Ok(());
-    };
-    ctx.globals.syscom.total_play_time = total_play_time;
-    if let Ok(mut g) = rd.fixed_i32_list() {
+pub fn load_global_save(ctx: &mut CommandContext) -> Result<()> {
+    let global_path = original_save::save_dir(&ctx.project_dir).join("global.sav");
+    if crate::resource::resolve_windows_case_insensitive_file(&global_path)?.is_some() {
+        let payload = original_save::read_global_save_file(&ctx.project_dir)?;
+        let fixed_flag_cnt = ctx
+            .tables
+            .gameexe
+            .as_ref()
+            .and_then(|cfg| {
+                cfg.get_usize("#GLOBAL_FLAG.CNT")
+                    .or_else(|| cfg.get_usize("GLOBAL_FLAG.CNT"))
+            })
+            .map(|count| count.min(10000));
+        let mut rd = original_save::OriginalStreamReader::new(&payload);
+        let total_play_time = rd.i64()?;
+        let mut g = rd.fixed_i32_list()?;
         if let Some(fixed_flag_cnt) = fixed_flag_cnt {
             g.resize(fixed_flag_cnt, 0);
             g.truncate(fixed_flag_cnt);
         }
-        ctx.globals
-            .int_lists
-            .insert(crate::runtime::forms::codes::ELM_GLOBAL_G as u32, g);
-    } else {
-        return Ok(());
-    }
-    if let Ok(mut z) = rd.fixed_i32_list() {
+        let mut z = rd.fixed_i32_list()?;
         if let Some(fixed_flag_cnt) = fixed_flag_cnt {
             z.resize(fixed_flag_cnt, 0);
             z.truncate(fixed_flag_cnt);
         }
-        ctx.globals
-            .int_lists
-            .insert(crate::runtime::forms::codes::ELM_GLOBAL_Z as u32, z);
-    } else {
-        return Ok(());
-    }
-    if let Ok(mut m) = rd.fixed_str_list() {
+        let mut m = rd.fixed_str_list()?;
         if let Some(fixed_flag_cnt) = fixed_flag_cnt {
             m.resize_with(fixed_flag_cnt, String::new);
             m.truncate(fixed_flag_cnt);
         }
+        let mut namae_global = rd.fixed_str_list()?;
+        namae_global.resize_with(26 + 26 * 26, String::new);
+        namae_global.truncate(26 + 26 * 26);
+        let _dummy_check_id = rd.i32()?;
+        let cg = rd.fixed_i32_list()?;
+        let bgm = rd.fixed_i32_list()?;
+        let chrkoe_cnt = rd.i32()?;
+        for _ in 0..chrkoe_cnt.max(0) {
+            let _name = rd.string()?;
+            let _look_flag = rd.i32()?;
+        }
+
+        ctx.globals.syscom.total_play_time = total_play_time;
+        ctx.globals
+            .int_lists
+            .insert(crate::runtime::forms::codes::ELM_GLOBAL_G as u32, g);
+        ctx.globals
+            .int_lists
+            .insert(crate::runtime::forms::codes::ELM_GLOBAL_Z as u32, z);
         ctx.globals
             .str_lists
             .insert(crate::runtime::forms::codes::ELM_GLOBAL_M as u32, m);
-    } else {
-        return Ok(());
-    }
-    if let Ok(mut namae_global) = rd.fixed_str_list() {
-        namae_global.resize_with(26 + 26 * 26, String::new);
-        namae_global.truncate(26 + 26 * 26);
         ctx.globals.str_lists.insert(
             crate::runtime::forms::codes::ELM_GLOBAL_NAMAE_GLOBAL as u32,
             namae_global,
         );
-    }
-    let _ = rd.i32();
-    if let Ok(cg) = rd.fixed_i32_list() {
         ctx.tables.cg_flags = cg.into_iter().map(|v| if v != 0 { 1 } else { 0 }).collect();
-    }
-    if let Ok(bgm) = rd.fixed_i32_list() {
         ctx.globals.bgm_table_flags = bgm.into_iter().map(|v| v != 0).collect();
     }
-    if let Ok(chrkoe_cnt) = rd.i32() {
-        for _ in 0..chrkoe_cnt.max(0) {
-            let _ = rd.string();
-            let _ = rd.i32();
-        }
-    }
     load_read_flags(ctx)?;
+    load_config_save(ctx)?;
     Ok(())
 }
 
@@ -5923,4 +5909,52 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
 
     ctx.push(Value::Int(0));
     Ok(true)
+}
+
+#[cfg(test)]
+mod global_save_init_tests {
+    use super::*;
+    use crate::runtime::forms::codes;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_project_dir() -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "siglus-global-save-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn missing_global_save_keeps_zero_initialized_flags() {
+        let project_dir = test_project_dir();
+        fs::create_dir_all(&project_dir).expect("test project dir");
+        let mut ctx = CommandContext::new(project_dir.clone());
+
+        load_global_save(&mut ctx).expect("missing global save is valid");
+
+        let g = &ctx.globals.int_lists[&(codes::ELM_GLOBAL_G as u32)];
+        let z = &ctx.globals.int_lists[&(codes::ELM_GLOBAL_Z as u32)];
+        let m = &ctx.globals.str_lists[&(codes::ELM_GLOBAL_M as u32)];
+        assert!(!g.is_empty() && g.iter().all(|value| *value == 0));
+        assert!(!z.is_empty() && z.iter().all(|value| *value == 0));
+        assert!(!m.is_empty() && m.iter().all(String::is_empty));
+
+        let _ = fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn corrupt_existing_global_save_is_an_error() {
+        let project_dir = test_project_dir();
+        let save_dir = project_dir.join("savedata");
+        fs::create_dir_all(&save_dir).expect("test save dir");
+        fs::write(save_dir.join("global.sav"), b"invalid").expect("corrupt global save");
+        let mut ctx = CommandContext::new(project_dir.clone());
+
+        assert!(load_global_save(&mut ctx).is_err());
+
+        let _ = fs::remove_dir_all(project_dir);
+    }
 }

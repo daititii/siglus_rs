@@ -564,6 +564,25 @@ impl SiglusHost {
                 .unwrap_or_else(|| boot.start_scene.clone());
             vm.restart_scene_name(&scene_name, start_z)?;
         }
+        // C++ C_tnm_eng::init() loads the global save (g/z/m flags, system
+        // data) before the boot scene logic runs; _start checks g[1000] to
+        // decide title vs first-run flow. It must run AFTER scene activation,
+        // which (re)builds the global int lists for the boot scene.
+        if config.scene_id.is_none() && config.scene_name.is_none() {
+            crate::runtime::forms::syscom::load_global_save(&mut vm.ctx)
+                .context("load global save during engine initialization")?;
+            if std::env::var_os("SG_BOOT_TRACE").is_some() {
+                let g1000 = vm
+                    .ctx
+                    .globals
+                    .int_lists
+                    .get(&(crate::runtime::forms::codes::ELM_GLOBAL_G as u32))
+                    .and_then(|g| g.get(1000))
+                    .copied()
+                    .unwrap_or(0);
+                eprintln!("[SG_BOOT] global save initialization complete, g[1000]={g1000}");
+            }
+        }
         Ok(vm)
     }
 
@@ -958,6 +977,9 @@ impl SiglusHost {
     }
 
     fn queue_return_to_menu_proc(&mut self, proc: SyscomPendingProc) {
+        // Original tnm_syscom_return_to_menu() persists global data only after
+        // the warning (if any) has been accepted, and before fade/scene return.
+        crate::runtime::forms::syscom::write_global_save(&self.vm.ctx);
         let option = if proc.leave_msgbk { 1 } else { 0 };
         self.flow.pending_syscom_proc = Some(proc.clone());
         self.flow.push(ProcType::ReturnToMenu, option);
@@ -997,6 +1019,23 @@ impl SiglusHost {
     }
 
     fn finish_runtime_load(&mut self) {
+        // A load replaces the menu script before its viewport cleanup runs.
+        // Resume the saved scene on the game's base canvas and full viewport.
+        {
+            let base_w = self.config.width.unwrap_or(1920);
+            let base_h = self.config.height.unwrap_or(1080);
+            self.renderer.borrow_mut().resize_with_logical_viewport(
+                base_w,
+                base_h,
+                1.0,
+                base_w,
+                base_h,
+                0,
+                0,
+                base_w,
+                base_h,
+            );
+        }
         self.renderer.borrow_mut().clear_runtime_image_textures();
         self.flow.stack.clear();
         self.flow.pending_syscom_proc = None;

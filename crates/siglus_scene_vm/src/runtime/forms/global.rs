@@ -1862,7 +1862,7 @@ fn dispatch_global_message_command(
             // tnm_msg_back_add_pct(file_name, x, 0).  The command has two
             // overloads: (str) and (str, int); Y is always zero.
             let msgbk_form_id = ctx.ids.form_global_msgbk;
-            if msgbk_form_id != 0 && !file_name.is_empty() {
+            if msgbk_form_id != 0 {
                 ctx.globals
                     .msgbk_forms
                     .entry(msgbk_form_id)

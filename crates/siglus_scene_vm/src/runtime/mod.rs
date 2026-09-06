@@ -635,6 +635,10 @@ impl CommandContext {
         self.pending_sel_point_result = None;
         self.frame_clock_last = None;
         self.last_button_hover_sound_pos = None;
+        // The save/load menu runs as an EXCALL scene. Loading replaces that
+        // script context without executing EXCALL.FREE, so its ready flag must
+        // not select the menu-local stage for later game wipes.
+        self.excall_state = ExcallCompatState::default();
 
         self.globals.focused_editbox = None;
         self.globals.focused_stage_group = None;
@@ -6376,6 +6380,13 @@ impl CommandContext {
                         slide_time: m.slide_time,
                         vertical_writing: m.vertical_writing,
                         name_text: m.name_text.clone(),
+                        name_extend_type: m.name_extend_type,
+                        name_window_align: m.name_window_align,
+                        name_window_pos: m.name_window_pos,
+                        name_window_size: m.name_window_size,
+                        name_message_pos: m.name_message_pos,
+                        name_message_pos_rep: m.name_message_pos_rep,
+                        name_message_margin: m.name_message_margin,
                         name_glyphs: m
                             .name_glyphs
                             .iter()

@@ -756,24 +756,24 @@ fn finish_event_wait_by_key(w: &EventWait, globals: &mut GlobalState, ids: &Runt
 
 #[derive(Debug, Default, Clone)]
 pub struct VmWait {
-    until: Option<Instant>,
-    until_frame: Option<u64>,
-    waiting_for_key: bool,
+    pub until: Option<Instant>,
+    pub until_frame: Option<u64>,
+    pub waiting_for_key: bool,
     /// TNM_PROC_TYPE_MESSAGE_WAIT: block only until the typewriter has
     /// revealed the complete message.  This is deliberately distinct from
     /// MESSAGE_KEY_WAIT, which waits for user input after reveal.
-    message_reveal: bool,
+    pub message_reveal: bool,
     /// If set, a key press cancels the current time wait (TIMEWAIT_KEY behavior).
     skip_time_on_key: bool,
 
-    audio: Option<AudioWait>,
+    pub audio: Option<AudioWait>,
     audio_return_value: bool,
 
-    event: Option<EventWait>,
+    pub event: Option<EventWait>,
     event_key_skip: bool,
     event_return_value: bool,
 
-    movie: Option<MovieWait>,
+    pub movie: Option<MovieWait>,
     movie_key_skip: bool,
 
     emote: Option<EmoteWait>,
@@ -785,14 +785,14 @@ pub struct VmWait {
 
     movie_skip_info: Option<MovieWait>,
 
-    quake: Option<QuakeWait>,
+    pub quake: Option<QuakeWait>,
     quake_key_skip: bool,
-    pending_value: Option<Value>,
+    pub pending_value: Option<Value>,
 
     /// Blocks VM execution until a runtime modal UI supplies a return value.
-    system_modal: bool,
+    pub system_modal: bool,
 
-    wipe: bool,
+    pub wipe: bool,
     wipe_key_skip: bool,
 
     block_generation: u64,
@@ -1097,7 +1097,12 @@ impl VmWait {
         if self.wipe {
             if globals.wipe_done() {
                 self.wipe = false;
-                self.wipe_key_skip = false;
+                if self.wipe_key_skip {
+                    self.wipe_key_skip = false;
+                    if self.waiting_for_key {
+                        self.waiting_for_key = false;
+                    }
+                }
             }
         }
 
@@ -1469,9 +1474,10 @@ impl VmWait {
         self.mark_block_request();
         self.wipe = true;
         self.wipe_key_skip = key_skip;
-        if key_skip {
-            self.waiting_for_key = true;
-        }
+        // C++ TNM_PROC_TYPE_WIPE_WAIT semantics (flow_proc.cpp
+        // tnm_wipe_wait_proc): the wait releases when the wipe finishes by
+        // time; a decide key press only *skips early*. It is never a hard
+        // key wait, so waiting_for_key must stay untouched here.
     }
 
     /// Notify the wait system that a key/mouse input happened.

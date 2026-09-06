@@ -909,6 +909,46 @@ impl GfxRuntime {
         self.sync_object_sprite(images, layers, stage_u, obj_u)
     }
 
+    /// Release only the type-owned visual resource while preserving the
+    /// object's render parameters. This mirrors C_elm_object::free_type(false):
+    /// CHANGE_FILE must not reset position/color/alpha/layer/order/etc.
+    pub fn object_release_type_backing(
+        &mut self,
+        layers: &mut LayerManager,
+        stage: i64,
+        obj_idx: i64,
+    ) -> Result<()> {
+        let stage_i = stage as isize;
+        if !(0..3).contains(&stage_i) || obj_idx < 0 {
+            return Ok(());
+        }
+        let stage_u = stage_i as usize;
+        let obj_u = obj_idx as usize;
+        let (is_bg, layer_id, sprite_id) = {
+            let obj = self.ensure_object_mut(stage_u, obj_u);
+            obj.file = None;
+            obj.is_mesh = false;
+            (obj.is_bg, obj.layer_id, obj.sprite_id)
+        };
+
+        if is_bg {
+            let bg = layers.bg_mut();
+            bg.image_id = None;
+            bg.mesh_file_name = None;
+            bg.mesh_kind = 0;
+            bg.billboard = false;
+        } else if let (Some(lid), Some(sid)) = (layer_id, sprite_id) {
+            if let Some(sprite) = layers.layer_mut(lid).and_then(|layer| layer.sprite_mut(sid)) {
+                sprite.image_id = None;
+                sprite.mesh_file_name = None;
+                sprite.mesh_kind = 0;
+                sprite.billboard = false;
+                sprite.emote_render = None;
+            }
+        }
+        Ok(())
+    }
+
     pub fn object_change_file(
         &mut self,
         images: &mut ImageManager,
@@ -994,6 +1034,78 @@ impl GfxRuntime {
         sprite.shadow_cast = true;
         sprite.shadow_receive = true;
 
+        Ok(())
+    }
+
+    /// Mesh counterpart of object_change_file(): rebuild the mesh backing
+    /// without resetting render parameters that survive free_type(false).
+    pub fn object_change_mesh_file(
+        &mut self,
+        layers: &mut LayerManager,
+        stage: i64,
+        obj_idx: i64,
+        file: &str,
+        disp: i64,
+        x: i64,
+        y: i64,
+        patno: i64,
+    ) -> Result<()> {
+        let stage_i = stage as isize;
+        if !(0..3).contains(&stage_i) {
+            bail!("invalid stage: {stage}");
+        }
+        if obj_idx < 0 {
+            bail!("invalid obj idx: {obj_idx}");
+        }
+        let stage_u = stage_i as usize;
+        let obj_u = obj_idx as usize;
+        let current_layer = self.current_layer;
+
+        {
+            let obj = self.ensure_object_mut(stage_u, obj_u);
+            obj.is_bg = stage_u == 0 && obj_u == 0;
+            obj.is_mesh = true;
+            obj.file = Some(file.to_string());
+            obj.patno = patno;
+            obj.disp = disp != 0;
+            obj.x = x;
+            obj.y = y;
+            if obj.layer_no == 0 {
+                obj.layer_no = current_layer as i64;
+            }
+        }
+
+        if stage_u == 0 && obj_u == 0 {
+            let bg = layers.bg_mut();
+            bg.visible = disp != 0;
+            bg.image_id = None;
+            bg.x = x as i32;
+            bg.y = y as i32;
+            bg.mesh_file_name = Some(file.to_string());
+            bg.mesh_kind = 1;
+            bg.billboard = false;
+            bg.camera_enabled = true;
+            bg.shadow_cast = true;
+            bg.shadow_receive = true;
+        } else {
+            let (lid, sid) = self.ensure_bound_sprite(layers, stage_u, obj_u)?;
+            let sprite = layers
+                .layer_mut(lid)
+                .and_then(|l| l.sprite_mut(sid))
+                .context("mesh sprite not found")?;
+            sprite.visible = disp != 0;
+            sprite.image_id = None;
+            sprite.x = x as i32;
+            sprite.y = y as i32;
+            sprite.fit = SpriteFit::PixelRect;
+            sprite.size_mode = SpriteSizeMode::Intrinsic;
+            sprite.mesh_file_name = Some(file.to_string());
+            sprite.mesh_kind = 1;
+            sprite.billboard = false;
+            sprite.camera_enabled = true;
+            sprite.shadow_cast = true;
+            sprite.shadow_receive = true;
+        }
         Ok(())
     }
 

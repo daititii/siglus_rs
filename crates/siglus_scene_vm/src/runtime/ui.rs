@@ -189,6 +189,13 @@ pub struct MwndWindowRuntime {
     pub moji_color: Option<i64>,
     pub shadow_color: Option<i64>,
     pub fuchi_color: Option<i64>,
+    pub name_extend_type: i64,
+    pub name_window_align: i64,
+    pub name_window_pos: (i64, i64),
+    pub name_window_size: (i64, i64),
+    pub name_message_pos: (i64, i64),
+    pub name_message_pos_rep: (i64, i64),
+    pub name_message_margin: (i64, i64, i64, i64),
 }
 
 #[derive(Debug, Default)]
@@ -473,6 +480,13 @@ pub struct MwndProjectionState {
     pub slide_time: i64,
     pub vertical_writing: bool,
     pub name_text: String,
+    pub name_extend_type: i64,
+    pub name_window_align: i64,
+    pub name_window_pos: (i64, i64),
+    pub name_window_size: (i64, i64),
+    pub name_message_pos: (i64, i64),
+    pub name_message_pos_rep: (i64, i64),
+    pub name_message_margin: (i64, i64, i64, i64),
     pub name_glyphs: Vec<MwndGlyphProjection>,
     pub msg_text: String,
     pub glyphs: Vec<MwndGlyphProjection>,
@@ -869,20 +883,30 @@ impl UiRuntime {
         (x, y, width, height)
     }
 
-    fn name_rect(&self, w: u32, h: u32) -> (i32, i32, u32, u32) {
+    fn name_layout(&self, w: u32, h: u32) -> ((i32, i32, u32, u32), (i32, i32)) {
         let rect = self.window_rect(w, h);
-        let pad = self.base_padding();
-        let name_h = self.name_band_height().max(1);
-        let face_pad = if self.mwnd.face.file.is_some() || self.mwnd.face.image.is_some() {
-            self.face_reserved_width(rect) + pad / 2
-        } else {
-            0
-        };
-        let x = rect.x + pad + face_pad;
-        let y = rect.y + pad;
-        let width = (rect.w as i32 - pad * 2 - face_pad).max(1) as u32;
-        let height = name_h as u32;
-        (x, y, width, height)
+        let (mut x, y) = (
+            rect.x + self.mwnd.window.name_window_pos.0 as i32,
+            rect.y + self.mwnd.window.name_window_pos.1 as i32,
+        );
+        let width = self.mwnd.window.name_window_size.0.max(1) as u32;
+        let height = self.mwnd.window.name_window_size.1.max(1) as u32;
+        match self.mwnd.window.name_window_align {
+            1 => x -= (width / 2) as i32,
+            2 => x -= width as i32,
+            _ => {}
+        }
+        let msg_x = match self.mwnd.window.name_window_align {
+            1 => rect.x + self.mwnd.window.name_window_pos.0 as i32,
+            2 => rect.x + self.mwnd.window.name_window_pos.0 as i32
+                - self.mwnd.window.name_message_pos.0 as i32,
+            _ => rect.x + self.mwnd.window.name_window_pos.0 as i32
+                + self.mwnd.window.name_message_pos.0 as i32,
+        } + self.mwnd.window.name_message_pos_rep.0 as i32;
+        let msg_y = rect.y + self.mwnd.window.name_window_pos.1 as i32
+            + self.mwnd.window.name_message_pos.1 as i32
+            + self.mwnd.window.name_message_pos_rep.1 as i32;
+        ((x, y, width, height), (msg_x, msg_y))
     }
 
     fn face_rect(&self, w: u32, h: u32) -> UiRect {
@@ -1636,7 +1660,7 @@ impl UiRuntime {
             }
         }
 
-        let (nx, ny, nw, nh) = self.name_rect(w, h);
+        let ((_, _, nw, nh), (nx, ny)) = self.name_layout(w, h);
         for (sprite_id, image, order) in [
             (name_shadow_sprite, self.mwnd.name.shadow_image, 1_000_020),
             (name_fuchi_sprite, self.mwnd.name.fuchi_image, 1_000_021),
@@ -2392,6 +2416,13 @@ impl UiRuntime {
             proj.slide_enabled,
             proj.slide_time,
             proj.vertical_writing,
+            proj.name_extend_type,
+            proj.name_window_align,
+            proj.name_window_pos,
+            proj.name_window_size,
+            proj.name_message_pos,
+            proj.name_message_pos_rep,
+            proj.name_message_margin,
         );
         self.set_name(proj.name_text.clone());
         if self.mwnd.name.glyphs != proj.name_glyphs {
@@ -2438,6 +2469,13 @@ impl UiRuntime {
         slide_enabled: bool,
         slide_time: i64,
         vertical_writing: bool,
+        name_extend_type: i64,
+        name_window_align: i64,
+        name_window_pos: (i64, i64),
+        name_window_size: (i64, i64),
+        name_message_pos: (i64, i64),
+        name_message_pos_rep: (i64, i64),
+        name_message_margin: (i64, i64, i64, i64),
     ) {
         self.mwnd.window.pos = window_pos.map(|(x, y)| (x as i32, y as i32));
         self.mwnd.window.size = window_size.map(|(w, h)| (w.max(1) as u32, h.max(1) as u32));
@@ -2451,6 +2489,13 @@ impl UiRuntime {
         self.mwnd.window.moji_color = moji_color;
         self.mwnd.window.shadow_color = shadow_color;
         self.mwnd.window.fuchi_color = fuchi_color;
+        self.mwnd.window.name_extend_type = name_extend_type;
+        self.mwnd.window.name_window_align = name_window_align;
+        self.mwnd.window.name_window_pos = name_window_pos;
+        self.mwnd.window.name_window_size = name_window_size;
+        self.mwnd.window.name_message_pos = name_message_pos;
+        self.mwnd.window.name_message_pos_rep = name_message_pos_rep;
+        self.mwnd.window.name_message_margin = name_message_margin;
         self.mwnd.face.rep_pos = rep_pos;
         self.mwnd.msg.slide_enabled = slide_enabled;
         self.mwnd.msg.slide_time_ms = slide_time.max(0) as u64;
@@ -2511,6 +2556,9 @@ impl UiRuntime {
         self.mwnd.msg.text_dirty = true;
         self.mwnd.msg.visible_chars = 0;
         self.mwnd.msg.reveal_base = 0;
+        // Start the reveal clock for this initial text chunk. Subsequent PRINT
+        // chunks update the clock again via append_message(), matching
+        // C_elm_mwnd::set_last_moji_disp_time().
         self.mwnd.msg.reveal_start = Some(Instant::now());
         if self.mwnd.msg.slide_enabled {
             self.mwnd.msg.slide_started_at = Some(Instant::now());
@@ -2526,6 +2574,9 @@ impl UiRuntime {
             None => self.mwnd.msg.text = Some(msg.to_string()),
         }
         self.mwnd.msg.text_dirty = true;
+        // C++ tnm_msg_proc_print() calls set_last_moji_disp_time() after every
+        // added text chunk. Already-visible glyphs stay visible, while the next
+        // undisplayed glyph starts a fresh character-delay interval from now.
         self.mwnd.msg.reveal_base = self.mwnd.msg.visible_chars;
         self.mwnd.msg.reveal_start = Some(Instant::now());
         if self.mwnd.msg.slide_enabled {
@@ -2539,8 +2590,6 @@ impl UiRuntime {
             None => self.mwnd.msg.text = Some("\n".to_string()),
         }
         self.mwnd.msg.text_dirty = true;
-        self.mwnd.msg.reveal_base = self.mwnd.msg.visible_chars;
-        self.mwnd.msg.reveal_start = Some(Instant::now());
         if self.mwnd.msg.slide_enabled {
             self.mwnd.msg.slide_started_at = Some(Instant::now());
         }
@@ -3181,7 +3230,7 @@ impl UiRuntime {
         }
 
         if self.mwnd.name.text_dirty {
-            let (_, _, mw, mh) = self.name_rect(w, h);
+            let ((_, _, mw, mh), _) = self.name_layout(w, h);
             if self.mwnd.name.glyphs.is_empty() {
                 let font_size = self.name_font_px() as f32;
                 let name_text = self.mwnd.name.text.as_deref().unwrap_or("");
