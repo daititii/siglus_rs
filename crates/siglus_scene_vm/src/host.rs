@@ -31,6 +31,16 @@ use crate::vm::{SceneVm, VmConfig};
 
 const FRAME_INTERVAL_MS: u32 = 16;
 
+fn should_exit_host_frame(
+    pending_exit: bool,
+    vm_halted: bool,
+    flow_empty: bool,
+    legacy_saved_active_only: bool,
+) -> bool {
+    pending_exit
+        || (vm_halted && flow_empty && !legacy_saved_active_only)
+}
+
 
 #[derive(Debug, Clone)]
 pub struct SiglusHostConfig {
@@ -183,6 +193,10 @@ pub struct SiglusHost {
     syscom_suspended_waits: Vec<(usize, VmWait, String)>,
     paused: bool,
     pending_exit: bool,
+    /// A legacy original save may resume a top-level scene with no saved proc
+    /// caller. Its frame actions still own the visible map, so an empty script
+    /// flow is an idle frame loop rather than an Activity exit.
+    legacy_load_frame_loop: bool,
     last_step: Option<Instant>,
 }
 
@@ -250,6 +264,7 @@ impl SiglusHost {
             syscom_suspended_waits: Vec::new(),
             paused: false,
             pending_exit: false,
+            legacy_load_frame_loop: false,
             last_step: None,
         })
     }
@@ -347,7 +362,24 @@ impl SiglusHost {
             self.pump_vm()?;
         }
         self.redraw()?;
-        Ok(self.pending_exit || (self.vm.is_halted() && self.flow.stack.is_empty()))
+        let exit_now = should_exit_host_frame(
+            self.pending_exit,
+            self.vm.is_halted(),
+            self.flow.stack.is_empty(),
+            self.legacy_load_frame_loop,
+        );
+        if exit_now {
+            log::warn!(
+                "[SG-DIAG-2] engine exit requested: pending_exit={} halted={} scene={:?} scene_no={:?} line={} flow={:?}",
+                self.pending_exit,
+                self.vm.is_halted(),
+                self.vm.current_scene_name(),
+                self.vm.current_scene_no(),
+                self.vm.current_line_no(),
+                self.flow.stack
+            );
+        }
+        Ok(exit_now)
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
@@ -357,11 +389,33 @@ impl SiglusHost {
 
     pub fn mouse_down(&mut self, button: VmMouseButton) {
         self.vm.ctx.on_mouse_down(button);
+        log::warn!(
+            "[SG_INPUT_DEBUG] down={:?} scene={:?} line={} msg_waiting={} visible={}/{} wait_key={} flow={:?}",
+            button,
+            self.vm.current_scene_name(),
+            self.vm.current_line_no(),
+            self.vm.ctx.ui.message_waiting(),
+            self.vm.ctx.ui.message_visible_chars(),
+            self.vm.ctx.ui.message_wait_message_len(),
+            self.vm.ctx.wait.waiting_for_key(),
+            self.flow.stack
+        );
         self.script_needs_pump = true;
     }
 
     pub fn mouse_up(&mut self, button: VmMouseButton) {
         self.vm.ctx.on_mouse_up(button);
+        log::warn!(
+            "[SG_INPUT_DEBUG] up={:?} scene={:?} line={} msg_waiting={} visible={}/{} wait_key={} flow={:?}",
+            button,
+            self.vm.current_scene_name(),
+            self.vm.current_line_no(),
+            self.vm.ctx.ui.message_waiting(),
+            self.vm.ctx.ui.message_visible_chars(),
+            self.vm.ctx.ui.message_wait_message_len(),
+            self.vm.ctx.wait.waiting_for_key(),
+            self.flow.stack
+        );
         self.script_needs_pump = true;
     }
 
@@ -1019,21 +1073,15 @@ impl SiglusHost {
     }
 
     fn finish_runtime_load(&mut self) {
-        // A load replaces the menu script before its viewport cleanup runs.
-        // Resume the saved scene on the game's base canvas and full viewport.
-        {
-            let base_w = self.config.width.unwrap_or(1920);
-            let base_h = self.config.height.unwrap_or(1080);
-            self.renderer.borrow_mut().resize_with_logical_viewport(
-                base_w,
-                base_h,
-                1.0,
-                base_w,
-                base_h,
-                0,
-                0,
-                base_w,
-                base_h,
+        // Keep the platform-owned surface and viewport across a load. Android
+        // establishes an aspect-fit viewport for the physical SurfaceView; using
+        // Gameexe/config dimensions here would replace it with a smaller
+        // top-left canvas and leave the rest of the display black.
+        self.legacy_load_frame_loop = self.vm.legacy_saved_active_only();
+        if self.legacy_load_frame_loop {
+            log::warn!(
+                "[SG_SAVELOAD] legacy active-only load keeps host frame loop scene={:?}",
+                self.vm.current_scene_name()
             );
         }
         self.renderer.borrow_mut().clear_runtime_image_textures();
@@ -1075,6 +1123,7 @@ impl SiglusHost {
             self.vm.ctx.globals.msgbk_forms = msgbk;
         }
         self.vm.ctx.globals.finish_wipe();
+        self.legacy_load_frame_loop = false;
         self.flow.stack.clear();
         self.flow.pending_syscom_proc = None;
         self.flow.booted_menu = true;
@@ -1120,7 +1169,9 @@ impl SiglusHost {
 
         loop {
             let Some(proc) = self.flow.top().cloned() else {
-                self.paused = true;
+                if !self.legacy_load_frame_loop {
+                    self.paused = true;
+                }
                 break;
             };
             if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
@@ -1467,4 +1518,24 @@ pub fn parse_bool_exit(result: Result<bool>, context: &str) -> i32 {
 
 pub fn default_frame_interval_ms(dt_ms: u32) -> u32 {
     if dt_ms == 0 { FRAME_INTERVAL_MS } else { dt_ms }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_exit_host_frame;
+
+    #[test]
+    fn active_only_legacy_load_keeps_halted_host_alive() {
+        assert!(!should_exit_host_frame(false, true, true, true));
+    }
+
+    #[test]
+    fn ordinary_halted_empty_flow_still_requests_exit() {
+        assert!(should_exit_host_frame(false, true, true, false));
+    }
+
+    #[test]
+    fn explicit_exit_always_wins_over_legacy_keepalive() {
+        assert!(should_exit_host_frame(true, true, true, true));
+    }
 }

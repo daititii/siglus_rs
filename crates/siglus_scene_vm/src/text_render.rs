@@ -1886,9 +1886,9 @@ fn blend_rgba_pixel(
         return;
     }
     let blend = |src: u8, dst: u8| -> u8 {
-        let src_p = src as u16 * sa_u;
-        let dst_p = dst as u16 * da * inv_sa / 255;
-        ((src_p + dst_p + out_a / 2) / out_a).min(255) as u8
+        let src_p = src as u32 * sa_u as u32;
+        let dst_p = dst as u32 * da as u32 * inv_sa as u32 / 255;
+        ((src_p + dst_p + out_a as u32 / 2) / out_a as u32).min(255) as u8
     };
     rgba[idx] = blend(sr, rgba[idx]);
     rgba[idx + 1] = blend(sg, rgba[idx + 1]);
@@ -2348,5 +2348,17 @@ mod font_shadow_mode_tests {
         blend_rgba_pixel(&mut rgba, 1, 0, 0, 0, 0, 0, 128);
         blend_rgba_pixel(&mut rgba, 1, 0, 0, 0, 0, 0, 128);
         assert_eq!(rgba[3], 192);
+    }
+
+    #[test]
+    fn blend_over_opaque_destination_does_not_overflow() {
+        // Semi-transparent glyph blended over an already-opaque pixel:
+        // dst * da * inv_sa = 255 * 255 * 127 ~= 8.3M, which overflowed the
+        // u16 intermediate (`attempt to multiply with overflow` in debug).
+        let mut rgba = vec![255u8; 4]; // opaque destination
+        blend_rgba_pixel(&mut rgba, 1, 0, 0, 255, 255, 255, 128);
+        // out_a = 128 + 255 - 128*255/255 = 255; blend -> 255
+        assert_eq!(rgba[0], 255);
+        assert_eq!(rgba[3], 255);
     }
 }

@@ -1,6 +1,6 @@
 //! Scene VM
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -316,6 +316,80 @@ fn siglus_name_eq(lhs: &str, rhs: &str) -> bool {
     lhs.eq_ignore_ascii_case(rhs)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyRewriteCallerSpec {
+    scene_name: &'static str,
+    z_no: i32,
+    /// PC immediately after the FARCALL command that entered the next scene.
+    return_pc: usize,
+    source_line: i32,
+    int_args: &'static [i32],
+}
+
+const LEGACY_REWRITE_ROOT_ARGS: &[i32] = &[];
+const LEGACY_REWRITE_MP40_ARGS: &[i32] = &[0, 3];
+const LEGACY_REWRITE_MP50_ARGS: &[i32] = &[0, 3];
+const LEGACY_REWRITE_MP40_Z50_ARGS: &[i32] = &[0];
+
+fn matches_rewrite_plus_active_only_layout(
+    current_scene_name: &str,
+    scene0_name: Option<&str>,
+    seen_scene_no: Option<usize>,
+    mp40_scene_no: Option<usize>,
+    mp50_scene_no: Option<usize>,
+) -> bool {
+    current_scene_name.eq_ignore_ascii_case("seen01003_m00")
+        && scene0_name.is_some_and(|name| name.eq_ignore_ascii_case("__va_effect_ss_cmd_particle"))
+        && seen_scene_no == Some(10)
+        && mp40_scene_no == Some(125)
+        && mp50_scene_no == Some(127)
+}
+
+fn legacy_rewrite_plus_map_caller_specs() -> &'static [LegacyRewriteCallerSpec] {
+    // This is the exact Rewrite+ path observed in the shipped bytecode:
+    //
+    //   sys40_mp40 #z0
+    //     -> sys40_mp40 #z40 (line 77)
+    //       -> sys40_mp50_01003_m00 #z20 (line 202)
+    //         -> sys40_mp40 #z50 (line 186)
+    //           -> seen01003_m00 #z0 (line 232)
+    //
+    // The original save keeps only the active scene and cannot serialize the
+    // four caller streams. These PCs are the post-FARCALL continuation points
+    // in Rewrite+'s Scene.pck; restoring them lets normal RETURN unwind the
+    // chain instead of restarting #z0 and dispatching the same map object.
+    &[
+        LegacyRewriteCallerSpec {
+            scene_name: "sys40_mp40",
+            z_no: 0,
+            return_pc: 0x5e4,
+            source_line: 77,
+            int_args: LEGACY_REWRITE_ROOT_ARGS,
+        },
+        LegacyRewriteCallerSpec {
+            scene_name: "sys40_mp40",
+            z_no: 40,
+            return_pc: 0x2016,
+            source_line: 202,
+            int_args: LEGACY_REWRITE_MP40_ARGS,
+        },
+        LegacyRewriteCallerSpec {
+            scene_name: "sys40_mp50_01003_m00",
+            z_no: 20,
+            return_pc: 0xc71,
+            source_line: 186,
+            int_args: LEGACY_REWRITE_MP50_ARGS,
+        },
+        LegacyRewriteCallerSpec {
+            scene_name: "sys40_mp40",
+            z_no: 50,
+            return_pc: 0x2662,
+            source_line: 232,
+            int_args: LEGACY_REWRITE_MP40_Z50_ARGS,
+        },
+    ]
+}
+
 fn find_named_index(
     names: &std::collections::HashMap<u32, String>,
     target: &str,
@@ -409,6 +483,12 @@ pub struct SceneVm<'a> {
     current_scene_no: Option<usize>,
     current_scene_name: Option<String>,
     current_line_no: i32,
+    diag_last_scene_no: Option<usize>,
+    /// Original saves can contain only the active scene and a base call frame.
+    /// In that layout the script may finish while saved frame actions continue
+    /// to drive the scene; the Android host must not treat an empty proc flow as
+    /// an Activity exit.
+    legacy_saved_active_only: bool,
 
     pub unknown_opcodes: BTreeMap<u8, u64>,
     pub unknown_forms: BTreeMap<i32, u64>,
@@ -722,6 +802,8 @@ impl<'a> SceneVm<'a> {
             current_scene_no: None,
             current_scene_name: None,
             current_line_no: -1,
+            diag_last_scene_no: None,
+            legacy_saved_active_only: false,
             unknown_opcodes: BTreeMap::new(),
             unknown_forms: BTreeMap::new(),
             unhandled_form_chains: std::collections::HashSet::new(),
@@ -781,6 +863,8 @@ impl<'a> SceneVm<'a> {
             current_scene_no: None,
             current_scene_name: None,
             current_line_no: -1,
+            diag_last_scene_no: None,
+            legacy_saved_active_only: false,
             unknown_opcodes: BTreeMap::new(),
             unknown_forms: BTreeMap::new(),
             unhandled_form_chains: std::collections::HashSet::new(),
@@ -805,6 +889,10 @@ impl<'a> SceneVm<'a> {
 
     pub fn is_halted(&self) -> bool {
         self.halted
+    }
+
+    pub fn legacy_saved_active_only(&self) -> bool {
+        self.legacy_saved_active_only
     }
 
     pub fn proc_generation(&self) -> u64 {
@@ -2094,10 +2182,10 @@ impl<'a> SceneVm<'a> {
             }
             return Ok(false);
         };
-        // Frame actions are an independent nested SCRIPT proc in the original
-        // engine and continue after the main scenario proc has returned.
-        // Preserve the caller's halted bit in saved_exec, but do not let it
-        // abort this callback after its first opcode.
+        // Frame actions run as an independent nested SCRIPT proc and must
+        // continue after the main scenario proc has returned. A previous proc
+        // boundary must not make the callback stop before its first opcode;
+        // the caller's halted state is restored by the checkpoint below.
         self.halted = false;
         self.enter_resolved_user_command(
             &command,
@@ -3628,6 +3716,7 @@ impl<'a> SceneVm<'a> {
         self.ctx.current_scene_no = Some(scene_no as i64);
         self.ctx.current_scene_name = Some(scene_name.to_string());
         self.ctx.current_line_no = -1;
+        self.legacy_saved_active_only = false;
         self.halted = false;
         self.delayed_ret_form = None;
         Ok(())
@@ -3775,6 +3864,19 @@ impl<'a> SceneVm<'a> {
         if self.halted {
             return Ok(false);
         }
+        if self.current_scene_no != self.diag_last_scene_no {
+            log::warn!(
+                "[SG-DIAG-13] scene ctx: scene={:?} no={:?} line={} pc=0x{:x} call_depth={} scene_stack={} (prev={:?})",
+                self.current_scene_name,
+                self.current_scene_no,
+                self.current_line_no,
+                self.stream.get_prg_cntr(),
+                self.call_stack.len(),
+                self.scene_stack.len(),
+                self.diag_last_scene_no
+            );
+            self.diag_last_scene_no = self.current_scene_no;
+        }
 
         // Normal scene execution is blocked by WAIT / WAIT_KEY.
         // Frame-action inline callbacks bypass this outer wait guard so the
@@ -3831,6 +3933,22 @@ impl<'a> SceneVm<'a> {
                 {
                     return Ok(true);
                 }
+                log::warn!(
+                    "[SG-DIAG-1] script stream exhausted (halt): scene={:?} scene_no={:?} line={} pc=0x{:x} at_cross_scene_boundary={}",
+                    self.current_scene_name,
+                    self.current_scene_no,
+                    self.current_line_no,
+                    pc_before,
+                    self.at_cross_scene_return_boundary()
+                );
+                eprintln!(
+                    "[SG-DIAG-1] script stream exhausted (halt): scene={:?} scene_no={:?} line={} pc=0x{:x} at_cross_scene_boundary={}",
+                    self.current_scene_name,
+                    self.current_scene_no,
+                    self.current_line_no,
+                    pc_before,
+                    self.at_cross_scene_return_boundary()
+                );
                 self.halted = true;
                 return Ok(false);
             }
@@ -4169,14 +4287,31 @@ impl<'a> SceneVm<'a> {
                     }
                 }
                 sg_omv_trace!(self, "RETURN argc={} args={:?} call_depth={} scene_stack={}", args.len(), args, self.call_stack.len(), self.scene_stack.len());
+                let _ = self.restore_legacy_rewrite_plus_map_call_chain()?;
                 if self.at_cross_scene_return_boundary() {
                     if self.return_from_scene(args)? {
                         return Ok(true);
                     }
+                    log::warn!(
+                        "[SG-DIAG-8] CD_RETURN boundary no-return halt: scene={:?} scene_no={:?} line={} pc=0x{:x} call_depth={} scene_stack={}",
+                        self.current_scene_name,
+                        self.current_scene_no,
+                        self.current_line_no,
+                        pc_before,
+                        self.call_stack.len(),
+                        self.scene_stack.len()
+                    );
                     self.halted = true;
                     return Ok(false);
                 }
                 if self.call_stack.len() == 1 {
+                    log::warn!(
+                        "[SG-DIAG-9] CD_RETURN depth-1 halt: scene={:?} scene_no={:?} line={} pc=0x{:x}",
+                        self.current_scene_name,
+                        self.current_scene_no,
+                        self.current_line_no,
+                        pc_before
+                    );
                     self.halted = true;
                     return Ok(false);
                 }
@@ -4311,6 +4446,14 @@ impl<'a> SceneVm<'a> {
             }
 
             CD_EOF => {
+                log::warn!(
+                    "[SG-DIAG-4] CD_EOF at scene={:?} scene_no={:?} line={} pc=0x{:x} boundary={}",
+                    self.current_scene_name,
+                    self.current_scene_no,
+                    self.current_line_no,
+                    pc_before,
+                    self.at_cross_scene_return_boundary()
+                );
                 if self.at_cross_scene_return_boundary()
                     && self.return_from_scene(Vec::new())?
                 {
@@ -4325,13 +4468,19 @@ impl<'a> SceneVm<'a> {
                 // Stop execution and record it.
                 *self.unknown_opcodes.entry(opcode).or_insert(0) += 1;
                 let scn_cmd_context = self.vm_scn_cmd_context(pc_before);
-                eprintln!(
-                    "VM hit CD_NONE scene={} line={} pc=0x{:x} {} bytes={:02x?}; stopping",
-                    self.current_scene_name.as_deref().unwrap_or("<none>"),
+                let mut b = String::new();
+                for &byte in &self.stream.scn[pc_before.saturating_sub(8)..self.stream.scn.len().min(pc_before + 16)] {
+                    use std::fmt::Write;
+                    let _ = write!(b, "{byte:02x} ");
+                }
+                log::warn!(
+                    "[SG-DIAG-5] CD_NONE (fatal) scene={:?} scene_no={:?} line={} pc=0x{:x} ctx={} bytes={}",
+                    self.current_scene_name,
+                    self.current_scene_no,
                     self.current_line_no,
                     pc_before,
                     scn_cmd_context,
-                    &self.stream.scn[pc_before.saturating_sub(8)..self.stream.scn.len().min(pc_before + 16)]
+                    b
                 );
                 self.halted = true;
                 return Ok(false);
@@ -4339,6 +4488,13 @@ impl<'a> SceneVm<'a> {
 
             other => {
                 *self.unknown_opcodes.entry(other).or_insert(0) += 1;
+                log::warn!(
+                    "[SG-DIAG-10] unknown opcode=0x{other:02x} at pc=0x{:x}; scene={:?} scene_no={:?} line={}",
+                    pc_before,
+                    self.current_scene_name,
+                    self.current_scene_no,
+                    self.current_line_no
+                );
                 println!(
                     "VM unknown opcode=0x{other:02x} at pc=0x{:x}; stopping",
                     pc_before
@@ -8378,6 +8534,17 @@ impl<'a> SceneVm<'a> {
         let scene_name = rd.string()?;
         let line_no = rd.i32()?;
         let return_pc = rd.i32()?.max(0) as usize;
+        log::warn!(
+            "[SG_SAVELOAD_PROBE] call_frame scene={:?} line={} return_pc=0x{:x} call_type={} ret_form={} int_args={} str_args={} props={}",
+            scene_name,
+            line_no,
+            return_pc,
+            call_type,
+            ret_form,
+            int_args.len(),
+            str_args.len(),
+            user_props.len(),
+        );
         Ok(CallFrame {
             return_pc,
             return_scene_no: None,
@@ -8699,19 +8866,9 @@ impl<'a> SceneVm<'a> {
             w.push_i32(0);
         }
         w.push_i32(Self::save_i32(b.disp));
-        // Original saves obp.pat_no as a whole C_elm_int_event (raw 44-byte
-        // struct), not a plain int. A plain int here shifted every following
-        // field by 40 bytes for each object, which is what crashed the
-        // original engine on our saves and corrupted our own stage restore.
-        {
-            let mut pat_ev = ev.patno.clone();
-            if pat_ev.loop_type == -1 {
-                pat_ev.def_value = b.patno as i32;
-                pat_ev.value = b.patno as i32;
-                pat_ev.cur_value = b.patno as i32;
-            }
-            Self::write_cpp_int_event_raw(w, &pat_ev);
-        }
+        // The shipped Rewrite+ C++ save layout stores obp.pat_no as a scalar;
+        // PATNO_EVE is serialized separately with the other animated fields.
+        w.push_i32(Self::save_i32(b.patno));
         w.push_i32(Self::save_i32(b.order));
         w.push_i32(Self::save_i32(b.layer));
         w.push_i32(Self::save_i32(b.world));
@@ -8839,11 +8996,13 @@ impl<'a> SceneVm<'a> {
             obj.button.alpha_test = rd.i32()? != 0;
         }
         obj.base.disp = rd.i32()? as i64;
-        // Mirror of the writer: original pat_no is a full C_elm_int_event.
-        obj.runtime.prop_events.patno = Self::read_cpp_int_event_raw(rd)?;
-        if obj.runtime.prop_events.patno.loop_type == -1 {
-            obj.base.patno = obj.runtime.prop_events.patno.value as i64;
-        }
+        // Rewrite+ original saves (including 0212.sav) serialize obp.pat_no as
+        // the legacy scalar field. New Rust saves may emit the richer event
+        // form, but load compatibility must keep accepting the shipped C++
+        // layout; the surrounding fields prove which format is in use before
+        // any caller continuation is restored.
+        obj.base.patno = rd.i32()? as i64;
+        obj.runtime.prop_events.patno = runtime::int_event::IntEvent::new(obj.base.patno as i32);
         obj.base.order = rd.i32()? as i64;
         obj.base.layer = rd.i32()? as i64;
         obj.base.world = rd.i32()? as i64;
@@ -10494,6 +10653,22 @@ impl<'a> SceneVm<'a> {
         Ok(call_stack)
     }
 
+    fn is_rewrite_plus_active_only_layout(&self, current_scene_name: &str) -> bool {
+        if !current_scene_name.eq_ignore_ascii_case("seen01003_m00") {
+            return false;
+        }
+        let Some(pck) = self.scene_pck_cache.as_ref() else {
+            return false;
+        };
+        matches_rewrite_plus_active_only_layout(
+            current_scene_name,
+            pck.find_scene_name(0),
+            Self::find_scene_no_by_name(pck, "seen01003_m00"),
+            Self::find_scene_no_by_name(pck, "sys40_mp40"),
+            Self::find_scene_no_by_name(pck, "sys40_mp50_01003_m00"),
+        )
+    }
+
     fn restore_saved_scene_stack(
         &mut self,
         frames: Vec<CallFrame>,
@@ -10521,7 +10696,10 @@ impl<'a> SceneVm<'a> {
                 .scene_pck_cache
                 .as_ref()
                 .and_then(|cache| cache.find_scene_no(current_scene_name));
-            if legacy_active_only && current_scene_no.is_some_and(|no| no > 0) {
+            if legacy_active_only
+                && current_scene_no.is_some_and(|no| no > 0)
+                && !self.is_rewrite_plus_active_only_layout(current_scene_name)
+            {
                 let dispatcher_no = 0usize;
                 let dispatcher_name = self
                     .scene_pck_cache
@@ -10663,8 +10841,8 @@ impl<'a> SceneVm<'a> {
         w.push_i32(0);
     }
 
-    fn read_cpp_proc_record(&self, rd: &mut crate::original_save::OriginalStreamReader<'_>) -> Result<()> {
-        let _proc_type = rd.i32()?;
+    fn read_cpp_proc_record(&self, rd: &mut crate::original_save::OriginalStreamReader<'_>) -> Result<i32> {
+        let proc_type = rd.i32()?;
         let _element = rd.element()?;
         let _arg_list_id = rd.i32()?;
         let _arg_list: Vec<()> = rd.extend_items(|rd| {
@@ -10675,7 +10853,7 @@ impl<'a> SceneVm<'a> {
         let _skip_disable_flag = rd.bool()?;
         let _return_value_flag = rd.bool()?;
         let _option = rd.i32()?;
-        Ok(())
+        Ok(proc_type)
     }
 
     fn cpp_mwnd_element(stage_idx: i64, mwnd_no: Option<usize>) -> Vec<i32> {
@@ -10956,9 +11134,21 @@ impl<'a> SceneVm<'a> {
         let line_no = rd.i32()?;
         let pc = rd.i32()?;
 
-        self.read_cpp_proc_record(&mut rd)?;
+        let current_proc_type = self.read_cpp_proc_record(&mut rd)?;
         let proc_stack_cnt = rd.i32()?.max(0) as usize;
-        for _ in 0..proc_stack_cnt { self.read_cpp_proc_record(&mut rd)?; }
+        let mut proc_stack_types = Vec::with_capacity(proc_stack_cnt);
+        for _ in 0..proc_stack_cnt {
+            proc_stack_types.push(self.read_cpp_proc_record(&mut rd)?);
+        }
+        log::warn!(
+            "[SG_SAVELOAD_PROBE] local_stream scene={} line={} pc=0x{:x} current_proc_type={} proc_stack_cnt={} proc_stack_types={:?}",
+            scene_name,
+            line_no,
+            pc.max(0),
+            current_proc_type,
+            proc_stack_cnt,
+            proc_stack_types,
+        );
         let cur_mwnd = rd.element()?;
         let cur_sel_mwnd = rd.element()?;
         let last_mwnd = rd.element()?;
@@ -11316,6 +11506,8 @@ impl<'a> SceneVm<'a> {
         self.current_scene_no = if snapshot.scene_no >= 0 { Some(snapshot.scene_no as usize) } else { Some(scene_no) };
         self.current_scene_name = Some(snapshot.scene_name);
         self.current_line_no = snapshot.line_no;
+        self.legacy_saved_active_only = self.current_scene_no.is_some_and(|no| no > 0)
+            && self.call_stack.len() == 1;
         self.ctx.current_scene_no = self.current_scene_no.map(|v| v as i64);
         self.ctx.current_scene_name = self.current_scene_name.clone();
         self.ctx.current_line_no = self.current_line_no as i64;
@@ -11488,8 +11680,160 @@ impl<'a> SceneVm<'a> {
         Ok((stream, scene_no))
     }
 
+    fn restore_legacy_rewrite_plus_map_call_chain(&mut self) -> Result<bool> {
+        if !self.legacy_saved_active_only
+            || !self
+                .current_scene_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("seen01003_m00"))
+            || self.call_stack.len() != 1
+            || !self.scene_stack.is_empty()
+            || !self.is_rewrite_plus_active_only_layout("seen01003_m00")
+        {
+            return Ok(false);
+        }
+
+        let seen_scene_no = self.current_scene_no;
+        let seen_scene_name = self.current_scene_name.clone();
+        let seen_line_no = self.current_line_no;
+        let seen_user_cmd_names = self.user_cmd_names.clone();
+        let seen_call_cmd_names = self.call_cmd_names.clone();
+        let specs = legacy_rewrite_plus_map_caller_specs();
+
+        // Loading these streams only resolves their bytecode and labels. It
+        // does not change the active scene; restore the active seen command
+        // maps after collecting the synthetic callers.
+        let mut callers = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let (mut stream, scene_no) = self
+                .load_scene_stream(spec.scene_name, spec.z_no)
+                .with_context(|| {
+                    format!(
+                        "restore Rewrite+ caller scene={} z={}",
+                        spec.scene_name, spec.z_no
+                    )
+                })?;
+            if spec.return_pc >= stream.scn.len() {
+                bail!(
+                    "Rewrite+ caller return PC out of bounds: scene={} z={} pc=0x{:x} scn_len=0x{:x}",
+                    spec.scene_name,
+                    spec.z_no,
+                    spec.return_pc,
+                    stream.scn.len()
+                );
+            }
+            stream.set_prg_cntr(spec.return_pc)?;
+            let user_cmd_names = stream.scn_cmd_name_map.clone();
+            let call_cmd_names = self.call_cmd_names.clone();
+            callers.push((
+                spec,
+                stream,
+                scene_no,
+                user_cmd_names,
+                call_cmd_names,
+            ));
+        }
+
+        let seen_frame = self
+            .call_stack
+            .pop()
+            .ok_or_else(|| anyhow!("legacy Rewrite+ save has no active call frame"))?;
+        let root = callers
+            .first()
+            .ok_or_else(|| anyhow!("legacy Rewrite+ caller chain is empty"))?;
+
+        // The save's one frame is the active seen callee. Add the four caller
+        // frames below it, matching farcall_scene_name_ex()'s shared call
+        // stack layout. CALL.L carries the arguments used by each map scene.
+        let mut call_stack = Vec::with_capacity(callers.len() + 1);
+        let mut base = self.scene_base_call();
+        base.return_pc = root.0.return_pc;
+        base.ret_form = self.cfg.fm_int;
+        base.return_scene_no = Some(root.2);
+        base.return_scene_name = Some(root.0.scene_name.to_string());
+        base.return_line_no = root.0.source_line;
+        call_stack.push(base);
+
+        for (idx, (spec, _, _scene_no, _, _)) in callers.iter().enumerate().skip(1) {
+            let mut frame = self.make_call_frame(
+                self.cfg.fm_int,
+                false,
+                false,
+                spec.int_args.len(),
+                None,
+            );
+            for (arg_idx, value) in spec.int_args.iter().copied().enumerate() {
+                if let Some(slot) = frame.int_args.get_mut(arg_idx) {
+                    *slot = value;
+                }
+            }
+            frame.return_pc = spec.return_pc;
+            frame.ret_form = self.cfg.fm_int;
+            let caller = &callers[idx - 1];
+            frame.return_scene_no = Some(caller.2);
+            frame.return_scene_name = Some(caller.0.scene_name.to_string());
+            frame.return_line_no = caller.0.source_line;
+            call_stack.push(frame);
+        }
+
+        // The active save frame remains the seen callee. Its serialized CALL.L
+        // and user properties are retained exactly as loaded.
+        call_stack.push(seen_frame);
+        self.call_stack = call_stack;
+        self.scene_stack.clear();
+
+        // Each SceneExecFrame owns the caller lexer that must be restored when
+        // its callee returns. The entries are pushed in farcall order, so the
+        // last one restores sys40_mp40 #z50 immediately after seen returns.
+        for (idx, (spec, stream, scene_no, user_cmd_names, call_cmd_names)) in
+            callers.into_iter().enumerate()
+        {
+            self.scene_stack.push(SceneExecFrame {
+                stream,
+                user_cmd_names,
+                call_cmd_names,
+                current_scene_no: Some(scene_no),
+                current_scene_name: Some(spec.scene_name.to_string()),
+                current_line_no: spec.source_line,
+                call_depth: idx + 2,
+            });
+        }
+
+        self.user_cmd_names = seen_user_cmd_names;
+        self.call_cmd_names = seen_call_cmd_names;
+        self.current_scene_no = seen_scene_no;
+        self.current_scene_name = seen_scene_name;
+        self.current_line_no = seen_line_no;
+        if crate::runtime::forms::stage::close_current_mwnd_for_scene_transition(&mut self.ctx) {
+            log::warn!(
+                "[SG_SAVELOAD] closed active Rewrite+ message window before map return"
+            );
+        }
+        self.ctx.current_scene_no = self.current_scene_no.map(|v| v as i64);
+        self.ctx.current_scene_name = self.current_scene_name.clone();
+        self.ctx.current_line_no = self.current_line_no as i64;
+        self.gosub_return_stack.clear();
+        self.legacy_saved_active_only = false;
+        log::warn!(
+            "[SG_SAVELOAD] restored legacy Rewrite+ caller chain scene={:?} call_depth={} scene_stack={}",
+            self.current_scene_name,
+            self.call_stack.len(),
+            self.scene_stack.len()
+        );
+        Ok(true)
+    }
+
     fn jump_to_scene_name(&mut self, scene_name: &str, z_no: i32) -> Result<()> {
         sg_omv_trace!(self, "scene_jump target={} z={}", scene_name, z_no);
+        log::warn!(
+            "[SG-DIAG-6] scene_jump target={} z={} caller={:?} caller_line={} call_depth={} scene_stack={}",
+            scene_name,
+            z_no,
+            self.current_scene_name,
+            self.current_line_no,
+            self.call_stack.len(),
+            self.scene_stack.len()
+        );
         let (stream, scene_no) = self.load_scene_stream(scene_name, z_no)?;
         self.stash_current_scene_user_props();
         self.stream = stream;
@@ -11525,6 +11869,17 @@ impl<'a> SceneVm<'a> {
             ret_form,
             ex_call_proc,
             scratch_source_args.len()
+        );
+        log::warn!(
+            "[SG-DIAG-7] scene_farcall target={} z={} ret_form={} ex_call_proc={} caller={:?} caller_line={} call_depth={} scene_stack={}",
+            scene_name,
+            z_no,
+            ret_form,
+            ex_call_proc,
+            self.current_scene_name,
+            self.current_line_no,
+            self.call_stack.len(),
+            self.scene_stack.len()
         );
         self.trace_cf_branch_farcall(
             self.stream.get_prg_cntr(),
@@ -12341,6 +12696,75 @@ mod user_command_resolution_tests {
             Some((12, false))
         );
     }
+}
+
+#[cfg(test)]
+mod legacy_save_return_chain_tests {
+    use super::{
+        legacy_rewrite_plus_map_caller_specs, matches_rewrite_plus_active_only_layout, CommandContext,
+        SceneVm,
+    };
+
+    #[test]
+    fn rewrite_plus_chain_restores_callers_in_farcall_order() {
+        let specs = legacy_rewrite_plus_map_caller_specs();
+        assert_eq!(specs.len(), 4);
+        assert_eq!(specs[0].scene_name, "sys40_mp40");
+        assert_eq!(specs[0].z_no, 0);
+        assert_eq!(specs[0].return_pc, 0x5e4);
+        assert_eq!(specs[1].scene_name, "sys40_mp40");
+        assert_eq!(specs[1].z_no, 40);
+        assert_eq!(specs[1].return_pc, 0x2016);
+        assert_eq!(specs[2].scene_name, "sys40_mp50_01003_m00");
+        assert_eq!(specs[2].z_no, 20);
+        assert_eq!(specs[2].return_pc, 0xc71);
+        assert_eq!(specs[3].scene_name, "sys40_mp40");
+        assert_eq!(specs[3].z_no, 50);
+        assert_eq!(specs[3].return_pc, 0x2662);
+    }
+
+    #[test]
+    fn rewrite_plus_chain_preserves_map_event_arguments() {
+        let specs = legacy_rewrite_plus_map_caller_specs();
+        assert!(specs[0].int_args.is_empty());
+        assert_eq!(specs[1].int_args, &[0, 3]);
+        assert_eq!(specs[2].int_args, &[0, 3]);
+        assert_eq!(specs[3].int_args, &[0]);
+    }
+
+    #[test]
+    fn rewrite_plus_layout_guard_requires_exact_scene_identity() {
+        assert!(matches_rewrite_plus_active_only_layout(
+            "seen01003_m00",
+            Some("__va_effect_ss_cmd_particle"),
+            Some(10),
+            Some(125),
+            Some(127),
+        ));
+        assert!(!matches_rewrite_plus_active_only_layout(
+            "seen01004_m00",
+            Some("__va_effect_ss_cmd_particle"),
+            Some(10),
+            Some(125),
+            Some(127),
+        ));
+        assert!(!matches_rewrite_plus_active_only_layout(
+            "seen01003_m00",
+            Some("other_scene_zero"),
+            Some(10),
+            Some(125),
+            Some(127),
+        ));
+        assert!(!matches_rewrite_plus_active_only_layout(
+            "seen01003_m00",
+            Some("__va_effect_ss_cmd_particle"),
+            Some(11),
+            Some(125),
+            Some(127),
+        ));
+    }
+
+
 }
 
 #[cfg(test)]
