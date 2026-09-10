@@ -767,6 +767,11 @@ pub struct VmWait {
     skip_time_on_key: bool,
 
     pub audio: Option<AudioWait>,
+    /// C_tnm_proc::key_skip_enable_flag for audio waits. Audio WAIT_KEY is
+    /// still an audio proc; it must not be represented by the generic
+    /// MESSAGE/INPUT `waiting_for_key` bit. The original flow proc consumes
+    /// only VK_EX_DECIDE down-up and leaves the sound playing.
+    audio_key_skip: bool,
     audio_return_value: bool,
 
     pub event: Option<EventWait>,
@@ -829,8 +834,9 @@ impl VmWait {
         pcm: &mut PcmEngine,
         globals: &mut GlobalState,
         ids: &RuntimeConstants,
+        skipping: bool,
     ) -> bool {
-        let blocked = self.is_blocked(bgm, koe, se, pcm, globals, ids);
+        let blocked = self.is_blocked(bgm, koe, se, pcm, globals, ids, skipping);
         if !blocked {
             if let Some(v) = self.pending_value.take() {
                 stack.push(v);
@@ -847,6 +853,7 @@ impl VmWait {
         pcm: &mut PcmEngine,
         globals: &mut GlobalState,
         ids: &RuntimeConstants,
+        skipping: bool,
     ) -> bool {
         // Auto-clear time waits when the deadline is reached.
         if let Some(t) = self.until {
@@ -880,11 +887,24 @@ impl VmWait {
             };
             if done {
                 self.audio = None;
+                self.audio_key_skip = false;
                 if self.audio_return_value {
                     self.pending_value = Some(Value::Int(0));
                 }
                 self.audio_return_value = false;
             }
+        }
+
+        // All original audio flow procs (BGM/KOE/PCM/PCMCH) test skipping
+        // after natural completion. Skip releases only the proc; the player
+        // keeps running. The returned value is the normal-completion value 0.
+        if skipping && self.audio.is_some() {
+            self.audio = None;
+            self.audio_key_skip = false;
+            if self.audio_return_value {
+                self.pending_value = Some(Value::Int(0));
+            }
+            self.audio_return_value = false;
         }
 
         // Auto-clear event waits when the predicate is satisfied.
@@ -900,7 +920,7 @@ impl VmWait {
                     *stage_idx,
                     *runtime_slot,
                 )
-                .map(|obj| !obj.used || !obj.any_event_active())
+                .map(|obj| !obj.any_event_active())
                 .unwrap_or(true),
                 EventWait::ObjectOne {
                     stage_form_id,
@@ -914,11 +934,10 @@ impl VmWait {
                     *runtime_slot,
                 )
                 .map(|obj| {
-                    !obj.used
-                        || !obj
-                            .int_event_by_op(ids, *op)
-                            .map(|e| e.check_event())
-                            .unwrap_or(false)
+                    !obj
+                        .int_event_by_op(ids, *op)
+                        .map(|e| e.check_event())
+                        .unwrap_or(false)
                 })
                 .unwrap_or(true),
                 EventWait::ObjectList {
@@ -938,7 +957,7 @@ impl VmWait {
                         .and_then(|v| v.get(*list_idx))
                         .map(|e| e.check_event())
                         .unwrap_or(false);
-                    !obj.used || !active
+                    !active
                 })
                 .unwrap_or(true),
                 EventWait::GenericIntEvent { form_id, index } => match index {
@@ -1057,7 +1076,7 @@ impl VmWait {
                 w.stage_idx,
                 w.runtime_slot,
             )
-            .map(|obj| !obj.used || !obj.movie.check_movie())
+            .map(|obj| !obj.movie.check_movie())
             .unwrap_or(true);
 
             if done {
@@ -1077,7 +1096,7 @@ impl VmWait {
                 w.stage_idx,
                 w.runtime_slot,
             )
-            .map(|obj| !obj.used || !obj.emote.is_animating())
+            .map(|obj| !obj.emote.is_animating())
             .unwrap_or(true);
 
             if done {
@@ -1208,10 +1227,8 @@ impl VmWait {
     pub fn wait_audio_with_return(&mut self, w: AudioWait, key: bool, return_value_flag: bool) {
         self.mark_block_request();
         self.audio = Some(w);
+        self.audio_key_skip = key;
         self.audio_return_value = return_value_flag;
-        if key {
-            self.waiting_for_key = true;
-        }
     }
 
     pub fn wait_object_all_events(
@@ -1486,14 +1503,10 @@ impl VmWait {
     pub fn notify_key(&mut self, _globals: &mut GlobalState, _ids: &RuntimeConstants) -> bool {
         let wipe_skipped = self.wipe && self.wipe_key_skip;
         self.waiting_for_key = false;
-        if self.audio.is_some() && self.audio_return_value {
-            self.pending_value = Some(Value::Int(1));
-        }
-        self.audio = None;
-        self.audio_return_value = false;
         // C++ TIMEWAIT_KEY, event WAIT_KEY, and MOV/OBJECT movie waits are
         // not skipped by arbitrary key-down/mouse-down input here. They
-        // consume DECIDE/CANCEL down-up in notify_movie_down_up().
+        // consume DECIDE/CANCEL down-up in notify_movie_down_up(). Audio
+        // waits follow the same rule, but consume DECIDE only.
 
         if wipe_skipped {
             self.wipe = false;
@@ -1516,6 +1529,19 @@ impl VmWait {
         result: i64,
     ) -> bool {
         let mut skipped = false;
+        // C++ tnm_{bgm,koe,pcm,pcmch}_wait_proc consumes only a completed
+        // VK_EX_DECIDE down-up for WAIT_KEY. It releases the wait but does not
+        // stop the sound. CANCEL and arbitrary key-down events are ignored.
+        if result == 1 && self.audio_key_skip {
+            if self.audio.take().is_some() {
+                if self.audio_return_value {
+                    self.pending_value = Some(Value::Int(1));
+                }
+                skipped = true;
+            }
+            self.audio_key_skip = false;
+            self.audio_return_value = false;
+        }
         if self.skip_time_on_key && matches!(result, 1 | -1) {
             anim_skip_trace(format!(
                 "notify_movie_down_up skipped TIMEWAIT_KEY pending={}",
@@ -1616,6 +1642,7 @@ impl VmWait {
         self.message_reveal = false;
         self.skip_time_on_key = false;
         self.audio = None;
+        self.audio_key_skip = false;
         self.audio_return_value = false;
         self.event = None;
         self.event_key_skip = false;
@@ -1632,5 +1659,93 @@ impl VmWait {
         self.system_modal = false;
         self.wipe = false;
         self.wipe_key_skip = false;
+    }
+}
+
+#[cfg(test)]
+mod audio_wait_parity_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn engines() -> (BgmEngine, KoeEngine, SeEngine, PcmEngine) {
+        let root = PathBuf::from(".");
+        (
+            BgmEngine::new(root.clone()),
+            KoeEngine::new(root.clone()),
+            SeEngine::new(root.clone()),
+            PcmEngine::new(root),
+        )
+    }
+
+    #[test]
+    fn audio_wait_key_ignores_generic_input_and_cancel_but_decide_returns_one() {
+        let mut wait = VmWait::default();
+        let mut globals = GlobalState::default();
+        let ids = RuntimeConstants::default();
+
+        wait.wait_audio_with_return(AudioWait::KoeAny, true, true);
+        assert!(wait.audio.is_some());
+        assert!(wait.audio_key_skip);
+        assert!(!wait.waiting_for_key);
+
+        // C++ tnm_koe_wait_proc does not consume arbitrary key-down input.
+        assert!(!wait.notify_key(&mut globals, &ids));
+        assert!(wait.audio.is_some());
+        assert!(wait.pending_value.is_none());
+
+        // KOE/PCM/BGM WAIT_KEY consumes VK_EX_DECIDE only, not CANCEL.
+        assert!(!wait.notify_movie_down_up(&mut globals, &ids, -1));
+        assert!(wait.audio.is_some());
+        assert!(wait.pending_value.is_none());
+
+        assert!(wait.notify_movie_down_up(&mut globals, &ids, 1));
+        assert!(wait.audio.is_none());
+        assert!(!wait.audio_key_skip);
+        assert_eq!(wait.pending_value.take().and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn audio_wait_natural_finish_returns_zero_without_leaving_generic_key_wait() {
+        let mut wait = VmWait::default();
+        let (mut bgm, mut koe, mut se, mut pcm) = engines();
+        let mut globals = GlobalState::default();
+        let ids = RuntimeConstants::default();
+
+        wait.wait_audio_with_return(AudioWait::KoeAny, true, true);
+        assert!(!wait.is_blocked(
+            &mut bgm,
+            &mut koe,
+            &mut se,
+            &mut pcm,
+            &mut globals,
+            &ids,
+            false,
+        ));
+        assert!(wait.audio.is_none());
+        assert!(!wait.audio_key_skip);
+        assert!(!wait.waiting_for_key);
+        assert_eq!(wait.pending_value.take().and_then(|v| v.as_i64()), Some(0));
+    }
+
+    #[test]
+    fn skipping_releases_audio_wait_with_zero_without_stopping_player_state() {
+        let mut wait = VmWait::default();
+        let (mut bgm, mut koe, mut se, mut pcm) = engines();
+        let mut globals = GlobalState::default();
+        let ids = RuntimeConstants::default();
+
+        wait.wait_audio_with_return(AudioWait::KoeAny, true, true);
+        assert!(!wait.is_blocked(
+            &mut bgm,
+            &mut koe,
+            &mut se,
+            &mut pcm,
+            &mut globals,
+            &ids,
+            true,
+        ));
+        assert!(wait.audio.is_none());
+        assert!(!wait.audio_key_skip);
+        assert_eq!(wait.pending_value.take().and_then(|v| v.as_i64()), Some(0));
     }
 }

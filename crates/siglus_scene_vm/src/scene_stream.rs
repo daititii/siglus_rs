@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use std::sync::Arc;
 
 use siglus_assets::scene_pck::CIndex;
 
@@ -175,9 +176,9 @@ pub struct SceneStream<'a> {
     pub str_list: &'a [u8],
     pub label_list: &'a [u8],
     pub z_label_list: &'a [u8],
-    pub scn_prop_name_map: std::collections::HashMap<u32, String>,
-    pub scn_cmd_name_map: std::collections::HashMap<u32, String>,
-    pub call_prop_name_map: std::collections::HashMap<u32, String>,
+    pub scn_prop_name_map: Arc<std::collections::HashMap<u32, String>>,
+    pub scn_cmd_name_map: Arc<std::collections::HashMap<u32, String>>,
+    pub call_prop_name_map: Arc<std::collections::HashMap<u32, String>>,
     pub pc: usize,
 }
 
@@ -257,9 +258,9 @@ impl<'a> SceneStream<'a> {
             str_list,
             label_list,
             z_label_list,
-            scn_prop_name_map,
-            scn_cmd_name_map,
-            call_prop_name_map,
+            scn_prop_name_map: Arc::new(scn_prop_name_map),
+            scn_cmd_name_map: Arc::new(scn_cmd_name_map),
+            call_prop_name_map: Arc::new(call_prop_name_map),
             pc: 0,
         })
     }

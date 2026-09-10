@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use std::cell::Cell;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use eluna::{
@@ -46,6 +46,14 @@ pub struct EmoteDecodedTexture {
 }
 
 #[derive(Debug, Clone)]
+struct EmoteHitSurface {
+    version: u64,
+    width: u32,
+    height: u32,
+    alpha: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 pub struct EmoteRenderPacket {
     pub render_id: u64,
     pub version: u64,
@@ -53,8 +61,73 @@ pub struct EmoteRenderPacket {
     pub height: u32,
     pub rep_x: f32,
     pub rep_y: f32,
+    pub alpha_readback: bool,
     pub scene: Arc<EmoteStaticScene>,
     pub textures: Arc<HashMap<u32, EmoteDecodedTexture>>,
+    hit_surface: Arc<RwLock<Option<EmoteHitSurface>>>,
+}
+
+impl EmoteRenderPacket {
+    pub fn alpha_hit_test(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let Ok(surface) = self.hit_surface.read() else {
+            return false;
+        };
+        let Some(surface) = surface.as_ref() else {
+            return false;
+        };
+        if surface.version != self.version
+            || surface.width != self.width
+            || surface.height != self.height
+        {
+            return false;
+        }
+        let x = x as u32;
+        let y = y as u32;
+        if x >= surface.width || y >= surface.height {
+            return false;
+        }
+        surface
+            .alpha
+            .get((y as usize) * (surface.width as usize) + x as usize)
+            .copied()
+            .unwrap_or(0)
+            != 0
+    }
+
+    pub(crate) fn has_current_hit_surface(&self) -> bool {
+        let Ok(surface) = self.hit_surface.read() else {
+            return false;
+        };
+        surface.as_ref().is_some_and(|surface| {
+            surface.version == self.version
+                && surface.width == self.width
+                && surface.height == self.height
+        })
+    }
+
+    pub(crate) fn publish_hit_alpha(&self, alpha: Vec<u8>) {
+        if alpha.len() != self.width as usize * self.height as usize {
+            return;
+        }
+        let Ok(mut surface) = self.hit_surface.write() else {
+            return;
+        };
+        if surface
+            .as_ref()
+            .is_some_and(|current| current.version > self.version)
+        {
+            return;
+        }
+        *surface = Some(EmoteHitSurface {
+            version: self.version,
+            width: self.width,
+            height: self.height,
+            alpha,
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +136,7 @@ pub struct SiglusEmoteRuntime {
     decoded_textures: Arc<HashMap<u32, EmoteDecodedTexture>>,
     render_id: u64,
     version: u64,
+    hit_surface: Arc<RwLock<Option<EmoteHitSurface>>>,
 }
 
 impl SiglusEmoteRuntime {
@@ -107,6 +181,7 @@ impl SiglusEmoteRuntime {
             decoded_textures: Arc::new(decoded),
             render_id: next_render_id(),
             version: 1,
+            hit_surface: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -115,6 +190,7 @@ impl SiglusEmoteRuntime {
         // C_elm_object::copy clones the player but creates a fresh render target.
         cloned.render_id = next_render_id();
         cloned.version = cloned.version.wrapping_add(1).max(1);
+        cloned.hit_surface = Arc::new(RwLock::new(None));
         cloned
     }
 
@@ -187,7 +263,14 @@ impl SiglusEmoteRuntime {
         Ok(())
     }
 
-    pub fn packet(&self, width: i64, height: i64, rep_x: i64, rep_y: i64) -> Arc<EmoteRenderPacket> {
+    pub fn packet(
+        &self,
+        width: i64,
+        height: i64,
+        rep_x: i64,
+        rep_y: i64,
+        alpha_readback: bool,
+    ) -> Arc<EmoteRenderPacket> {
         Arc::new(EmoteRenderPacket {
             render_id: self.render_id,
             version: self.version,
@@ -195,8 +278,10 @@ impl SiglusEmoteRuntime {
             height: height.max(1).min(u32::MAX as i64) as u32,
             rep_x: rep_x as f32,
             rep_y: rep_y as f32,
+            alpha_readback,
             scene: Arc::new(self.runtime.scene().clone()),
             textures: self.decoded_textures.clone(),
+            hit_surface: self.hit_surface.clone(),
         })
     }
 

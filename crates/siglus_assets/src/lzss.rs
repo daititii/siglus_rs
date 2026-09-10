@@ -3,6 +3,7 @@ use anyhow::{anyhow, bail, Result};
 /// Parse the Siglus LZSS header.
 ///
 /// Format: `[u32 arc_size][u32 org_size][payload...]`.
+/// `arc_size` includes the eight-byte header.
 #[inline]
 fn parse_header(src: &[u8]) -> Result<(usize, usize)> {
     if src.len() < 8 {
@@ -28,10 +29,8 @@ pub fn lzss_unpack(src: &[u8]) -> Result<Vec<u8>> {
     }
 
     let payload_start = 8usize;
-    let payload_end = payload_start
-        .checked_add(arc_size)
-        .ok_or_else(|| anyhow!("lzss: arc_size overflow"))?;
-    if payload_end > src.len() {
+    let payload_end = arc_size;
+    if payload_end < payload_start || payload_end > src.len() {
         bail!(
             "lzss: arc_size out of bounds (end={}, len={})",
             payload_end,
@@ -109,14 +108,10 @@ pub fn lzss_unpack(src: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decompress Siglus LZSS but be tolerant about the declared `arc_size`.
+/// Decompress Siglus LZSS, allowing `arc_size` to extend past the input.
 ///
-/// The original engine does not always hard-fail on mismatched `arc_size`.
-/// Instead, it will typically decode until either:
-/// - the output reaches `org_size`, or
-/// - the input stream ends.
-///
-/// We still require the final output length to match `org_size`.
+/// Read only up to the declared archive boundary or the end of the input,
+/// whichever comes first. The output must still contain `org_size` bytes.
 pub fn lzss_unpack_lenient(src: &[u8]) -> Result<Vec<u8>> {
     let (arc_size, org_size) = parse_header(src)?;
     if org_size == 0 {
@@ -124,10 +119,7 @@ pub fn lzss_unpack_lenient(src: &[u8]) -> Result<Vec<u8>> {
     }
 
     let payload_start = 8usize;
-    let payload_end = payload_start
-        .checked_add(arc_size)
-        .ok_or_else(|| anyhow!("lzss(lenient): arc_size overflow"))?
-        .min(src.len());
+    let payload_end = arc_size.min(src.len());
 
     let mut pos = payload_start;
     let mut out: Vec<u8> = Vec::with_capacity(org_size);
@@ -204,10 +196,8 @@ pub fn lzss_unpack32(src: &[u8]) -> Result<Vec<u8>> {
     }
 
     let payload_start = 8usize;
-    let payload_end = payload_start
-        .checked_add(arc_size)
-        .ok_or_else(|| anyhow!("lzss32: arc_size overflow"))?;
-    if payload_end > src.len() {
+    let payload_end = arc_size;
+    if payload_end < payload_start || payload_end > src.len() {
         bail!(
             "lzss32: arc_size out of bounds (end={}, len={})",
             payload_end,
@@ -301,4 +291,50 @@ pub fn lzss_unpack32(src: &[u8]) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive(payload: &[u8], org_size: u32) -> Vec<u8> {
+        let mut src = Vec::new();
+        src.extend_from_slice(&(8 + payload.len() as u32).to_le_bytes());
+        src.extend_from_slice(&org_size.to_le_bytes());
+        src.extend_from_slice(payload);
+        src
+    }
+
+    #[test]
+    fn archive_size_includes_header() {
+        // Two literals followed by an overlapping, distance-two match.
+        let src = archive(&[0x03, b'a', b'b', 0x22, 0x00], 6);
+        assert_eq!(lzss_unpack(&src).unwrap(), b"ababab");
+        assert_eq!(lzss_unpack_lenient(&src).unwrap(), b"ababab");
+
+        let src = archive(&[0x01, 10, 20, 30, 0x11, 0x00], 12);
+        assert_eq!(lzss_unpack32(&src).unwrap(), [10, 20, 30, 255].repeat(3));
+    }
+
+    #[test]
+    fn archive_boundary_excludes_trailing_bytes() {
+        let mut src = archive(&[0x01], 1);
+        src.push(b'a');
+        assert!(lzss_unpack(&src).is_err());
+        assert!(lzss_unpack_lenient(&src).is_err());
+
+        let mut src = archive(&[0x01, 10, 20], 4);
+        src.push(30);
+        assert!(lzss_unpack32(&src).is_err());
+    }
+
+    #[test]
+    fn strict_decoders_reject_invalid_archive_sizes() {
+        for arc_size in [0u32, 7, 100] {
+            let mut src = archive(&[0x01, 10, 20, 30], 4);
+            src[..4].copy_from_slice(&arc_size.to_le_bytes());
+            assert!(lzss_unpack(&src).is_err());
+            assert!(lzss_unpack32(&src).is_err());
+        }
+    }
 }

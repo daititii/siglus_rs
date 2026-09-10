@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::runtime::globals::SaveSlotState;
@@ -98,7 +100,7 @@ impl OriginalSaveHeader {
             message: slot.message.clone(),
             full_message: slot.full_message.clone(),
             comment: slot.comment.clone(),
-            comment2: String::new(),
+            comment2: slot.comment2.clone(),
             flag,
             data_size: packed_size as i32,
         }
@@ -106,6 +108,7 @@ impl OriginalSaveHeader {
 
     pub fn to_slot(&self) -> SaveSlotState {
         let mut slot = SaveSlotState::default();
+        slot.header_cache_valid = true;
         slot.exist = self.major_version == 1 && self.minor_version == 0;
         slot.year = self.year as i64;
         slot.month = self.month as i64;
@@ -121,6 +124,8 @@ impl OriginalSaveHeader {
         slot.message = self.message.clone();
         slot.full_message = self.full_message.clone();
         slot.comment = self.comment.clone();
+        slot.comment2 = self.comment2.clone();
+        slot.packed_data_size = self.data_size.max(0) as usize;
         for (idx, value) in self.flag.iter().enumerate() {
             if *value != 0 {
                 slot.values.insert(idx as i32, *value as i64);
@@ -747,8 +752,27 @@ pub fn thumb_candidate_paths_with_counts(project_dir: &Path, save_cnt: usize, qu
 }
 
 pub fn read_header_from_path(path: &Path) -> Result<OriginalSaveHeader> {
-    let data = crate::resource::read_file_bytes(path).with_context(|| format!("read save header {}", path.display()))?;
-    OriginalSaveHeader::from_bytes(&data[..data.len().min(SAVE_HEADER_SIZE)])
+    // Native C_tnm_save_cache::load_cache() reads only
+    // sizeof(S_tnm_save_header). Do not pull the packed local-save payload
+    // into memory just to answer LOAD_SCENE metadata queries.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        let mut file = crate::resource::open_game_file(path)
+            .with_context(|| format!("open save header {}", path.display()))?;
+        let mut data = vec![0u8; SAVE_HEADER_SIZE];
+        file.read_exact(&mut data)
+            .with_context(|| format!("read save header {}", path.display()))?;
+        return OriginalSaveHeader::from_bytes(&data);
+    }
+
+    // The browser VFS currently exposes whole-file reads only. Preserve that
+    // backend while keeping the native path faithful to C_file::read(header).
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let data = crate::resource::read_file_bytes(path)
+            .with_context(|| format!("read save header {}", path.display()))?;
+        OriginalSaveHeader::from_bytes(&data[..data.len().min(SAVE_HEADER_SIZE)])
+    }
 }
 
 pub fn read_header(project_dir: &Path, kind: SaveKind, idx: usize) -> Option<OriginalSaveHeader> {
@@ -765,14 +789,31 @@ pub fn read_slot_from_path(path: &Path) -> Option<SaveSlotState> {
 }
 
 pub fn write_header_in_place(path: &Path, header: &OriginalSaveHeader) -> Result<()> {
-    let mut data = crate::resource::read_file_bytes(path).with_context(|| format!("read save file {}", path.display()))?;
-    if data.len() < SAVE_HEADER_SIZE {
-        bail!("save file too short for header update: {}", path.display());
+    // C_tnm_save_cache::save_cache() opens the existing file as rb+ and
+    // overwrites only S_tnm_save_header. Keep the packed payload untouched.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open save header for update {}", path.display()))?;
+        file.write_all(&header.to_bytes())
+            .with_context(|| format!("write save header {}", path.display()))?;
+        return Ok(());
     }
-    data[..SAVE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
-    fs::write(path, data).with_context(|| format!("write save file {}", path.display()))?;
-    crate::resource::invalidate_game_path_cache(path);
-    Ok(())
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let mut data = crate::resource::read_file_bytes(path)
+            .with_context(|| format!("read save file {}", path.display()))?;
+        if data.len() < SAVE_HEADER_SIZE {
+            bail!("save file too short for header update: {}", path.display());
+        }
+        data[..SAVE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+        fs::write(path, data).with_context(|| format!("write save file {}", path.display()))?;
+        crate::resource::invalidate_game_path_cache(path);
+        Ok(())
+    }
 }
 
 pub fn write_local_save_file(path: &Path, slot: &SaveSlotState, env: &OriginalLocalSaveEnvelope) -> Result<()> {

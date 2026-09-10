@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use bytemuck::{Pod, Zeroable};
@@ -118,6 +119,7 @@ struct Target {
     output: GpuTexture,
     feedback: GpuTexture,
     feedback_valid: bool,
+    alpha_readback_version: Option<u64>,
     stencil_texture: wgpu::Texture,
     stencil_view: wgpu::TextureView,
     textures: HashMap<u32, GpuTexture>,
@@ -245,11 +247,24 @@ impl EmoteCompositor {
             let target = create_target(device, queue, &self.bind_group_layout, packet)?;
             self.targets.insert(packet.render_id, target);
         }
+        // Drive map_async callbacks without blocking. This is also valid on
+        // wasm32, where Maintain::Wait is not available as a synchronous path.
+        device.poll(wgpu::Maintain::Poll);
         if self
             .targets
             .get(&packet.render_id)
             .is_some_and(|target| target.version == packet.version)
         {
+            if packet.alpha_readback && !packet.has_current_hit_surface() {
+                let target = self
+                    .targets
+                    .get_mut(&packet.render_id)
+                    .ok_or_else(|| anyhow!("Emote compositor target disappeared"))?;
+                if target.alpha_readback_version != Some(packet.version) {
+                    schedule_alpha_readback(device, queue, target, packet);
+                    target.alpha_readback_version = Some(packet.version);
+                }
+            }
             return Ok(());
         }
 
@@ -385,6 +400,10 @@ impl EmoteCompositor {
         let target = self.targets.get_mut(&packet.render_id).unwrap();
         target.feedback_valid = true;
         target.version = packet.version;
+        if packet.alpha_readback && target.alpha_readback_version != Some(packet.version) {
+            schedule_alpha_readback(device, queue, target, packet);
+            target.alpha_readback_version = Some(packet.version);
+        }
         Ok(())
     }
 
@@ -395,6 +414,77 @@ impl EmoteCompositor {
     pub(super) fn retain_render_ids(&mut self, live: &HashSet<u64>) {
         self.targets.retain(|render_id, _| live.contains(render_id));
     }
+}
+
+fn schedule_alpha_readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &Target,
+    packet: &EmoteRenderPacket,
+) {
+    let width = packet.width.max(1);
+    let height = packet.height.max(1);
+    let unpadded_bytes_per_row = width.saturating_mul(4);
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+    let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("siglus-emote-alpha-readback"),
+        size: padded_bytes_per_row as u64 * height as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    }));
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("siglus-emote-alpha-readback-encoder"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: &target.output._tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: buffer.as_ref(),
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let callback_buffer = buffer.clone();
+    let callback_packet = packet.clone();
+    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        if let Err(err) = result {
+            log::error!("Emote alpha readback failed: {err}");
+            return;
+        }
+        let width = callback_packet.width as usize;
+        let height = callback_packet.height as usize;
+        let row_bytes = width.saturating_mul(4);
+        let data = callback_buffer.slice(..).get_mapped_range();
+        let mut alpha = vec![0u8; width.saturating_mul(height)];
+        for y in 0..height {
+            let src_offset = y.saturating_mul(padded_bytes_per_row as usize);
+            let src_end = src_offset.saturating_add(row_bytes);
+            if src_end > data.len() {
+                break;
+            }
+            for x in 0..width {
+                alpha[y * width + x] = data[src_offset + x * 4 + 3];
+            }
+        }
+        drop(data);
+        callback_buffer.unmap();
+        callback_packet.publish_hit_alpha(alpha);
+    });
 }
 
 fn create_target(
@@ -499,6 +589,7 @@ fn create_target(
         output,
         feedback,
         feedback_valid: false,
+        alpha_readback_version: None,
         stencil_texture,
         stencil_view,
         textures,

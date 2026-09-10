@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -179,7 +180,7 @@ pub struct ScenePck {
     pub header: PackScnHeader,
     pub scn_name_map: HashMap<String, usize>,
     pub inc_prop_name_map: HashMap<u32, String>,
-    pub inc_cmd_name_map: HashMap<u32, String>,
+    pub inc_cmd_name_map: Arc<HashMap<u32, String>>,
     pub inc_props: Vec<PackIncProp>,
     pub inc_cmds: Vec<PackIncCmd>,
 }
@@ -462,7 +463,7 @@ impl ScenePck {
             header,
             scn_name_map,
             inc_prop_name_map,
-            inc_cmd_name_map,
+            inc_cmd_name_map: Arc::new(inc_cmd_name_map),
             inc_props,
             inc_cmds,
         })
@@ -495,7 +496,22 @@ impl ScenePck {
         if let Ok(i) = name_or_index.parse::<usize>() {
             return Some(i);
         }
-        self.scn_name_map.get(name_or_index).copied()
+
+        // Original SiglusCompiler lower-cases every scene name written into
+        // Scene.pck (`main_proc_link.cpp`), and the runtime lexer lower-cases
+        // the requested name before looking it up (`tnm_lexer.cpp::get_scn_no`).
+        // Script source is therefore allowed to spell a scene with arbitrary
+        // ASCII case, e.g. `_RB_titlemenu` while the pack contains
+        // `_rb_titlemenu`.  Keep the fast exact lookup first, then mirror the
+        // original case-insensitive lookup semantics.
+        self.scn_name_map
+            .get(name_or_index)
+            .copied()
+            .or_else(|| {
+                self.scn_name_map.iter().find_map(|(name, scene_no)| {
+                    name.eq_ignore_ascii_case(name_or_index).then_some(*scene_no)
+                })
+            })
     }
 
     pub fn find_scene_name(&self, scn_no: usize) -> Option<&str> {
@@ -577,4 +593,56 @@ pub fn find_scene_pck_in_project(project_dir: &Path) -> Result<std::path::PathBu
         "scene_pck: Scene.pck not found under {}",
         project_dir.display()
     );
+}
+
+
+#[cfg(test)]
+mod scene_name_lookup_tests {
+    use super::*;
+
+    fn header_for_lookup_test() -> PackScnHeader {
+        PackScnHeader {
+            header_size: 0,
+            inc_prop_list_ofs: 0,
+            inc_prop_cnt: 0,
+            inc_prop_name_index_list_ofs: 0,
+            inc_prop_name_index_cnt: 0,
+            inc_prop_name_list_ofs: 0,
+            inc_prop_name_cnt: 0,
+            inc_cmd_list_ofs: 0,
+            inc_cmd_cnt: 0,
+            inc_cmd_name_index_list_ofs: 0,
+            inc_cmd_name_index_cnt: 0,
+            inc_cmd_name_list_ofs: 0,
+            inc_cmd_name_cnt: 0,
+            scn_name_index_list_ofs: 0,
+            scn_name_index_cnt: 0,
+            scn_name_list_ofs: 0,
+            scn_name_cnt: 0,
+            scn_data_index_list_ofs: 0,
+            scn_data_index_cnt: 0,
+            scn_data_list_ofs: 0,
+            scn_data_cnt: 0,
+            scn_data_exe_angou_mod: 0,
+            original_source_header_size: 0,
+        }
+    }
+
+    #[test]
+    fn scene_name_lookup_matches_original_case_insensitive_lexer() {
+        let mut scn_name_map = HashMap::new();
+        scn_name_map.insert("_rb_titlemenu".to_string(), 37);
+        let pck = ScenePck {
+            buf: Vec::new(),
+            header: header_for_lookup_test(),
+            scn_name_map,
+            inc_prop_name_map: HashMap::new(),
+            inc_cmd_name_map: Arc::default(),
+            inc_props: Vec::new(),
+            inc_cmds: Vec::new(),
+        };
+
+        assert_eq!(pck.find_scene_no("_RB_titlemenu"), Some(37));
+        assert_eq!(pck.find_scene_no("_rb_titlemenu"), Some(37));
+    }
 }

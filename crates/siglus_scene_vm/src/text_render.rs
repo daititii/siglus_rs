@@ -1871,9 +1871,12 @@ fn blend_rgba_pixel(
     sa: u8,
 ) {
     let idx = ((y * w + x) * 4) as usize;
-    let da = rgba[idx + 3] as u16;
-    let sa_u = sa as u16;
-    let inv_sa = 255u16.saturating_sub(sa_u);
+    // Cfont_copy uses 32-bit `int` work tables/arithmetic. The destination
+    // term can reach 255^3, so u16 is non-original and overflows in debug
+    // builds for ordinary coloured glyph overlaps.
+    let da = rgba[idx + 3] as u32;
+    let sa_u = sa as u32;
+    let inv_sa = 255u32.saturating_sub(sa_u);
     // Cfont_copy's alpha table uses integer truncation:
     //   src + dst - src * dst / 255
     // Do not round here; repeated face copies otherwise diverge from tona3.
@@ -1886,9 +1889,9 @@ fn blend_rgba_pixel(
         return;
     }
     let blend = |src: u8, dst: u8| -> u8 {
-        let src_p = src as u32 * sa_u as u32;
-        let dst_p = dst as u32 * da as u32 * inv_sa as u32 / 255;
-        ((src_p + dst_p + out_a as u32 / 2) / out_a as u32).min(255) as u8
+        let src_p = src as u32 * sa_u;
+        let dst_p = dst as u32 * da * inv_sa / 255;
+        ((src_p + dst_p + out_a / 2) / out_a).min(255) as u8
     };
     rgba[idx] = blend(sr, rgba[idx]);
     rgba[idx + 1] = blend(sg, rgba[idx + 1]);
@@ -2360,5 +2363,12 @@ mod font_shadow_mode_tests {
         // out_a = 128 + 255 - 128*255/255 = 255; blend -> 255
         assert_eq!(rgba[0], 255);
         assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn coloured_glyph_blend_uses_wide_original_integer_arithmetic() {
+        let mut rgba = [255, 220, 192, 255];
+        blend_rgba_pixel(&mut rgba, 1, 0, 0, 80, 160, 240, 128);
+        assert_eq!(rgba, [167, 190, 216, 255]);
     }
 }

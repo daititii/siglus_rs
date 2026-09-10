@@ -559,3 +559,60 @@ fn mask_copy_u32(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_cg_composition_lookup_from_compressed_database() {
+        // One UTF-16 row mapping an expression image to its composed CG.
+        // Keep the fixture synthetic so the regression needs no game assets.
+        let mut expanded = vec![0u8; 128];
+        let words = [
+            // Header: byte size, row/column counts, then table offsets.
+            128i32, 1, 2, 28, 32, 48, 56,
+            // Row ID, two string columns, and string offsets in bytes.
+            7, 0, b'S' as i32, 1, b'S' as i32, 0, 10,
+        ];
+        for (dst, word) in expanded.chunks_exact_mut(4).zip(words) {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+        for (dst, word) in expanded[56..]
+            .chunks_exact_mut(2)
+            .zip("cg_a\0cg_a__base|cg_a\0".encode_utf16())
+        {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+
+        // Apply the on-disk tiled XOR and a literal-only LZSS archive whose
+        // declared size includes its header, as in retail DBS files.
+        for (i, word) in expanded.chunks_exact_mut(4).enumerate() {
+            let tile =
+                TILE[(i / MAP_WIDTH % TILE_HEIGHT) * TILE_WIDTH + i % MAP_WIDTH % TILE_WIDTH];
+            let key = XORCODE[usize::from(tile < 128)];
+            let value = u32::from_le_bytes(word.try_into().unwrap()) ^ key;
+            word.copy_from_slice(&value.to_le_bytes());
+        }
+        let mut archive = vec![0u8; 8];
+        for chunk in expanded.chunks(8) {
+            archive.push(0xff);
+            archive.extend_from_slice(chunk);
+        }
+        let arc_size = archive.len() as u32;
+        archive[..4].copy_from_slice(&arc_size.to_le_bytes());
+        archive[4..8].copy_from_slice(&(expanded.len() as u32).to_le_bytes());
+        xor_u32_in_place(&mut archive, XORCODE[2]);
+        let mut file = 1i32.to_le_bytes().to_vec();
+        file.extend_from_slice(&archive);
+
+        let db = DbsDatabase::from_bytes(&file).unwrap();
+        let row = db.find_str(0, "CG_A").unwrap();
+        assert_eq!(row, 7);
+        assert_eq!(
+            db.get_data_str(row, 1).unwrap().as_deref(),
+            Some("cg_a__base|cg_a")
+        );
+        assert_eq!(db.find_str(0, "missing").unwrap(), -1);
+    }
+}

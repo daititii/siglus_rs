@@ -132,7 +132,10 @@ fn dump_title_menu_rects(vm: &SceneVm<'static>) {
         let Some(obj) = root.runtime.child_objects.get(idx) else {
             continue;
         };
-        if !obj.used {
+        if obj.object_type == 0
+            && obj.runtime.child_objects.is_empty()
+            && matches!(obj.backend, siglus_scene_vm::runtime::globals::ObjectBackend::None)
+        {
             continue;
         }
         let x = obj.lookup_int_prop(&vm.ctx.ids, vm.ctx.ids.obj_x).unwrap_or(0);

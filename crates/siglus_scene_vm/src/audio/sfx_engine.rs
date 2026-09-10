@@ -1036,9 +1036,14 @@ pub struct KoeEngine {
     mouth_volume_table: Vec<f32>,
     /// Asynchronous decode in flight: the voice is decoded on a worker thread
     /// so a 300ms Vorbis decode never freezes the frame loop.
-    pending_decode: Option<(i64, std::sync::mpsc::Receiver<Result<Vec<u8>, String>>)>,
-    /// Decoded voice cache keyed by koe_no. Title/loop voices repeat often.
-    decode_cache: HashMap<i64, std::sync::Arc<Vec<u8>>>,
+    pending_decode: Option<(
+        (i64, u16),
+        String,
+        std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    )>,
+    /// Decoded/JITAN-converted voice cache keyed by (koe_no, jitan_rate).
+    /// The original re-runs JITAN when the configured rate changes.
+    decode_cache: HashMap<(i64, u16), std::sync::Arc<Vec<u8>>>,
 }
 
 impl KoeEngine {
@@ -1060,6 +1065,16 @@ impl KoeEngine {
         koe_no: i64,
         current_append_dir: &str,
     ) -> Result<()> {
+        self.play_koe_no_with_rate(audio, koe_no, current_append_dir, 100)
+    }
+
+    pub fn play_koe_no_with_rate(
+        &mut self,
+        audio: &mut AudioHub,
+        koe_no: i64,
+        current_append_dir: &str,
+        jitan_rate: u16,
+    ) -> Result<()> {
         // C_tnm_player::play_koe starts with reinit(): clear the old player
         // metadata and mouth table before resolving/loading the new voice.
         let _ = self.stop(None);
@@ -1070,22 +1085,29 @@ impl KoeEngine {
             return Ok(());
         }
 
-        if let Some(wav) = self.decode_cache.get(&koe_no).cloned() {
+        // C_jitan_cnv::convert clamps its low-level input to 100..400.  Normal
+        // configuration commands clamp JITAN_SPEED to 100..300, but preserving
+        // the converter clamp also matches loaded/legacy config values.
+        let jitan_rate = jitan_rate.clamp(100, 400);
+        let cache_key = (koe_no, jitan_rate);
+        if let Some(wav) = self.decode_cache.get(&cache_key).cloned() {
             self.finish_koe_start(audio, koe_no, current_append_dir, (*wav).clone())?;
             return Ok(());
         }
 
-        // Decode on a worker thread; the slot starts playing as soon as the
-        // bytes are ready (tick()). The original player loads the mouth CSV
-        // only after the voice stream has been prepared, but before play().
+        // Decode and perform the original on-memory JITAN conversion on the
+        // worker.  This mirrors elm_sound_player.cpp: decode KOE first, then
+        // construct a mono time-compressed memory sound before playback.
         let project_dir = self.inner.project_dir.clone();
+        let append_dir = current_append_dir.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = decode_koe_no_for_project(&project_dir, koe_no)
+                .and_then(|wav| crate::audio::jitan::convert_koe_wav(wav, jitan_rate))
                 .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
         });
-        self.pending_decode = Some((koe_no, rx));
+        self.pending_decode = Some((cache_key, append_dir, rx));
         Ok(())
     }
 
@@ -1115,16 +1137,17 @@ impl KoeEngine {
     }
 
     pub fn tick(&mut self, audio: &mut AudioHub) {
-        let Some((koe_no, rx)) = self.pending_decode.take() else {
+        let Some((cache_key, append_dir, rx)) = self.pending_decode.take() else {
             return;
         };
+        let koe_no = cache_key.0;
         match rx.try_recv() {
             Ok(Ok(wav)) => {
                 if self.decode_cache.len() < 24 {
                     self.decode_cache
-                        .insert(koe_no, std::sync::Arc::new(wav.clone()));
+                        .insert(cache_key, std::sync::Arc::new(wav.clone()));
                 }
-                if let Err(err) = self.finish_koe_start(audio, koe_no, "", wav) {
+                if let Err(err) = self.finish_koe_start(audio, koe_no, &append_dir, wav) {
                     log::warn!("koe async start failed koe_no={koe_no}: {err:#}");
                 }
             }
@@ -1132,7 +1155,7 @@ impl KoeEngine {
                 log::warn!("koe async decode failed koe_no={koe_no}: {err}");
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                self.pending_decode = Some((koe_no, rx));
+                self.pending_decode = Some((cache_key, append_dir, rx));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 log::warn!("koe async decode worker died koe_no={koe_no}");

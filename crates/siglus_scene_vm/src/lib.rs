@@ -46,5 +46,7 @@ pub mod ios_host;
 pub mod pump_host;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub mod desktop_messagebox;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub mod desktop_twitter;
 
 pub mod display_ffi;

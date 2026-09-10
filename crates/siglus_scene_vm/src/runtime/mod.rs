@@ -16,10 +16,13 @@ pub mod game_title;
 pub mod globals;
 pub mod int_event;
 pub mod string_semantics;
+mod scene_metadata;
 pub mod net;
 pub mod native_ui;
 pub mod tables;
 pub mod tonecurve;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub mod twitter;
 pub mod ui;
 pub mod unknown;
 pub mod wait;
@@ -28,6 +31,7 @@ pub(crate) mod wipe_mask;
 use crate::runtime::forms::codes::syscom_op;
 use crate::runtime::forms::pcmevent as pcmevent_form;
 use crate::runtime::forms::syscom as syscom_form;
+use scene_metadata::SceneMetadata;
 
 use anyhow::{anyhow, Result};
 use std::cell::RefCell;
@@ -352,9 +356,11 @@ pub struct CommandContext {
     /// 1x1 white sprite used for screen-space overlays (filters, etc.).
     pub solid_white: ImageId,
 
+    // Keep BGM before AudioHub so streaming handles stop while the mixer still
+    // exists; Rust drops struct fields in declaration order.
+    pub bgm: BgmEngine,
     pub audio: AudioHub,
 
-    pub bgm: BgmEngine,
     pub koe: KoeEngine,
     pub pcm: PcmEngine,
     pub se: SeEngine,
@@ -397,6 +403,10 @@ pub struct CommandContext {
 
     /// Gameexe-driven asset tables (CGTABLE / DATABASE / THUMBTABLE).
     pub tables: tables::AssetTables,
+
+    /// Scene names/read-flag shapes derived from the resident Scene.pck.
+    /// Replaced when the active append changes, like tnm_reload_scene_pck().
+    scene_metadata: RefCell<Option<(String, Arc<SceneMetadata>)>>,
 
     /// Value stack used by form handlers to return results.
     pub stack: Vec<Value>,
@@ -792,7 +802,9 @@ impl CommandContext {
                     return false;
                 }
                 list.iter().enumerate().any(|(obj_idx, obj)| {
-                    !stage.is_embedded_object_slot(stage_idx, obj_idx) && object_needs_tick(obj)
+                    !stage.is_embedded_object_slot(stage_idx, obj_idx)
+                        && stage.object_slot_is_used(stage_idx, obj_idx)
+                        && object_needs_tick(obj)
                 })
             }) || stage.mwnd_lists.iter().any(|(&stage_idx, list)| {
                 if stage_idx == TNM_STAGE_NEXT_I64 && !wipe_active {
@@ -1145,6 +1157,7 @@ impl CommandContext {
         let emote_key = crate::resource::load_project_emote_key(&project_dir)
             .ok()
             .flatten();
+        let initial_append = crate::resource::initial_select_ini_append(&project_dir);
 
         let ids = constants::RuntimeConstants::default();
 
@@ -1166,6 +1179,7 @@ impl CommandContext {
             emote_key,
             solid_white,
             tables,
+            scene_metadata: RefCell::new(None),
             stack: Vec::new(),
             unknown,
             ids,
@@ -1208,8 +1222,87 @@ impl CommandContext {
             last_button_hover_sound_pos: None,
             suppress_next_right_syscom_open: false,
         };
+        ctx.set_active_append(initial_append.dir, initial_append.name);
         ctx.apply_gameexe_runtime_defaults();
         ctx
+    }
+
+    /// Update the active append selected by the original `Gp_dir` state and
+    /// keep all resource managers that cache it in sync.  SceneVm observes the
+    /// same value and reloads Scene.pck only when this directory changes.
+    pub fn set_active_append(&mut self, append_dir: String, append_name: String) {
+        if !self.globals.append_dir.eq_ignore_ascii_case(&append_dir) {
+            self.scene_metadata.get_mut().take();
+        }
+        self.globals.append_dir = append_dir;
+        self.globals.append_name = append_name;
+        let active_append = self.globals.append_dir.clone();
+        self.images.set_current_append_dir_ref(&active_append);
+        self.movie.set_current_append_dir_ref(&active_append);
+        self.bgm.set_current_append_dir_ref(&active_append);
+    }
+
+    /// Restore the startup append selected by the first `Select.ini` entry,
+    /// matching `tnm_scene_proc_restart_from_menu_scene()`.
+    pub fn reset_active_append_to_initial(&mut self) {
+        let append = crate::resource::initial_select_ini_append(&self.project_dir);
+        self.set_active_append(append.dir, append.name);
+    }
+
+    /// Select the KOE JITAN rate with the same policy as the original engine.
+    ///
+    /// * `explicit = Some(..)` is EXKOE's named `jitan` argument.
+    /// * `replay = true` is backlog/SYSCOM voice replay.
+    /// * normal message KOE follows `tnm_is_auto_mode()` and chooses the
+    ///   normal or auto-mode JITAN switch.
+    pub(crate) fn koe_jitan_rate(&self, explicit: Option<bool>, replay: bool) -> u16 {
+        use crate::runtime::forms::codes::syscom_op::*;
+
+        let cfg = |op: i32, fallback: i64| {
+            self.globals
+                .syscom
+                .config_int
+                .get(&op)
+                .copied()
+                .unwrap_or(fallback)
+        };
+        let original = &self.globals.syscom.original_config;
+
+        let enabled = if let Some(enabled) = explicit {
+            enabled
+        } else if replay {
+            cfg(
+                GET_JITAN_KOE_REPLAY_ONOFF,
+                if original.jitan_msgbk_onoff { 1 } else { 0 },
+            ) != 0
+        } else {
+            // C++ tnm_is_auto_mode(): script temporary auto-mode OR the
+            // persistent system configuration auto-mode.
+            let auto_mode =
+                self.globals.script.auto_mode_flag || self.globals.syscom.auto_mode.onoff;
+            let (op, fallback) = if auto_mode {
+                (
+                    GET_JITAN_AUTO_MODE_ONOFF,
+                    if original.jitan_auto_mode_onoff { 1 } else { 0 },
+                )
+            } else {
+                (
+                    GET_JITAN_NORMAL_ONOFF,
+                    if original.jitan_normal_onoff { 1 } else { 0 },
+                )
+            };
+            cfg(op, fallback) != 0
+        };
+
+        if !enabled {
+            return 100;
+        }
+
+        // SET_JITAN_SPEED is 100..300 in the public config API, while
+        // C_jitan_cnv itself defensively clamps 100..400.  Preserve the latter
+        // for values loaded from legacy config data.
+        cfg(GET_JITAN_SPEED, original.jitan_speed)
+            .clamp(100, 400) as u16
     }
 
     pub(crate) fn effective_font_name(&self) -> &str {
@@ -1662,13 +1755,40 @@ impl CommandContext {
         }
     }
 
-    pub fn lookup_scene_no(&self, scene_name: &str) -> Result<i64> {
-        if scene_name.is_empty() {
-            anyhow::bail!("empty scene name")
+    #[doc(hidden)]
+    pub fn install_scene_metadata(
+        &self,
+        append_dir: &str,
+        pck: &ScenePck,
+    ) -> Result<()> {
+        let mut slot = self.scene_metadata.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|(cached_append, _)| cached_append.eq_ignore_ascii_case(append_dir))
+        {
+            return Ok(());
         }
+        *slot = Some((
+            append_dir.to_string(),
+            Arc::new(SceneMetadata::from_pack(pck)?),
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn scene_metadata(&self) -> Result<Arc<SceneMetadata>> {
+        let active_append = self.globals.append_dir.clone();
+        if let Some((cached_append, metadata)) = self.scene_metadata.borrow().as_ref() {
+            if cached_append.eq_ignore_ascii_case(&active_append) {
+                return Ok(Arc::clone(metadata));
+            }
+        }
+
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let pck = {
-            let scene_pck_path = self.project_dir.join("Scene.pck");
+            let scene_pck_path = crate::resource::find_scene_pck_path_for_append(
+                &self.project_dir,
+                &active_append,
+            )?;
             let bytes = crate::resource::read_file_bytes(&scene_pck_path)?;
             let exe = ["key.toml", "Key.toml"]
                 .iter()
@@ -1691,19 +1811,49 @@ impl CommandContext {
         };
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let pck = {
-            let scene_pck_path = crate::resource::find_scene_pck_path(&self.project_dir)?;
+            let scene_pck_path = crate::resource::find_scene_pck_path_for_append(
+                &self.project_dir,
+                &active_append,
+            )?;
             let opt = ScenePckDecodeOptions::from_project_dir(&self.project_dir)?;
             ScenePck::load_and_rebuild(&scene_pck_path, &opt)?
         };
-        let scene_no = pck
+        self.install_scene_metadata(&active_append, &pck)?;
+        let slot = self.scene_metadata.borrow();
+        Ok(Arc::clone(
+            &slot.as_ref().expect("scene metadata installed").1,
+        ))
+    }
+
+    pub fn lookup_scene_no(&self, scene_name: &str) -> Result<i64> {
+        if scene_name.is_empty() {
+            anyhow::bail!("empty scene name")
+        }
+        let scene_no = self
+            .scene_metadata()?
             .find_scene_no(scene_name)
             .ok_or_else(|| anyhow::anyhow!("scene not found: {}", scene_name))?;
         Ok(scene_no as i64)
     }
 
+    /// Reinitialize scene-local engine state.
+    ///
+    /// This mirrors `C_tnm_eng::reinit_local(true)`: local flag banks and
+    /// render/input/sound objects are rebuilt, while global G/Z/M flags, global
+    /// names, read flags, loaded configuration, global save state and the active
+    /// append survive.  The previous implementation replaced the entire
+    /// `GlobalState`, which was equivalent to calling `init_global()` on every
+    /// scene restart and destroyed data that the original engine retains.
     pub fn reset_for_scene_restart(&mut self) {
-        self.audio = AudioHub::new();
+        use crate::runtime::forms::codes;
+
+        let append_dir = self.globals.append_dir.clone();
+        let append_name = self.globals.append_name.clone();
+
+        // Drop the old streaming BGM engine before replacing its AudioHub so
+        // decoder stop commands are delivered to the old mixer.
         self.bgm = BgmEngine::new(self.project_dir.clone());
+        self.audio = AudioHub::new();
         self.koe = KoeEngine::new(self.project_dir.clone());
         self.pcm = PcmEngine::new(self.project_dir.clone());
         self.se = SeEngine::new(self.project_dir.clone());
@@ -1717,20 +1867,123 @@ impl CommandContext {
         self.font_cache = FontCache::new();
         self.wait = wait::VmWait::default();
         self.stack.clear();
-        self.globals = globals::GlobalState::default();
+
+        // C_elm_flag::init_local(): A..F/X/S and local NAMAE are local;
+        // G/Z/M and global NAMAE are intentionally untouched.
+        let local_count = self.configured_flag_count(false);
+        for form in [
+            codes::ELM_GLOBAL_A,
+            codes::ELM_GLOBAL_B,
+            codes::ELM_GLOBAL_C,
+            codes::ELM_GLOBAL_D,
+            codes::ELM_GLOBAL_E,
+            codes::ELM_GLOBAL_F,
+            codes::ELM_GLOBAL_X,
+        ] {
+            self.globals
+                .int_lists
+                .insert(form as u32, vec![0; local_count]);
+        }
+        self.globals.str_lists.insert(
+            codes::ELM_GLOBAL_S as u32,
+            vec![String::new(); local_count],
+        );
+        self.globals.str_lists.insert(
+            codes::ELM_GLOBAL_NAMAE_LOCAL as u32,
+            vec![String::new(); 26 + 26 * 26],
+        );
+
+        // Element/runtime objects recreated by reinit_local().
+        self.globals.counter_lists.clear();
+        self.globals.pcm_event_lists.clear();
+        self.globals.pcmch_persistent.clear();
+        self.globals.sound_routing = globals::SoundRoutingState::default();
+        self.globals.int_event_roots.clear();
+        self.globals.int_event_lists.clear();
+        self.globals.int_props.clear();
+        self.globals.str_props.clear();
+        self.globals.g00buf.clear();
+        self.globals.g00buf_names.clear();
+        self.globals.mask_lists.clear();
+        self.globals.editbox_lists.clear();
+        self.globals.focused_editbox = None;
+        self.globals.frame_actions.clear();
+        self.globals.frame_action_lists.clear();
+        self.globals.pending_frame_action_finishes.clear();
+        self.globals.pending_button_actions.clear();
+        self.globals.stage_forms.clear();
+        self.globals.focused_stage_group = None;
+        self.globals.focused_stage_mwnd = None;
+        self.globals.current_mwnd_no = Some(0);
+        self.globals.current_mwnd_stage_idx = 1;
+        self.globals.current_sel_mwnd_no = Some(1);
+        self.globals.current_sel_mwnd_stage_idx = 1;
+        self.globals.last_mwnd_no = Some(0);
+        self.globals.last_mwnd_stage_idx = 1;
+        self.globals.local_real_time = 0;
+        self.globals.local_game_time = 0;
+        self.globals.local_wipe_time = 0;
+        self.globals.local_flag_h.clear();
+        self.globals.local_flag_i.clear();
+        self.globals.local_flag_j.clear();
+        self.globals.selbtn = globals::BtnSelectRuntimeState::default();
+        self.globals.current_stage_object = None;
+        self.globals.current_object_chain = None;
+        self.globals.screen_forms.clear();
+        self.globals.msgbk_forms.clear();
+        self.globals.script = globals::ScriptRuntimeState::default();
+        self.globals.mov = globals::GlobalMovieState::default();
+        self.globals.capture_image = None;
+        self.globals.capture_for_object_image = None;
+        self.globals.save_thumb_capture_image = None;
+        self.globals.save_thumb_capture_prior = 0;
+        self.globals.wipe = None;
+        self.globals.lights.clear();
+        self.globals.fog_global = globals::FogGlobalState::default();
+
+        // tnm_syscom_init_syscom_flag() resets local menu interaction state but
+        // does not reload global.sav or config.sav.  Preserve the loaded config
+        // and total play time while rebuilding the local Syscom state.
+        let total_play_time = self.globals.syscom.total_play_time;
+        let system_extra_int_value = self.globals.syscom.system_extra_int_value;
+        let system_extra_str_value =
+            std::mem::take(&mut self.globals.syscom.system_extra_str_value);
+        let config_int = std::mem::take(&mut self.globals.syscom.config_int);
+        let config_str = std::mem::take(&mut self.globals.syscom.config_str);
+        let original_config = self.globals.syscom.original_config.clone();
+        let font_list = std::mem::take(&mut self.globals.syscom.font_list);
+        let return_scene_once = self.globals.syscom.return_scene_once.take();
+        self.globals.syscom = globals::SyscomRuntimeState::default();
+        self.globals.syscom.total_play_time = total_play_time;
+        self.globals.syscom.system_extra_int_value = system_extra_int_value;
+        self.globals.syscom.system_extra_str_value = system_extra_str_value;
+        self.globals.syscom.config_int = config_int;
+        self.globals.syscom.config_str = config_str;
+        self.globals.syscom.original_config = original_config;
+        self.globals.syscom.font_list = font_list;
+        self.globals.syscom.return_scene_once = return_scene_once;
+
         self.tonecurve = tonecurve::ToneCurveRuntime::new(&self.project_dir);
         self.excall_state = ExcallCompatState::default();
         self.last_presented_render_list.clear();
         self.input.clear_all();
+        self.script_input.clear_all();
         self.vm_call = None;
         self.pending_read_flag_no = false;
         self.pending_selbtn_read_flag_no = false;
         self.pending_mwnd_read_flag_target = None;
-        self.pending_sel_point_result = None;
+        self.pending_runtime_save = None;
+        self.pending_runtime_load = None;
         self.runtime_load_completed = false;
+        self.local_save_snapshot = None;
+        self.pending_auto_savepoint = false;
+        self.pending_sel_point_result = None;
         self.frame_clock_last = None;
         self.last_button_hover_sound_pos = None;
+
+        self.set_active_append(append_dir, append_name);
         self.apply_gameexe_runtime_defaults();
+        forms::syscom::apply_audio_config(self);
     }
 
     /// Install or clear an external form handler.
@@ -1863,6 +2116,9 @@ impl CommandContext {
             let layers = &self.layers;
             let gfx = &self.gfx;
             let ids = &self.ids;
+            // C_elm_stage::{regist_button,button_event} gates every top-level
+            // OBJECT by the destination slot's immutable is_use() flag.
+            let slot_use_by_stage = st.object_slot_use.clone();
             let (object_lists, group_lists, embedded_by_stage) = (
                 &mut st.object_lists,
                 &mut st.group_lists,
@@ -1879,6 +2135,14 @@ impl CommandContext {
                     if embedded_by_stage
                         .get(stage_idx)
                         .map_or(false, |slots| slots.contains(&obj_idx))
+                    {
+                        continue;
+                    }
+                    if !slot_use_by_stage
+                        .get(stage_idx)
+                        .and_then(|flags| flags.get(obj_idx))
+                        .copied()
+                        .unwrap_or(true)
                     {
                         continue;
                     }
@@ -1910,6 +2174,14 @@ impl CommandContext {
                         if embedded_by_stage
                             .get(&stage_idx)
                             .map_or(false, |slots| slots.contains(&obj_idx))
+                        {
+                            continue;
+                        }
+                        if !slot_use_by_stage
+                            .get(&stage_idx)
+                            .and_then(|flags| flags.get(obj_idx))
+                            .copied()
+                            .unwrap_or(true)
                         {
                             continue;
                         }
@@ -1948,6 +2220,14 @@ impl CommandContext {
                                 if embedded_by_stage
                                     .get(&stage_idx)
                                     .map_or(false, |slots| slots.contains(&obj_idx))
+                                {
+                                    continue;
+                                }
+                                if !slot_use_by_stage
+                                    .get(&stage_idx)
+                                    .and_then(|flags| flags.get(obj_idx))
+                                    .copied()
+                                    .unwrap_or(true)
                                 {
                                     continue;
                                 }
@@ -1993,6 +2273,14 @@ impl CommandContext {
                     {
                         continue;
                     }
+                    if !slot_use_by_stage
+                        .get(stage_idx)
+                        .and_then(|flags| flags.get(obj_idx))
+                        .copied()
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
                     if let Some(hit) = hit_test_standalone_action_button_recursive(
                         images,
                         layers,
@@ -2023,6 +2311,14 @@ impl CommandContext {
                             if embedded_by_stage
                                 .get(stage_idx)
                                 .map_or(false, |slots| slots.contains(&obj_idx))
+                            {
+                                continue;
+                            }
+                            if !slot_use_by_stage
+                                .get(stage_idx)
+                                .and_then(|flags| flags.get(obj_idx))
+                                .copied()
+                                .unwrap_or(true)
                             {
                                 continue;
                             }
@@ -2349,6 +2645,7 @@ impl CommandContext {
                 return false;
             };
 
+            let slot_use_by_stage = st.object_slot_use.clone();
             let (object_lists, group_lists, embedded_by_stage) = (
                 &mut st.object_lists,
                 &mut st.group_lists,
@@ -2387,6 +2684,17 @@ impl CommandContext {
                             g.pushed_runtime_slot = Some(hit_slot);
                             if let Some(objs) = object_lists.get_mut(&stage_idx) {
                                 for (obj_idx, obj) in objs.iter_mut().enumerate() {
+                                    if embedded_by_stage
+                                        .get(&stage_idx)
+                                        .map_or(false, |slots| slots.contains(&obj_idx))
+                                        || !slot_use_by_stage
+                                            .get(&stage_idx)
+                                            .and_then(|flags| flags.get(obj_idx))
+                                            .copied()
+                                            .unwrap_or(true)
+                                    {
+                                        continue;
+                                    }
                                     set_button_pushed_by_runtime_slot_recursive(
                                         obj_idx, obj, hit_slot,
                                     );
@@ -2405,6 +2713,11 @@ impl CommandContext {
                             if embedded_by_stage
                                 .get(&stage_idx)
                                 .map_or(false, |slots| slots.contains(&obj_idx))
+                                || !slot_use_by_stage
+                                    .get(&stage_idx)
+                                    .and_then(|flags| flags.get(obj_idx))
+                                    .copied()
+                                    .unwrap_or(true)
                             {
                                 continue;
                             }
@@ -2576,6 +2889,7 @@ impl CommandContext {
                 return false;
             };
 
+            let slot_use_by_stage = st.object_slot_use.clone();
             let (object_lists, group_lists, embedded_by_stage) = (
                 &mut st.object_lists,
                 &mut st.group_lists,
@@ -2624,6 +2938,11 @@ impl CommandContext {
                                     if embedded_by_stage
                                         .get(&stage_idx)
                                         .map_or(false, |slots| slots.contains(&obj_idx))
+                                        || !slot_use_by_stage
+                                            .get(&stage_idx)
+                                            .and_then(|flags| flags.get(obj_idx))
+                                            .copied()
+                                            .unwrap_or(true)
                                     {
                                         continue;
                                     }
@@ -2662,6 +2981,11 @@ impl CommandContext {
                     if embedded_by_stage
                         .get(stage_idx)
                         .map_or(false, |slots| slots.contains(&obj_idx))
+                        || !slot_use_by_stage
+                            .get(stage_idx)
+                            .and_then(|flags| flags.get(obj_idx))
+                            .copied()
+                            .unwrap_or(true)
                     {
                         continue;
                     }
@@ -2684,6 +3008,11 @@ impl CommandContext {
                     if embedded_by_stage
                         .get(stage_idx)
                         .map_or(false, |slots| slots.contains(&obj_idx))
+                        || !slot_use_by_stage
+                            .get(stage_idx)
+                            .and_then(|flags| flags.get(obj_idx))
+                            .copied()
+                            .unwrap_or(true)
                     {
                         continue;
                     }
@@ -3451,6 +3780,7 @@ impl CommandContext {
                 self.ui.finish_message_reveal_wait();
             }
         }
+        let skipping = self.runtime_is_skipping();
         let (wait, stack, bgm, koe, se, pcm, globals) = (
             &mut self.wait,
             &mut self.stack,
@@ -3460,7 +3790,7 @@ impl CommandContext {
             &mut self.pcm,
             &mut self.globals,
         );
-        wait.poll(stack, bgm, koe, se, pcm, globals, &self.ids)
+        wait.poll(stack, bgm, koe, se, pcm, globals, &self.ids, skipping)
     }
 
     pub fn push(&mut self, v: Value) {
@@ -3848,12 +4178,21 @@ impl CommandContext {
                 if stage_idx == TNM_STAGE_NEXT_I64 && !wipe_active {
                     continue;
                 }
-                let embedded_slots = st.embedded_object_slots_by_stage.get(&stage_idx);
+                let embedded_slots = st.embedded_object_slots_by_stage.get(&stage_idx).cloned();
+                let slot_use = st.object_slot_use.get(&stage_idx).cloned();
                 let Some(objs) = st.object_lists.get_mut(&stage_idx) else {
                     continue;
                 };
                 for (obj_idx, obj) in objs.iter_mut().enumerate() {
-                    if embedded_slots.is_some_and(|slots| slots.contains(&obj_idx)) {
+                    if embedded_slots.as_ref().is_some_and(|slots| slots.contains(&obj_idx)) {
+                        continue;
+                    }
+                    if !slot_use
+                        .as_ref()
+                        .and_then(|flags| flags.get(obj_idx))
+                        .copied()
+                        .unwrap_or(true)
+                    {
                         continue;
                     }
                     apply_object_event_animations_recursive(
@@ -6384,6 +6723,7 @@ impl CommandContext {
                         name_window_align: m.name_window_align,
                         name_window_pos: m.name_window_pos,
                         name_window_size: m.name_window_size,
+                        name_window_rect: m.name_window_rect,
                         name_message_pos: m.name_message_pos,
                         name_message_pos_rep: m.name_message_pos_rep,
                         name_message_margin: m.name_message_margin,
@@ -6534,8 +6874,24 @@ impl CommandContext {
 
         let layers = &mut self.layers;
         for stage in self.globals.stage_forms.values_mut() {
-            for list in stage.object_lists.values_mut() {
-                for obj in list {
+            let mut stage_ids: Vec<i64> = stage.object_lists.keys().copied().collect();
+            stage_ids.sort_unstable();
+            for stage_idx in stage_ids {
+                let slot_use = stage.object_slot_use.get(&stage_idx).cloned();
+                let embedded = stage.embedded_object_slots_by_stage.get(&stage_idx).cloned();
+                let Some(list) = stage.object_lists.get_mut(&stage_idx) else {
+                    continue;
+                };
+                for (obj_idx, obj) in list.iter_mut().enumerate() {
+                    if embedded.as_ref().is_some_and(|slots| slots.contains(&obj_idx))
+                        || !slot_use
+                            .as_ref()
+                            .and_then(|flags| flags.get(obj_idx))
+                            .copied()
+                            .unwrap_or(true)
+                    {
+                        continue;
+                    }
                     sync_emote_object_recursive(
                         layers, obj, mouth_stop, koe_playing, koe_ex, koe_chara_no, live_mouth,
                     );
@@ -6588,10 +6944,21 @@ impl CommandContext {
                 if stage_idx == TNM_STAGE_NEXT_I64 && !wipe_active {
                     continue;
                 }
+                let slot_use = st.object_slot_use.get(&stage_idx).cloned();
+                let embedded = st.embedded_object_slots_by_stage.get(&stage_idx).cloned();
                 let Some(objs) = st.object_lists.get_mut(&stage_idx) else {
                     continue;
                 };
                 for (obj_idx, obj) in objs.iter_mut().enumerate() {
+                    if embedded.as_ref().is_some_and(|slots| slots.contains(&obj_idx))
+                        || !slot_use
+                            .as_ref()
+                            .and_then(|flags| flags.get(obj_idx))
+                            .copied()
+                            .unwrap_or(true)
+                    {
+                        continue;
+                    }
                     sync_movie_object_recursive(
                         ids,
                         layers,
@@ -6854,10 +7221,21 @@ impl CommandContext {
                 if stage_idx == TNM_STAGE_NEXT_I64 && !wipe_active {
                     continue;
                 }
+                let slot_use = st.object_slot_use.get(&stage_idx).cloned();
+                let embedded = st.embedded_object_slots_by_stage.get(&stage_idx).cloned();
                 let Some(objs) = st.object_lists.get_mut(&stage_idx) else {
                     continue;
                 };
-                for obj in objs.iter_mut() {
+                for (obj_idx, obj) in objs.iter_mut().enumerate() {
+                    if embedded.as_ref().is_some_and(|slots| slots.contains(&obj_idx))
+                        || !slot_use
+                            .as_ref()
+                            .and_then(|flags| flags.get(obj_idx))
+                            .copied()
+                            .unwrap_or(true)
+                    {
+                        continue;
+                    }
                     sync_weather_object_recursive(
                         ids,
                         layers,
@@ -6885,7 +7263,7 @@ impl CommandContext {
             out: &mut Vec<(i64, usize, String, i64)>,
         ) {
             for (idx, obj) in objs.iter().enumerate() {
-                if obj.used
+                if obj.object_type != 0
                     && obj.object_type != 6
                     && matches!(obj.backend, globals::ObjectBackend::Gfx)
                 {
@@ -7233,6 +7611,9 @@ impl CommandContext {
                     continue;
                 };
                 for (obj_idx, obj) in list.iter().enumerate() {
+                    if !st.object_slot_is_used(stage_idx, obj_idx) {
+                        continue;
+                    }
                     collect_debug_active_textures_from_object(
                         self,
                         form_id,
@@ -7865,13 +8246,21 @@ fn object_backend_sprite_layer_offset(
 }
 
 fn object_backend_sprite_local_offset(
-    backend: &globals::ObjectBackend,
+    obj: &globals::ObjectState,
     sprite_id: Option<SpriteId>,
 ) -> (i64, i64) {
     let Some(sprite_id) = sprite_id else {
         return (0, 0);
     };
-    let globals::ObjectBackend::String { glyphs, .. } = backend else {
+    if let globals::ObjectBackend::Number { sprite_ids, .. } = &obj.backend {
+        return sprite_ids
+            .iter()
+            .position(|id| *id == sprite_id)
+            .and_then(|idx| obj.runtime.number_sprite_offsets.get(idx).copied().flatten())
+            .map(|x| (i64::from(x), 0))
+            .unwrap_or((0, 0));
+    }
+    let globals::ObjectBackend::String { glyphs, .. } = &obj.backend else {
         return (0, 0);
     };
     for glyph in glyphs {
@@ -8309,7 +8698,7 @@ fn collect_button_decided_action_by_runtime_slot_recursive(
     out: &mut Vec<globals::PendingButtonAction>,
 ) -> bool {
     if object_runtime_slot(obj_idx, obj) == runtime_slot {
-        if obj.used && obj.button.enabled && obj.button.action_no >= 0 {
+        if obj.button.enabled && obj.button.action_no >= 0 {
             push_object_button_decided_action(obj, out);
         }
         return true;
@@ -8333,7 +8722,7 @@ fn find_button_se_no_by_runtime_slot_recursive(
     runtime_slot: usize,
 ) -> Option<i64> {
     if object_runtime_slot(obj_idx, obj) == runtime_slot {
-        return (obj.used && obj.button.enabled && obj.button.action_no >= 0)
+        return (obj.button.enabled && obj.button.action_no >= 0)
             .then_some(obj.button.se_no);
     }
     for (child_idx, child) in obj.runtime.child_objects.iter().enumerate() {
@@ -8527,14 +8916,23 @@ fn hit_test_render_sprite(
             return false;
         }
     }
-    let Some(img_id) = sprite.image_id else {
+    let img = sprite
+        .image_id
+        .and_then(|img_id| images.get(img_id))
+        .map(|image| image.as_ref());
+    let emote = sprite.emote_render.as_deref();
+    if img.is_none() && emote.is_none() {
         return false;
-    };
-    let Some(img) = images.get(img_id).map(|a| a.as_ref()) else {
+    }
+    let (intrinsic_w, intrinsic_h) = if let Some(img) = img {
+        (img.width, img.height)
+    } else if let Some(packet) = emote {
+        (packet.width, packet.height)
+    } else {
         return false;
     };
     let (w, h) = match sprite.size_mode {
-        SpriteSizeMode::Intrinsic => (img.width as f32, img.height as f32),
+        SpriteSizeMode::Intrinsic => (intrinsic_w as f32, intrinsic_h as f32),
         SpriteSizeMode::Explicit { width, height } => (width as f32, height as f32),
     };
     let (anchor_x, anchor_y) = match sprite.fit {
@@ -8576,7 +8974,14 @@ fn hit_test_render_sprite(
             ),
             None => (local_x.floor() as i32, local_y.floor() as i32),
         };
-        if !CommandContext::alpha_test_image(img, sx, sy) {
+        let opaque = if let Some(img) = img {
+            CommandContext::alpha_test_image(img, sx, sy)
+        } else if let Some(packet) = emote {
+            packet.alpha_hit_test(sx, sy)
+        } else {
+            false
+        };
+        if !opaque {
             return false;
         }
     }
@@ -8634,8 +9039,7 @@ fn button_sort_ge(lhs: ButtonSortKey, rhs: ButtonSortKey) -> bool {
 }
 
 fn has_standalone_button_action(obj: &globals::ObjectState) -> bool {
-    obj.used
-        && obj.button.enabled
+    obj.button.enabled
         && !obj.button.is_disabled()
         && obj.button.group_idx().is_none()
         && obj.button.action_no >= 0
@@ -8895,7 +9299,7 @@ fn fetch_bound_render_sprites_for_hit(
         let Some(sprite) = layer.sprite(sid) else {
             return;
         };
-        if sprite.image_id.is_none() {
+        if sprite.image_id.is_none() && sprite.emote_render.is_none() {
             return;
         }
         out.push(RenderSprite::new(Some(lid), Some(sid), sprite.clone()));
@@ -9392,8 +9796,7 @@ fn hit_test_object_button_recursive(
         inherited_owner: Option<ButtonOwnerInfo>,
     ) -> Option<ButtonHitCandidate> {
         let runtime_slot = object_runtime_slot(obj_idx, obj);
-        let current_owner = if obj.used
-            && obj.button.enabled
+        let current_owner = if obj.button.enabled
             && !obj.button.is_disabled()
             && !obj.base.no_event_hint
             && obj.button.action_no >= 0
@@ -10151,7 +10554,7 @@ fn sync_weather_object_recursive(
     real_delta_ms: i32,
     obj: &mut globals::ObjectState,
 ) {
-    if obj.used && obj.object_type == 4 && matches!(obj.weather_param.weather_type, 1 | 2) {
+    if obj.object_type == 4 && matches!(obj.weather_param.weather_type, 1 | 2) {
         obj.update_weather_time(game_delta_ms, real_delta_ms, screen_w, screen_h);
         let Some((layer_id, sprite_ids)) = ensure_weather_sprites(layers, obj) else {
             return;
@@ -10444,7 +10847,7 @@ fn sync_emote_object_recursive(
     koe_chara_no: i64,
     live_mouth: f32,
 ) {
-    if obj.used && obj.object_type == 12 {
+    if obj.object_type == 12 {
         let fallback = obj.emote.koe_mouth_volume as f32 / 1000.0;
         let mouth = if !mouth_stop
             && obj.emote.koe_chara_no >= 0
@@ -10464,7 +10867,13 @@ fn sync_emote_object_recursive(
         if let globals::ObjectBackend::Rect { layer_id, sprite_id, width, height } = obj.backend {
             if let Some(sprite) = layers.layer_mut(layer_id).and_then(|layer| layer.sprite_mut(sprite_id)) {
                 sprite.emote_render = obj.emote.runtime.as_ref().map(|runtime| {
-                    runtime.packet(obj.emote.width, obj.emote.height, obj.emote.rep_x, obj.emote.rep_y)
+                    runtime.packet(
+                        obj.emote.width,
+                        obj.emote.height,
+                        obj.emote.rep_x,
+                        obj.emote.rep_y,
+                        obj.button.alpha_test,
+                    )
                 });
                 sprite.size_mode = SpriteSizeMode::Explicit { width, height };
                 sprite.alpha_test = true;
@@ -10492,7 +10901,7 @@ fn sync_movie_object_recursive(
     decoded_any: &mut bool,
 ) {
     let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
-    if obj.used && obj.object_type == 9 {
+    if obj.object_type == 9 {
         if let Some(file_name) = obj.file_name.clone() {
             if trace {
                 eprintln!("[SG_MOVIE_TRACE] enter stage={} obj={} file={} playing={} pause={} backend={:?} children={}", stage_idx, obj_idx, file_name, obj.movie.playing, obj.movie.pause_flag, obj.backend, obj.runtime.child_objects.len());
@@ -11255,6 +11664,18 @@ fn fetch_bound_render_sprites_impl(
             }
         }
         globals::ObjectBackend::None => {}
+        globals::ObjectBackend::Number {
+            layer_id,
+            sprite_ids,
+        } => {
+            // Backend visibility may be suppressed for tree-owned sprites;
+            // the number layout separately selects digits and padding.
+            for (&sprite_id, offset) in sprite_ids.iter().zip(&obj.runtime.number_sprite_offsets) {
+                if offset.is_some() {
+                    push_one(ctx, *layer_id, sprite_id, visible_only, &mut out);
+                }
+            }
+        }
         backend => {
             for (layer_id, sprite_id) in layer_backed_object_sprite_bindings(backend) {
                 push_one(ctx, layer_id, sprite_id, visible_only, &mut out);
@@ -11442,15 +11863,9 @@ fn configure_sprite_3d(
     sprite.shadow_receive = sprite.mesh_kind != 0;
     sprite.mesh_animation = info.mesh_animation.clone();
 
-    let uses_3d = matches!(info.object_type, 6 | 7)
-        || info.billboard
-        || info.z != 0
-        || info.center_z != 0
-        || info.scale_z != 1000
-        || info.rotate_x != 0
-        || info.rotate_y != 0;
-
-    sprite.camera_enabled = uses_3d;
+    // Screen objects can rotate on all axes without entering world coordinates.
+    // An assigned WORLD supplies its camera later in apply_world_camera_mode.
+    sprite.camera_enabled = matches!(info.object_type, 6 | 7) || info.billboard;
     sprite.camera_eye = [0.0, 0.0, -1000.0];
     sprite.camera_target = [0.0, 0.0, 0.0];
     sprite.camera_up = [0.0, 1.0, 0.0];
@@ -11960,13 +12375,13 @@ fn append_object_tree_nodes(
             for mut rs in bound.drain(..) {
                 apply_object_render_info_to_sprite(&mut rs.sprite, &info);
                 let (local_x, local_y) =
-                    object_backend_sprite_local_offset(&obj.backend, rs.sprite_id);
+                    object_backend_sprite_local_offset(obj, rs.sprite_id);
                 if local_x != 0 || local_y != 0 {
                     rs.sprite.x = (rs.sprite.x as i64 + local_x)
                         .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                     rs.sprite.y = (rs.sprite.y as i64 + local_y)
                         .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                    // All glyph quads share the object's transform origin.
+                    // All glyph and digit quads share the object's transform origin.
                     // Moving the individual quad requires the inverse pivot
                     // adjustment, matching C++ rp.center -= glyph.pos.
                     rs.sprite.pivot_x -= local_x as f32;
@@ -12314,7 +12729,10 @@ fn finalize_object_center_rep_to_sprite(sprite: &mut Sprite, info: &ObjectRender
 }
 
 fn object_participates_in_tree(obj: &globals::ObjectState) -> bool {
-    if obj.used {
+    // C++ does not have a mutable "used" lifetime flag.  Top-level list slots
+    // are gated by C_elm_object::is_use() outside this helper; once an object is
+    // admitted, participation is determined by its payload/tree state.
+    if obj.object_type != 0 {
         return true;
     }
     if !obj.runtime.child_objects.is_empty() {
@@ -13559,6 +13977,7 @@ fn build_siglus_object_render_list(
                 };
                 for (obj_idx, obj) in list.iter().enumerate() {
                     if st.is_embedded_object_slot(stage_idx, obj_idx)
+                        || !st.object_slot_is_used(stage_idx, obj_idx)
                         || !object_participates_in_tree(obj)
                     {
                         continue;
@@ -14797,6 +15216,82 @@ mod render_tree_fidelity_tests {
     }
 
     #[test]
+    fn screen_icon_rotation_keeps_screen_coordinates() {
+        let ctx = super::CommandContext::new(std::path::PathBuf::from("."));
+        let mut obj = super::globals::ObjectState::default();
+        obj.init_param_like();
+        obj.object_type = 2;
+        obj.set_int_prop(&ctx.ids, ctx.ids.obj_rotate_x, 3600);
+        let info = super::effective_object_info(&ctx, 1, 0, &obj);
+        let mut sprite = Sprite::default();
+        super::configure_sprite_3d(&mut sprite, &info, None, 1920, 1080);
+        assert!(!sprite.camera_enabled);
+        let quad =
+            crate::render_math::sprite_quad_points(&sprite, 950.0, 800.0, 132.0, 132.0, 1920.0, 1080.0)
+                .expect("rotated icon quad");
+        assert!((quad[0].x - 950.0).abs() < 0.01);
+        assert!((quad[0].y - 800.0).abs() < 0.01);
+        assert!((quad[2].x - 1082.0).abs() < 0.01);
+        assert!((quad[2].y - 932.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn number_tree_preserves_digit_offsets_and_omits_unused_slots() {
+        let mut ctx = super::CommandContext::new(std::path::PathBuf::from("."));
+        let image_id = ctx.images.solid_rgba((255, 255, 255, 255));
+        let layer_id = ctx.layers.create_layer();
+        let layer = ctx.layers.layer_mut(layer_id).unwrap();
+        let sprite_ids: Vec<_> = (0..3)
+            .map(|_| {
+                let id = layer.create_sprite();
+                let sprite = layer.sprite_mut(id).unwrap();
+                sprite.image_id = Some(image_id);
+                // Tree-owned backend sprites can be hidden independently of digits.
+                sprite.visible = false;
+                id
+            })
+            .collect();
+        let mut obj = super::globals::ObjectState::default();
+        obj.init_param_like();
+        obj.used = true;
+        obj.object_type = 5;
+        obj.backend = super::globals::ObjectBackend::Number {
+            layer_id,
+            sprite_ids,
+        };
+        obj.runtime.number_sprite_offsets = vec![Some(0), Some(30), None];
+        obj.set_int_prop(&ctx.ids, ctx.ids.obj_disp, 1);
+        obj.set_int_prop(&ctx.ids, ctx.ids.obj_y, 206);
+        for x in [106, 200] {
+            obj.set_int_prop(&ctx.ids, ctx.ids.obj_x, x);
+            let mut nodes = Vec::new();
+            super::append_object_tree_nodes(
+                &ctx,
+                None,
+                1,
+                0,
+                &obj,
+                None,
+                true,
+                0,
+                0,
+                None,
+                &mut nodes,
+                &mut std::collections::HashSet::new(),
+                &mut Vec::new(),
+            );
+            let mut sprites = Vec::new();
+            for node in nodes {
+                node.flatten(&mut sprites);
+            }
+            assert_eq!(sprites.len(), 2);
+            assert_eq!(sprites[0].sprite.x, x as i32);
+            assert_eq!(sprites[1].sprite.x, x as i32 + 30);
+            assert_eq!(sprites[1].sprite.y, 206);
+        }
+    }
+
+    #[test]
     fn root_sort_keeps_each_subtree_contiguous() {
         let child = SiglusRenderNode::from_single_sprite(sprite(100, 0, 11));
         let first = SiglusRenderNode {
@@ -14925,5 +15420,26 @@ mod render_tree_fidelity_tests {
             classify_wipe_partition(&child, 0, 10, 0, 20, false),
             WipePartition::Target
         );
+    }
+}
+
+#[cfg(test)]
+mod scene_metadata_cache_tests {
+    use super::*;
+
+    #[test]
+    fn active_append_change_invalidates_resident_scene_metadata() {
+        let mut ctx = CommandContext::new(
+            std::env::temp_dir().join("siglus-scene-metadata-cache-test"),
+        );
+        ctx.set_active_append("append_a".to_string(), "A".to_string());
+        *ctx.scene_metadata.get_mut() = Some((
+            "append_a".to_string(),
+            Arc::new(SceneMetadata::from_rows(vec![("scene_a".to_string(), 3)])),
+        ));
+        assert!(ctx.scene_metadata.get_mut().is_some());
+
+        ctx.set_active_append("append_b".to_string(), "B".to_string());
+        assert!(ctx.scene_metadata.get_mut().is_none());
     }
 }

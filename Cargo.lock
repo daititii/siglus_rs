@@ -898,6 +898,19 @@ dependencies = [
 
 [[package]]
 name = "env_logger"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
+dependencies = [
+ "humantime",
+ "is-terminal",
+ "log",
+ "regex",
+ "termcolor",
+]
+
+[[package]]
+name = "env_logger"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2daee4ea451f429a58296525ddf28b45a3b64f1acf6587e2067437bb11e218d"
@@ -1264,6 +1277,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1426,6 +1445,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "is-terminal"
+version = "0.4.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
+dependencies = [
+ "hermit-abi",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1545,7 +1575,7 @@ dependencies = [
  "glam",
  "mint",
  "paste",
- "ringbuf",
+ "ringbuf 0.3.3",
  "send_wrapper",
  "symphonia",
  "triple_buffer",
@@ -1751,7 +1781,7 @@ dependencies = [
  "bytemuck",
  "byteorder",
  "crossbeam-channel",
- "env_logger",
+ "env_logger 0.11.9",
  "log",
  "oxideav-ac3",
  "oxideav-core",
@@ -2590,6 +2620,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ringbuf"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
+dependencies = [
+ "crossbeam-utils",
+ "portable-atomic",
+ "portable-atomic-util",
+]
+
+[[package]]
 name = "rodio"
 version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2893,7 +2934,7 @@ dependencies = [
  "egui-wgpu",
  "eluna_rs",
  "encoding_rs",
- "env_logger",
+ "env_logger 0.11.9",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "image",
@@ -2904,6 +2945,7 @@ dependencies = [
  "ndk-context",
  "pollster",
  "raw-window-handle 0.6.2",
+ "serde_json",
  "shion-xfile",
  "siglus_assets",
  "siglus_omv_decoder",
@@ -2915,6 +2957,7 @@ dependencies = [
  "web-time 1.1.0",
  "wgpu 0.20.1",
  "winit 0.30.12",
+ "wmv-decoder",
 ]
 
 [[package]]
@@ -2942,7 +2985,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
- "env_logger",
+ "env_logger 0.11.9",
  "log",
  "pollster",
  "shion-render",
@@ -4465,6 +4508,25 @@ name = "wit-bindgen"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
+
+[[package]]
+name = "wmv-decoder"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "byteorder",
+ "cpal",
+ "crossbeam-channel",
+ "env_logger 0.10.2",
+ "log",
+ "png 0.17.16",
+ "pollster",
+ "ringbuf 0.4.8",
+ "thiserror 1.0.69",
+ "wgpu 0.19.4",
+ "winit 0.29.15",
+]
 
 [[package]]
 name = "writeable"

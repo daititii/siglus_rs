@@ -9,6 +9,9 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-A static_mut_refs"
@@ -235,7 +238,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macos (dmg only)
+    name: macos (arm64 + x86_64 + universal dmg)
     runs-on: macos-15
 
     steps:
@@ -249,6 +252,8 @@ jobs:
 
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -257,25 +262,79 @@ jobs:
         run: |
           brew install xcodegen
 
-      - name: Build macOS .app
+      - name: Build macOS arm64 .app
         run: |
           chmod +x platform/scripts/package_macos_app.sh
-          ./platform/scripts/package_macos_app.sh
+          RUST_TARGET=aarch64-apple-darwin OUT_APP_NAME=Siglus-arm64.app ./platform/scripts/package_macos_app.sh
 
-      - name: Build macOS .dmg
+      - name: Build macOS x86_64 .app
+        run: |
+          chmod +x platform/scripts/package_macos_app.sh
+          RUST_TARGET=x86_64-apple-darwin OUT_APP_NAME=Siglus-x86_64.app ./platform/scripts/package_macos_app.sh
+
+      - name: Validate per-arch macOS outputs
+        run: |
+          ARM64_BIN="dist/macos/Siglus-arm64.app/Contents/MacOS/Siglus"
+          ARM64_DYLIB="dist/macos/Siglus-arm64.app/Contents/Frameworks/libsiglus.dylib"
+          X86_64_BIN="dist/macos/Siglus-x86_64.app/Contents/MacOS/Siglus"
+          X86_64_DYLIB="dist/macos/Siglus-x86_64.app/Contents/Frameworks/libsiglus.dylib"
+
+          test -f "${ARM64_BIN}"
+          test -f "${ARM64_DYLIB}"
+          test -f "${X86_64_BIN}"
+          test -f "${X86_64_DYLIB}"
+
+          lipo "${ARM64_BIN}" -verify_arch arm64
+          lipo "${ARM64_DYLIB}" -verify_arch arm64
+          lipo "${X86_64_BIN}" -verify_arch x86_64
+          lipo "${X86_64_DYLIB}" -verify_arch x86_64
+
+      - name: Build universal macOS .app
+        run: |
+          chmod +x platform/scripts/package_macos_universal_app.sh
+          ./platform/scripts/package_macos_universal_app.sh
+
+      - name: Build universal macOS .dmg
         run: |
           chmod +x platform/scripts/package_macos_dmg.sh
-          ./platform/scripts/package_macos_dmg.sh
+          DMG_NAME=Siglus-universal ./platform/scripts/package_macos_dmg.sh
 
-      - name: Verify DMG output
+      - name: Validate universal macOS outputs
         run: |
-          test -f dist/macos/Siglus.dmg
+          UNIVERSAL_BIN="dist/macos/Siglus.app/Contents/MacOS/Siglus"
+          UNIVERSAL_DYLIB="dist/macos/Siglus.app/Contents/Frameworks/libsiglus.dylib"
 
-      - name: Upload artifact
+          test -f "${UNIVERSAL_BIN}"
+          test -f "${UNIVERSAL_DYLIB}"
+          test -f dist/macos/Siglus-universal.dmg
+
+          lipo "${UNIVERSAL_BIN}" -verify_arch arm64 x86_64
+          lipo "${UNIVERSAL_DYLIB}" -verify_arch arm64 x86_64
+
+      - name: Package per-arch macOS artifacts
+        run: |
+          tar -C dist/macos -czf dist/macos/siglus-macos-arm64.app.tar.gz Siglus-arm64.app
+          tar -C dist/macos -czf dist/macos/siglus-macos-x86_64.app.tar.gz Siglus-x86_64.app
+
+      - name: Upload arm64 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: siglus-macos
-          path: dist/macos/Siglus.dmg
+          name: siglus-macos-arm64
+          path: dist/macos/siglus-macos-arm64.app.tar.gz
+          if-no-files-found: error
+
+      - name: Upload x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: siglus-macos-x86_64
+          path: dist/macos/siglus-macos-x86_64.app.tar.gz
+          if-no-files-found: error
+
+      - name: Upload universal DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: siglus-macos-universal
+          path: dist/macos/Siglus-universal.dmg
           if-no-files-found: error
 
   ios:
@@ -605,7 +664,9 @@ jobs:
             _artifacts/siglus-linux-aarch64/siglus-linux-aarch64.tar.gz \
             _artifacts/siglus-freebsd-x86_64/siglus-freebsd-x86_64.tar.gz \
             _artifacts/siglus-wasm/siglus_rs-wasm.zip \
-            _artifacts/siglus-macos/Siglus.dmg \
+            _artifacts/siglus-macos-arm64/siglus-macos-arm64.app.tar.gz \
+            _artifacts/siglus-macos-x86_64/siglus-macos-x86_64.app.tar.gz \
+            _artifacts/siglus-macos-universal/Siglus-universal.dmg \
             _artifacts/siglus-ios/SiglusLauncher.ipa \
             _artifacts/siglus-windows/siglus.exe \
             _artifacts/siglus-windows/siglus_arm64.exe \

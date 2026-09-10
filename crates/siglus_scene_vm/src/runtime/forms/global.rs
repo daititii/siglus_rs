@@ -1131,18 +1131,25 @@ fn dispatch_global_koe_command(
             .unwrap_or(-1);
             remember_global_koe(ctx, koe_no, chara_no, is_ex);
             let append_dir = ctx.globals.append_dir.clone();
+            let jitan_rate = ctx.koe_jitan_rate(
+                is_ex.then(|| named_i64(args, 4).unwrap_or(0) != 0),
+                false,
+            );
             if let Err(err) = {
                 let (koe, audio) = (&mut ctx.koe, &mut ctx.audio);
-                koe.play_koe_no(audio, koe_no, &append_dir)
+                koe.play_koe_no_with_rate(audio, koe_no, &append_dir, jitan_rate)
             } {
                 eprintln!("[SG_AUDIO] koe.play failed koe_no={koe_no}: {err:#}");
             }
-            if is_ex && named_i64(args, 2).unwrap_or(0) != 0 {
+            let ex_wait = is_ex && named_i64(args, 2).unwrap_or(0) != 0;
+            if ex_wait {
                 let key_skip = named_i64(args, 3).unwrap_or(0) != 0;
-                ctx.wait
-                    .wait_audio(crate::runtime::wait::AudioWait::KoeAny, key_skip);
-            }
-            if ret_form.unwrap_or(0) != 0 {
+                ctx.wait.wait_audio_with_return(
+                    crate::runtime::wait::AudioWait::KoeAny,
+                    key_skip,
+                    ret_form.unwrap_or(0) != 0,
+                );
+            } else if ret_form.unwrap_or(0) != 0 {
                 ctx.push(Value::Int(0));
             }
             Ok(true)
@@ -1170,19 +1177,23 @@ fn dispatch_global_koe_command(
             .unwrap_or(-1);
             remember_global_koe(ctx, koe_no, chara_no, is_ex);
             let append_dir = ctx.globals.append_dir.clone();
+            let jitan_rate = ctx.koe_jitan_rate(
+                is_ex.then(|| named_i64(args, 4).unwrap_or(0) != 0),
+                false,
+            );
             if let Err(err) = {
                 let (koe, audio) = (&mut ctx.koe, &mut ctx.audio);
-                koe.play_koe_no(audio, koe_no, &append_dir)
+                koe.play_koe_no_with_rate(audio, koe_no, &append_dir, jitan_rate)
             } {
                 eprintln!("[SG_AUDIO] koe.play_wait failed koe_no={koe_no}: {err:#}");
             }
             let key_skip = op == constants::elm_value::GLOBAL_KOE_PLAY_WAIT_KEY
                 || op == constants::elm_value::GLOBAL_EXKOE_PLAY_WAIT_KEY;
-            ctx.wait
-                .wait_audio(crate::runtime::wait::AudioWait::KoeAny, key_skip);
-            if ret_form.unwrap_or(0) != 0 {
-                ctx.push(Value::Int(0));
-            }
+            ctx.wait.wait_audio_with_return(
+                crate::runtime::wait::AudioWait::KoeAny,
+                key_skip,
+                ret_form.unwrap_or(0) != 0,
+            );
             Ok(true)
         }
         constants::elm_value::GLOBAL_KOE_STOP => {
@@ -1192,11 +1203,11 @@ fn dispatch_global_koe_command(
         }
         constants::elm_value::GLOBAL_KOE_WAIT | constants::elm_value::GLOBAL_KOE_WAIT_KEY => {
             let key_skip = op == constants::elm_value::GLOBAL_KOE_WAIT_KEY;
-            ctx.wait
-                .wait_audio(crate::runtime::wait::AudioWait::KoeAny, key_skip);
-            if ret_form.unwrap_or(0) != 0 {
-                ctx.push(Value::Int(0));
-            }
+            ctx.wait.wait_audio_with_return(
+                crate::runtime::wait::AudioWait::KoeAny,
+                key_skip,
+                ret_form.unwrap_or(0) != 0,
+            );
             Ok(true)
         }
         constants::elm_value::GLOBAL_KOE_CHECK => {
@@ -1749,13 +1760,32 @@ fn dispatch_capture_command(
             Ok(true)
         }
         constants::elm_value::GLOBAL_CAPTURE_FOR_TWEET => {
-            let img = ctx.capture_frame_rgba()?;
-            ctx.globals.capture_image = Some(img);
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            {
+                // C++ tnm_syscom_create_capture_for_tweet() only raises
+                // TNM_CAPTURE_TYPE_TWEET and pushes DISP.  The texture itself
+                // is produced while that DISP is rendered, not at command
+                // dispatch time.
+                ctx.globals.capture_for_tweet_pending = true;
+                ctx.request_disp_proc_boundary();
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            {
+                log::error!("GLOBAL.CAPTURE_FOR_TWEET is not implemented on this platform");
+            }
             ctx.push(Value::Int(0));
             Ok(true)
         }
         constants::elm_value::GLOBAL_CAPTURE_FREE_FOR_TWEET => {
-            ctx.globals.capture_image = None;
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            {
+                ctx.globals.capture_image = None;
+                ctx.globals.capture_for_tweet_pending = false;
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            {
+                log::error!("GLOBAL.CAPTURE_FREE_FOR_TWEET is not implemented on this platform");
+            }
             ctx.push(Value::Int(0));
             Ok(true)
         }
@@ -2187,5 +2217,73 @@ pub fn dispatch_global_form(
 
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod koe_wait_return_tests {
+    use super::*;
+    use crate::runtime::VmCallMeta;
+    use std::path::PathBuf;
+
+    fn set_call(ctx: &mut CommandContext, op: i32, ret_form: i64) {
+        ctx.vm_call = Some(VmCallMeta {
+            element: vec![op],
+            al_id: 0,
+            ret_form,
+        });
+    }
+
+    fn named(id: i32, value: i64) -> Value {
+        Value::NamedArg {
+            id,
+            value: Box::new(Value::Int(value)),
+        }
+    }
+
+    #[test]
+    fn exkoe_named_wait_defers_its_integer_result_until_wait_completion() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let op = constants::elm_value::GLOBAL_EXKOE;
+        set_call(&mut ctx, op, 10);
+        let args = vec![named(0, -1), named(2, 1), named(3, 1)];
+
+        assert!(dispatch_global_koe_command(&mut ctx, op as u32, &args).unwrap());
+        assert!(ctx.wait.audio.is_some());
+        assert!(ctx.stack.is_empty(), "EXKOE(wait=1) must not push the result before the wait proc finishes");
+    }
+
+    #[test]
+    fn exkoe_without_wait_returns_zero_immediately() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let op = constants::elm_value::GLOBAL_EXKOE;
+        set_call(&mut ctx, op, 10);
+        let args = vec![named(0, -1), named(2, 0), named(3, 1)];
+
+        assert!(dispatch_global_koe_command(&mut ctx, op as u32, &args).unwrap());
+        assert!(ctx.wait.audio.is_none());
+        assert_eq!(ctx.stack.pop().and_then(|v| v.as_i64()), Some(0));
+    }
+
+    #[test]
+    fn exkoe_play_wait_key_defers_return_value() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let op = constants::elm_value::GLOBAL_EXKOE_PLAY_WAIT_KEY;
+        set_call(&mut ctx, op, 10);
+
+        assert!(dispatch_global_koe_command(&mut ctx, op as u32, &[Value::Int(-1)]).unwrap());
+        assert!(ctx.wait.audio.is_some());
+        assert!(ctx.stack.is_empty());
+    }
+
+    #[test]
+    fn koe_wait_key_defers_return_value() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let op = constants::elm_value::GLOBAL_KOE_WAIT_KEY;
+        set_call(&mut ctx, op, 10);
+
+        assert!(dispatch_global_koe_command(&mut ctx, op as u32, &[]).unwrap());
+        assert!(ctx.wait.audio.is_some());
+        assert!(ctx.stack.is_empty());
     }
 }

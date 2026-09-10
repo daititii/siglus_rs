@@ -1,10 +1,16 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use crate::platform_time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
-use kira::sound::{EndPosition, Region};
+#[cfg(target_arch = "wasm32")]
+use kira::sound::static_sound::{StaticSoundData as BgmSoundData, StaticSoundHandle as BgmSoundHandle};
+#[cfg(not(target_arch = "wasm32"))]
+type BgmSoundData = kira::sound::streaming::StreamingSoundData<kira::sound::FromFileError>;
+#[cfg(not(target_arch = "wasm32"))]
+type BgmSoundHandle = kira::sound::streaming::StreamingSoundHandle<kira::sound::FromFileError>;
+use kira::sound::{EndPosition, PlaybackPosition, Region};
 use kira::tween::Tween;
 use kira::Volume;
 use siglus_assets::gameexe::{decode_gameexe_dat_bytes, GameexeConfig, GameexeDecodeOptions};
@@ -218,8 +224,8 @@ struct BgmScriptEntry {
 
 #[derive(Debug, Default)]
 struct BgmPlayerSlot {
-    handle: Option<StaticSoundHandle>,
-    source_bytes: Option<Vec<u8>>,
+    handle: Option<BgmSoundHandle>,
+    source_bytes: Option<Arc<[u8]>>,
     source_format: Option<BgmPlaybackFormat>,
     sample_rate_hz: u32,
     total_samples: u64,
@@ -305,6 +311,31 @@ impl BgmPlayerSlot {
         self.loop_flag && self.restart_sample < self.end_sample
     }
 
+    fn playback_data(&self, effective_start: u64, amp: f64, fade_in_ms: i64) -> Result<BgmSoundData> {
+        let source = self.source_bytes.as_ref().context("BGM slot not prepared")?;
+        // The original player owns a C_sound_stream and decodes while playing.
+        // Keep native playback streaming as well; the browser retains Kira's
+        // static fallback because kira::sound::streaming is unavailable there.
+        let mut data = BgmSoundData::from_cursor(Cursor::new(Arc::clone(source)))
+            .context("kira: prepare BGM playback stream")?
+            .start_position(PlaybackPosition::Samples(effective_start as usize))
+            .slice(Region {
+                start: PlaybackPosition::Samples(0),
+                end: EndPosition::Custom(PlaybackPosition::Samples(self.end_sample as usize)),
+            })
+            .volume(Volume::Amplitude(amp));
+        if self.has_loop_region() {
+            data = data.loop_region(Region {
+                start: PlaybackPosition::Samples(self.restart_sample as usize),
+                end: EndPosition::Custom(PlaybackPosition::Samples(self.end_sample as usize)),
+            });
+        }
+        if fade_in_ms > 0 {
+            data = data.fade_in_tween(tween_ms(fade_in_ms));
+        }
+        Ok(data)
+    }
+
     fn play_pos_samples(&self) -> u64 {
         let elapsed = self.elapsed_samples();
         if self.has_loop_region() {
@@ -352,7 +383,7 @@ pub struct BgmEngine {
     current_name: Option<String>,
     current_player_id: Option<usize>,
     players: Vec<BgmPlayerSlot>,
-    retired: Vec<(StaticSoundHandle, Instant)>,
+    retired: Vec<(BgmSoundHandle, Instant)>,
     delay_deadline: Option<Instant>,
     delayed_fade_in_ms: i64,
     loop_flag: bool,
@@ -369,6 +400,22 @@ impl std::fmt::Debug for BgmEngine {
             .field("loop_flag", &self.loop_flag)
             .field("pause_flag", &self.pause_flag)
             .finish()
+    }
+}
+
+impl Drop for BgmEngine {
+    fn drop(&mut self) {
+        // Native streaming decoders can outlive their handles. Stop them while
+        // CommandContext still owns the AudioHub that receives stop commands.
+        let immediate = Tween { duration: Duration::ZERO, ..Tween::default() };
+        for slot in &mut self.players {
+            if let Some(handle) = slot.handle.as_mut() {
+                handle.stop(immediate);
+            }
+        }
+        for (handle, _) in &mut self.retired {
+            handle.stop(immediate);
+        }
     }
 }
 
@@ -626,7 +673,7 @@ impl BgmEngine {
 
         let slot = &mut self.players[slot_id];
         slot.reset_all();
-        slot.source_bytes = Some(decoded.bytes);
+        slot.source_bytes = Some(decoded.bytes.into());
         slot.source_format = Some(decoded.format);
         slot.sample_rate_hz = decoded.sample_rate;
         slot.total_samples = total_samples;
@@ -651,9 +698,9 @@ impl BgmEngine {
     ) -> Result<()> {
         let amp = self.total_gain_amplitude();
         let slot = &mut self.players[slot_id];
-        let Some(source) = slot.source_bytes.as_ref() else {
+        if slot.source_bytes.is_none() {
             return Err(anyhow!("BGM slot not prepared"));
-        };
+        }
 
         let mut effective_start = slot.start_sample;
         if effective_start >= slot.end_sample {
@@ -681,33 +728,18 @@ impl BgmEngine {
             return Ok(());
         }
 
-        let start_sec = if slot.sample_rate_hz == 0 {
-            0.0
-        } else {
-            effective_start as f64 / slot.sample_rate_hz as f64
-        };
-        let mut data = StaticSoundData::from_cursor(Cursor::new(source.clone()))
-            .context("kira: decode BGM playback bytes")?;
-        data = data.start_position(start_sec);
-        if slot.has_loop_region() {
-            let loop_region = Region {
-                start: (slot.restart_sample as f64 / slot.sample_rate_hz.max(1) as f64).into(),
-                end: EndPosition::Custom(
-                    (slot.end_sample as f64 / slot.sample_rate_hz.max(1) as f64).into(),
-                ),
-            };
-            data = data.loop_region(loop_region);
-        }
+        let data = slot.playback_data(
+            effective_start,
+            amp,
+            if start_paused { 0 } else { fade_in_ms },
+        )?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut handle = audio.play_streaming(TrackKind::Bgm, data)?;
+        #[cfg(target_arch = "wasm32")]
         let mut handle = audio.play_static(TrackKind::Bgm, data)?;
 
         if start_paused {
-            let _ = handle.set_volume(Volume::Amplitude(amp), Tween::default());
             let _ = handle.pause(Tween::default());
-        } else if fade_in_ms > 0 {
-            let _ = handle.set_volume(Volume::Amplitude(0.0), Tween::default());
-            let _ = handle.set_volume(Volume::Amplitude(amp), tween_ms(fade_in_ms));
-        } else {
-            let _ = handle.set_volume(Volume::Amplitude(amp), Tween::default());
         }
 
         slot.handle = Some(handle);
@@ -1006,6 +1038,16 @@ impl BgmEngine {
             return Ok(());
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(err) = self.players[cur_id]
+            .handle
+            .as_mut()
+            .and_then(|h| h.pop_error())
+        {
+            self.stop_current_internal(0)?;
+            return Err(err).context("kira: decode BGM stream");
+        }
+
         let pending = self.players[cur_id].pending;
         if let Some(pending) = pending {
             if now >= pending.at {
@@ -1114,4 +1156,150 @@ fn load_gameexe_config(project_dir: &Path) -> Option<GameexeConfig> {
     let opt = load_gameexe_decode_options(project_dir).ok()?;
     let (text, _report) = decode_gameexe_dat_bytes(&raw, &opt).ok()?;
     Some(GameexeConfig::from_text(&text))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod streaming_tests {
+    use super::*;
+
+    fn wav_source() -> Arc<[u8]> {
+        let data_len = 48000u32 * 2;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&48000u32.to_le_bytes());
+        wav.extend_from_slice(&96000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        wav.into()
+    }
+
+    #[test]
+    fn native_bgm_keeps_shared_encoded_source_and_sample_ranges() {
+        let source = wav_source();
+        let slot = BgmPlayerSlot {
+            source_bytes: Some(Arc::clone(&source)),
+            end_sample: 40000,
+            restart_sample: 12000,
+            loop_flag: true,
+            ..Default::default()
+        };
+        let data = slot.playback_data(6000, 0.5, 250).unwrap();
+        assert_eq!(Arc::strong_count(&source), 3);
+        assert_eq!(data.settings.start_position, PlaybackPosition::Samples(6000));
+        assert_eq!(data.slice, Some((0, 40000)));
+        assert_eq!(data.num_frames(), 40000);
+        assert_eq!(
+            data.settings.loop_region,
+            Some(Region {
+                start: PlaybackPosition::Samples(12000),
+                end: EndPosition::Custom(PlaybackPosition::Samples(40000)),
+            })
+        );
+        assert_eq!(
+            data.settings.fade_in_tween.unwrap().duration,
+            Duration::from_millis(250)
+        );
+        drop(data);
+        assert_eq!(Arc::strong_count(&source), 2);
+    }
+
+    #[test]
+    fn oneshot_stops_at_script_end_without_loop_or_implicit_fade() {
+        let slot = BgmPlayerSlot {
+            source_bytes: Some(wav_source()),
+            end_sample: 24000,
+            ..Default::default()
+        };
+        let data = slot.playback_data(12000, 1.0, 0).unwrap();
+        assert_eq!(data.slice, Some((0, 24000)));
+        assert!(data.settings.loop_region.is_none());
+        assert!(data.settings.fade_in_tween.is_none());
+    }
+
+    #[test]
+    fn streaming_bgm_preserves_ready_pause_resume_and_retire_lifecycle() {
+        let mut audio = AudioHub::new();
+        let mut bgm = BgmEngine::new(std::env::temp_dir());
+        bgm.players[0] = BgmPlayerSlot {
+            source_bytes: Some(wav_source()),
+            sample_rate_hz: 48000,
+            total_samples: 48000,
+            end_sample: 48000,
+            loop_flag: true,
+            ..Default::default()
+        };
+        bgm.current_player_id = Some(0);
+        bgm.current_name = Some("test".to_owned());
+        bgm.loop_flag = true;
+
+        bgm.ready_slot(&mut audio, 0).unwrap();
+        assert_eq!(bgm.check_state(), TNM_PLAYER_STATE_PAUSE);
+        assert_eq!(bgm.play_pos_samples(), 0);
+        bgm.resume_script(&mut audio, 20, 0).unwrap();
+        assert_eq!(bgm.check_state(), TNM_PLAYER_STATE_PLAY);
+        bgm.pause_fade(&mut audio, 20).unwrap();
+        assert_eq!(bgm.check_state(), TNM_PLAYER_STATE_FADE_OUT);
+        bgm.players[0].pending.as_mut().unwrap().at = Instant::now();
+        bgm.tick(&mut audio).unwrap();
+        assert_eq!(bgm.check_state(), TNM_PLAYER_STATE_PAUSE);
+        bgm.resume_script(&mut audio, 0, 0).unwrap();
+        bgm.handoff_current_to_retired(20);
+        assert_eq!(bgm.retired.len(), 1);
+        assert_eq!(bgm.check_state(), TNM_PLAYER_STATE_FREE);
+        bgm.retired[0].1 = Instant::now();
+        bgm.tick(&mut audio).unwrap();
+        assert!(bgm.retired.is_empty());
+        bgm.start_slot(&mut audio, 0, 0).unwrap();
+        bgm.stop().unwrap();
+        assert_eq!(bgm.check_state(), TNM_PLAYER_STATE_FREE);
+        assert!(bgm.current_name().is_none());
+    }
+
+    fn check_context_releases_streaming_decoder(restart: bool) {
+        let source = wav_source();
+        let mut ctx = crate::runtime::CommandContext::new(std::env::temp_dir());
+        ctx.bgm.players[0] = BgmPlayerSlot {
+            source_bytes: Some(Arc::clone(&source)),
+            sample_rate_hz: 48000,
+            total_samples: 48000,
+            end_sample: 48000,
+            loop_flag: true,
+            ..Default::default()
+        };
+        ctx.bgm.current_player_id = Some(0);
+        ctx.bgm.start_slot(&mut ctx.audio, 0, 0).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        if restart {
+            ctx.reset_for_scene_restart();
+        } else {
+            drop(ctx);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Arc::strong_count(&source) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            Arc::strong_count(&source),
+            1,
+            "old BGM decoder leaked after shutdown"
+        );
+    }
+
+    #[test]
+    fn restarting_context_releases_old_streaming_decoder() {
+        check_context_releases_streaming_decoder(true);
+    }
+
+    #[test]
+    fn dropping_context_releases_old_streaming_decoder() {
+        check_context_releases_streaming_decoder(false);
+    }
 }

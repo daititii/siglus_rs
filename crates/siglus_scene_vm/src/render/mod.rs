@@ -19,9 +19,10 @@ use crate::layer::{
 };
 use crate::mesh3d::{load_mesh_asset, MeshAsset};
 use crate::runtime::FrameCaptureBackend;
-use crate::render_math::sprite_quad_points;
+use crate::render_math::sprite_quad_points_rect;
 
 mod emote;
+mod mipmap;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -672,6 +673,7 @@ pub struct Renderer {
     vertex_sprite2d_capacity: usize,
 
     textures: HashMap<ImageId, GpuTexture>,
+    mipmap_generator: mipmap::MipmapGenerator,
     external_textures: HashMap<PathBuf, GpuTexture>,
     mesh_assets: HashMap<String, MeshAsset>,
     default_aux: GpuTexture,
@@ -2172,7 +2174,13 @@ impl Renderer {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let vertex_sprite2d_capacity = vertex_capacity;
 
-        let default_aux = create_solid_texture(&device, &queue, [255, 255, 255, 255])?;
+        let mipmap_generator = mipmap::MipmapGenerator::new(&device);
+        let default_aux = create_solid_texture(
+            &device,
+            &queue,
+            &mipmap_generator,
+            [255, 255, 255, 255],
+        )?;
         let fog_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("siglus-cfx-fog-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -2302,6 +2310,7 @@ impl Renderer {
             external_textures: HashMap::new(),
             mesh_assets: HashMap::new(),
             default_aux,
+            mipmap_generator,
             fog_sampler,
             mesh_sampler,
             normal_sampler,
@@ -2490,7 +2499,7 @@ impl Renderer {
                 final_target,
                 blit_range,
             )?;
-            self.queue.submit(Some(encoder.finish()));
+            self.submit(encoder);
         } else {
             self.render_ordinary_frame_to_surface(images, &frame_plan.sprites, &view)?;
         }
@@ -2554,7 +2563,7 @@ impl Renderer {
             None,
             None,
         )?;
-        self.queue.submit(Some(encoder.finish()));
+        self.submit(encoder);
         Ok(())
     }
 
@@ -2595,20 +2604,62 @@ impl Renderer {
             } else {
                 (1, 1)
             };
-            let (src_left, src_top, src_right, src_bottom) =
-                src_clip_rect(sprite.src_clip, source_width, source_height)?;
-            let src_w = (src_right - src_left).max(1.0);
-            let src_h = (src_bottom - src_top).max(1.0);
-            let (dst_x, dst_y, dst_w, dst_h) = match sprite.fit {
-                SpriteFit::FullScreen => (0.0f32, 0.0f32, win_w, win_h),
-                SpriteFit::PixelRect => {
-                    let (w, h) = match sprite.size_mode {
-                        SpriteSizeMode::Intrinsic => (src_w, src_h),
-                        SpriteSizeMode::Explicit { width, height } => (width as f32, height as f32),
-                    };
-                    (sprite.x as f32, sprite.y as f32, w, h)
-                }
-            };
+            // Tona3's SRC_CLIP rectangle is expressed in the sprite's
+            // center-relative local coordinate system, not in 0-based texture
+            // pixels. For an intrinsic PCT sprite its initial rectangle is
+            // [-center, size-center], then rp.src_clip is intersected with it.
+            // UVs are derived only after translating the clipped local rectangle
+            // back by +center. Keep full-screen presentation on the existing
+            // screen-space path; ordinary object sprites use the original local
+            // coordinate semantics below.
+            let (dst_x, dst_y, local_left, local_top, local_right, local_bottom, u0, v0, u1, v1) =
+                match sprite.fit {
+                    SpriteFit::FullScreen => {
+                        let (src_left, src_top, src_right, src_bottom) =
+                            src_clip_rect(sprite.src_clip, source_width, source_height)?;
+                        let sw = source_width.max(1) as f32;
+                        let sh = source_height.max(1) as f32;
+                        (
+                            0.0f32,
+                            0.0f32,
+                            0.0f32,
+                            0.0f32,
+                            win_w,
+                            win_h,
+                            (src_left / sw).clamp(0.0, 1.0),
+                            (src_top / sh).clamp(0.0, 1.0),
+                            (src_right / sw).clamp(0.0, 1.0),
+                            (src_bottom / sh).clamp(0.0, 1.0),
+                        )
+                    }
+                    SpriteFit::PixelRect => {
+                        let (logical_w, logical_h) = match sprite.size_mode {
+                            SpriteSizeMode::Intrinsic => {
+                                (source_width.max(1) as f32, source_height.max(1) as f32)
+                            }
+                            SpriteSizeMode::Explicit { width, height } => {
+                                (width.max(1) as f32, height.max(1) as f32)
+                            }
+                        };
+                        let Some((left, top, right, bottom)) =
+                            tona_src_clip_local_rect(sprite, logical_w, logical_h)
+                        else {
+                            continue;
+                        };
+                        (
+                            sprite.x as f32,
+                            sprite.y as f32,
+                            left,
+                            top,
+                            right,
+                            bottom,
+                            (left / logical_w).clamp(0.0, 1.0),
+                            (top / logical_h).clamp(0.0, 1.0),
+                            (right / logical_w).clamp(0.0, 1.0),
+                            (bottom / logical_h).clamp(0.0, 1.0),
+                        )
+                    }
+                };
 
             let scissor = dst_scissor_rect_to_viewport(
                 sprite.dst_clip,
@@ -3125,47 +3176,53 @@ impl Renderer {
             if img.is_none() && emote_render_id.is_none() {
                 continue;
             }
-            let source_width_f = source_width.max(1) as f32;
-            let source_height_f = source_height.max(1) as f32;
-            let (u0, v0, u1, v1) = (
-                (src_left / source_width_f).clamp(0.0, 1.0),
-                (src_top / source_height_f).clamp(0.0, 1.0),
-                (src_right / source_width_f).clamp(0.0, 1.0),
-                (src_bottom / source_height_f).clamp(0.0, 1.0),
-            );
+            let Some([p0, p1, p2, p3]) = sprite_quad_points_rect(
+                sprite,
+                dst_x,
+                dst_y,
+                local_left,
+                local_top,
+                local_right,
+                local_bottom,
+                win_w,
+                win_h,
+            ) else {
+                continue;
+            };
+
+            // Tona3 computes mask texture coordinates from the final 2D vertex
+            // positions, not from the source-image UV rectangle.  In
+            // C_d3d_sprite::set_d2_vertex_param() the original formula is:
+            //
+            //   u = linear(vertex.x + 0.5 - mask_x,
+            //              -mask_center_x, 0,
+            //              -mask_center_x + mask_width_ex, 1)
+            //
+            // The original D3D9 vertex has already been shifted by -0.5 px, so
+            // the +0.5 cancels that rasterization adjustment.  `p0..p3` are
+            // logical pixel positions before any half-pixel correction, hence
+            // the equivalent coordinate here is simply
+            // (vertex - mask_pos + mask_center) / mask_size.
             let mask_uv = if let Some(mask_id) = sprite.mask_image_id {
                 if let Some(mask_img) = images.get(mask_id) {
                     let mw = mask_img.width.max(1) as f32;
                     let mh = mask_img.height.max(1) as f32;
-                    [
+                    let mask_x = sprite.mask_offset_x as f32;
+                    let mask_y = sprite.mask_offset_y as f32;
+                    let center_x = mask_img.center_x as f32;
+                    let center_y = mask_img.center_y as f32;
+                    let uv_for = |p: crate::render_math::ProjectedPoint| {
                         [
-                            (src_left + sprite.mask_offset_x as f32) / mw,
-                            (src_top + sprite.mask_offset_y as f32) / mh,
-                        ],
-                        [
-                            (src_right + sprite.mask_offset_x as f32) / mw,
-                            (src_top + sprite.mask_offset_y as f32) / mh,
-                        ],
-                        [
-                            (src_right + sprite.mask_offset_x as f32) / mw,
-                            (src_bottom + sprite.mask_offset_y as f32) / mh,
-                        ],
-                        [
-                            (src_left + sprite.mask_offset_x as f32) / mw,
-                            (src_bottom + sprite.mask_offset_y as f32) / mh,
-                        ],
-                    ]
+                            (p.x - mask_x + center_x) / mw,
+                            (p.y - mask_y + center_y) / mh,
+                        ]
+                    };
+                    [uv_for(p0), uv_for(p1), uv_for(p2), uv_for(p3)]
                 } else {
                     [[0.0, 0.0]; 4]
                 }
             } else {
                 [[0.0, 0.0]; 4]
-            };
-
-            let Some([p0, p1, p2, p3]) =
-                sprite_quad_points(sprite, dst_x, dst_y, dst_w, dst_h, win_w, win_h)
-            else {
-                continue;
             };
             let base = self.verts.len() as u32;
             let (x0, y0, z0) = pixel_to_ndc(p0.x, p0.y, p0.depth, win_w, win_h);
@@ -3651,7 +3708,7 @@ impl Renderer {
                 )?;
             }
         }
-        self.queue.submit(Some(encoder.finish()));
+        self.submit(encoder);
         Ok(current)
     }
 
@@ -3684,7 +3741,7 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit(Some(encoder.finish()));
+        self.submit(encoder);
     }
 
 
@@ -3729,6 +3786,7 @@ impl Renderer {
         let texture = create_gpu_texture(
             &self.device,
             &self.queue,
+            &self.mipmap_generator,
             "siglus-generated-wipe-mask",
             &image,
             wipe.random_seed as u64,
@@ -3842,7 +3900,7 @@ impl Renderer {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit(Some(encoder.finish()));
+        self.submit(encoder);
         Ok(target)
     }
 
@@ -3954,7 +4012,7 @@ impl Renderer {
                 pass.draw(0..draw.vertices.len() as u32, 0..1);
             }
         }
-        self.queue.submit(Some(encoder.finish()));
+        self.submit(encoder);
         Ok(())
     }
 
@@ -4342,7 +4400,7 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit(Some(encoder.finish()));
+        self.submit(encoder);
 
         let buffer_slice = output_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4401,6 +4459,7 @@ impl Renderer {
         let tex = create_gpu_texture(
             &self.device,
             &self.queue,
+            &self.mipmap_generator,
             &format!("siglus-external-texture-{}", self.external_textures.len()),
             &img,
             0,
@@ -5206,6 +5265,7 @@ impl Renderer {
                     tex = create_gpu_texture(
                         &self.device,
                         &self.queue,
+                        &self.mipmap_generator,
                         &format!("siglus-texture-{}", id.index()),
                         img,
                         version,
@@ -5218,6 +5278,7 @@ impl Renderer {
             let tex = create_gpu_texture(
                 &self.device,
                 &self.queue,
+                &self.mipmap_generator,
                 &format!("siglus-texture-{}", id.index()),
                 img,
                 version,
@@ -5231,26 +5292,19 @@ impl Renderer {
         if tex.width != img.width || tex.height != img.height {
             return Ok(());
         }
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &tex._tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &img.rgba,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * img.width),
-                rows_per_image: Some(img.height),
-            },
-            wgpu::Extent3d {
-                width: img.width,
-                height: img.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        upload_texture_pixels(&self.queue, &tex._tex, img);
+        if let Some(mipmaps) = self.mipmap_generator.generate(&self.device, &tex._tex) {
+            // D3D9 AUTOGENMIPMAP makes regenerated levels available after a
+            // level-0 update. Submit this texture's chain immediately so the
+            // Metal backend cannot accumulate native command buffers for every
+            // texture prepared in the frame before any work reaches the queue.
+            self.queue.submit(Some(mipmaps));
+        }
         Ok(())
+    }
+
+    fn submit(&self, encoder: wgpu::CommandEncoder) {
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 impl FrameCaptureBackend for Renderer {
@@ -5293,6 +5347,7 @@ impl FrameCaptureBackend for Renderer {
 fn create_solid_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    mipmap_generator: &mipmap::MipmapGenerator,
     rgba: [u8; 4],
 ) -> Result<GpuTexture> {
     let img = crate::assets::RgbaImage {
@@ -5302,10 +5357,18 @@ fn create_solid_texture(
         center_y: 0,
         rgba: rgba.to_vec(),
     };
-    create_gpu_texture(device, queue, "siglus-default-aux", &img, 0)
+    create_gpu_texture(
+        device,
+        queue,
+        mipmap_generator,
+        "siglus-default-aux",
+        &img,
+        0,
+    )
 }
 
 
+#[cfg(test)]
 #[derive(Debug)]
 struct Rgba8MipLevel {
     width: u32,
@@ -5316,6 +5379,7 @@ struct Rgba8MipLevel {
 /// Build the same kind of full mip chain requested by the original
 /// D3DUSAGE_AUTOGENMIPMAP textures.  Values are averaged in the stored 8-bit
 /// color space rather than converted through sRGB, matching the D3D9 setup.
+#[cfg(test)]
 fn build_rgba8_mip_chain(width: u32, height: u32, rgba: &[u8]) -> Vec<Rgba8MipLevel> {
     if width == 0 || height == 0 || rgba.len() < width as usize * height as usize * 4 {
         return Vec::new();
@@ -5369,12 +5433,18 @@ fn build_rgba8_mip_chain(width: u32, height: u32, rgba: &[u8]) -> Vec<Rgba8MipLe
 fn create_gpu_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    mipmap_generator: &mipmap::MipmapGenerator,
     label: &str,
     img: &crate::assets::RgbaImage,
     version: u64,
 ) -> Result<GpuTexture> {
-    let mip_chain = build_rgba8_mip_chain(img.width, img.height, &img.rgba);
-    let mip_level_count = mip_chain.len().max(1) as u32;
+    anyhow::ensure!(img.width > 0 && img.height > 0, "empty texture dimensions");
+    let pixel_bytes = (img.width as usize)
+        .checked_mul(img.height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .context("texture size overflow")?;
+    anyhow::ensure!(img.rgba.len() >= pixel_bytes, "truncated texture pixels");
+    let mip_level_count = u32::BITS - img.width.max(img.height).leading_zeros();
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -5388,30 +5458,14 @@ fn create_gpu_texture(
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
 
-    for (mip_level, mip) in mip_chain.iter().enumerate() {
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &tex,
-                mip_level: mip_level as u32,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &mip.rgba,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * mip.width),
-                rows_per_image: Some(mip.height),
-            },
-            wgpu::Extent3d {
-                width: mip.width,
-                height: mip.height,
-                depth_or_array_layers: 1,
-            },
-        );
+    upload_texture_pixels(queue, &tex, img);
+    if let Some(mipmaps) = mipmap_generator.generate(device, &tex) {
+        queue.submit(Some(mipmaps));
     }
 
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -5434,6 +5488,32 @@ fn create_gpu_texture(
         height: img.height,
         version,
     })
+}
+
+fn upload_texture_pixels(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    img: &crate::assets::RgbaImage,
+) {
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &img.rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * img.width),
+            rows_per_image: Some(img.height),
+        },
+        wgpu::Extent3d {
+            width: img.width,
+            height: img.height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 fn create_render_target_texture(
@@ -5702,6 +5782,58 @@ fn create_depth_texture_with_format(
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     DepthTexture { _tex: tex, view }
+}
+
+fn tona_src_clip_local_rect(
+    sprite: &crate::layer::Sprite,
+    logical_w: f32,
+    logical_h: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let logical_w = logical_w.max(1.0);
+    let logical_h = logical_h.max(1.0);
+
+    // C_d3d_sprite::set_d2_vertex_param(): when the sprite size follows
+    // texture 0, the texture center is added to rp.center before clipping.
+    // Our object_anchor transform subtracts exactly the same combined center.
+    let center_x = sprite.pivot_x
+        + if sprite.object_anchor {
+            sprite.texture_center_x
+        } else {
+            0.0
+        };
+    let center_y = sprite.pivot_y
+        + if sprite.object_anchor {
+            sprite.texture_center_y
+        } else {
+            0.0
+        };
+
+    let mut local_left = -center_x;
+    let mut local_top = -center_y;
+    let mut local_right = logical_w - center_x;
+    let mut local_bottom = logical_h - center_y;
+
+    if let Some(clip) = sprite.src_clip {
+        local_left = local_left.max(clip.left as f32);
+        local_top = local_top.max(clip.top as f32);
+        local_right = local_right.min(clip.right as f32);
+        local_bottom = local_bottom.min(clip.bottom as f32);
+    }
+
+    if local_right <= local_left || local_bottom <= local_top {
+        return None;
+    }
+
+    // Translate the center-relative local coordinates back to the 0-based
+    // sprite rectangle. These values are both the pre-transform vertex
+    // coordinates used by our renderer and the numerator of Tona3's UV
+    // calculation: (src_clip + center) / size.
+    Some((
+        local_left + center_x,
+        local_top + center_y,
+        local_right + center_x,
+        local_bottom + center_y,
+    ))
 }
 
 fn src_clip_rect(clip: Option<ClipRect>, img_w: u32, img_h: u32) -> Result<(f32, f32, f32, f32)> {
@@ -6379,7 +6511,10 @@ fn wipe_shimi_source(color_in: vec4<f32>, fade: f32, progress: f32, reverse: boo
     let brightness = dot(vec3<f32>(0.299, 0.587, 0.114), color.rgb);
     let hide = select(brightness > progress, brightness < 1.0 - progress, reverse);
     if (hide) {
-        color.a = color.a * max(fade * (1.0 - progress), 0.0);
+        // shader.cfx ps_tex1_shimi / ps_tex1_shimi_inv:
+        //   color.a = tex.a * (c0.x - lerp(c0.x, 0.0, c0.w))
+        // which simplifies to tex.a * fade * progress.
+        color.a = color.a * max(fade * progress, 0.0);
     }
     return color;
 }
@@ -6922,9 +7057,10 @@ fn vs_common_2d(v: VsIn2d) -> VsOut2d {
 @group(0) @binding(16) var tex6: texture_2d<f32>;
 @group(0) @binding(17) var smp6: sampler;
 fn sample_mask(uv: vec2<f32>) -> vec4<f32> {
-  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
-    return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  }
+  // `my_sampler_mask` in the original tona3 effect uses CLAMP addressing.
+  // The bound wgpu sampler is ClampToEdge as well, so coordinates outside the
+  // normalized range must sample the nearest edge texel instead of becoming
+  // transparent black.
   return textureSampleLevel(tex1, smp1, uv, 0.0);
 }
 

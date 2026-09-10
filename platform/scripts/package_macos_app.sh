@@ -6,13 +6,33 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MACOS_DIR="${ROOT_DIR}/platform/macos/SiglusLauncher"
 VENDOR_DIR="${MACOS_DIR}/Vendor"
 DIST_DIR="${ROOT_DIR}/dist/macos"
-DERIVED_DIR="${DIST_DIR}/DerivedData"
 
 SIGLUS_CARGO_PKG="${SIGLUS_CARGO_PKG:-siglus_scene_vm}"
 RUST_LIB_NAME="${RUST_LIB_NAME:-siglus_scene_vm}"
 SIGLUS_DYLIB_NAME="${SIGLUS_DYLIB_NAME:-siglus}"
 SCHEME="${SCHEME:-SiglusLauncher}"
 CONFIG="${CONFIG:-Release}"
+RUST_TARGET="${RUST_TARGET:-}"
+OUT_APP_NAME="${OUT_APP_NAME:-Siglus.app}"
+
+case "${RUST_TARGET}" in
+  "")
+    XCODE_ARCH_DEFAULT="$(uname -m)"
+    ;;
+  "aarch64-apple-darwin")
+    XCODE_ARCH_DEFAULT="arm64"
+    ;;
+  "x86_64-apple-darwin")
+    XCODE_ARCH_DEFAULT="x86_64"
+    ;;
+  *)
+    echo "ERROR: Unsupported RUST_TARGET=${RUST_TARGET}"
+    exit 1
+    ;;
+esac
+
+XCODE_ARCH="${XCODE_ARCH:-${XCODE_ARCH_DEFAULT}}"
+DERIVED_DIR="${DIST_DIR}/DerivedData-${XCODE_ARCH}"
 
 mkdir -p "${VENDOR_DIR}" "${DIST_DIR}"
 
@@ -22,10 +42,18 @@ command -v xcodegen >/dev/null 2>&1 || { echo "ERROR: xcodegen not found. Instal
 
 echo "[macos] Building libsiglus.dylib ..."
 pushd "${ROOT_DIR}" >/dev/null
-cargo build --release -p "${SIGLUS_CARGO_PKG}"
+CARGO_ARGS=(build --release -p "${SIGLUS_CARGO_PKG}")
+if [[ -n "${RUST_TARGET}" ]]; then
+  CARGO_ARGS+=(--target "${RUST_TARGET}")
+fi
+cargo "${CARGO_ARGS[@]}"
 popd >/dev/null
 
-DYLIB_PATH="${ROOT_DIR}/target/release/lib${RUST_LIB_NAME}.dylib"
+if [[ -n "${RUST_TARGET}" ]]; then
+  DYLIB_PATH="${ROOT_DIR}/target/${RUST_TARGET}/release/lib${RUST_LIB_NAME}.dylib"
+else
+  DYLIB_PATH="${ROOT_DIR}/target/release/lib${RUST_LIB_NAME}.dylib"
+fi
 if [[ ! -f "${DYLIB_PATH}" ]]; then
   echo "ERROR: Missing ${DYLIB_PATH}"
   echo "Hint: ensure macOS build produces a cdylib named libsiglus.dylib."
@@ -49,7 +77,14 @@ rm -rf "${DERIVED_DIR}"
 mkdir -p "${DERIVED_DIR}"
 
 echo "[macos] Building .app ..."
-xcodebuild   -project "${XCODEPROJ}"   -scheme "${SCHEME}"   -configuration "${CONFIG}"   -derivedDataPath "${DERIVED_DIR}"   build
+xcodebuild \
+  -project "${XCODEPROJ}" \
+  -scheme "${SCHEME}" \
+  -configuration "${CONFIG}" \
+  -derivedDataPath "${DERIVED_DIR}" \
+  -arch "${XCODE_ARCH}" \
+  ONLY_ACTIVE_ARCH=NO \
+  build
 
 APP_PATH="${DERIVED_DIR}/Build/Products/${CONFIG}/Siglus.app"
 if [[ ! -d "${APP_PATH}" ]]; then
@@ -66,7 +101,7 @@ cp -f "${VENDOR_DIR}/lib${SIGLUS_DYLIB_NAME}.dylib" "${FW_DIR}/lib${SIGLUS_DYLIB
 codesign --force --sign - --timestamp=none "${FW_DIR}/lib${SIGLUS_DYLIB_NAME}.dylib" || true
 codesign --force --sign - --timestamp=none --deep "${APP_PATH}" || true
 
-OUT_APP="${DIST_DIR}/Siglus.app"
+OUT_APP="${DIST_DIR}/${OUT_APP_NAME}"
 rm -rf "${OUT_APP}"
 cp -R "${APP_PATH}" "${OUT_APP}"
 

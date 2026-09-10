@@ -8,7 +8,6 @@ This project is non-commercial and intended for research purposes.
 
 <br clear="left"/>
 
-
 ## Example screenshots
 * siglus_rs on macOS
 ![On Mac](./images/screenshot.png)
@@ -26,7 +25,7 @@ This project is non-commercial and intended for research purposes.
 | Linux | x86_64, aarch64 |
 | FreeBSD | x86_64 |
 | Windows | x86_64, ARM64 |
-| macOS | DMG app bundle |
+| macOS | aarch64 app, x86_64 app, universal DMG app bundle |
 | iOS | arm64 device, arm64 simulator, x86_64 simulator |
 | Android | arm64-v8a, x86_64 |
 | WebAssembly | wasm32-unknown-unknown |
@@ -42,6 +41,11 @@ This project is non-commercial and intended for research purposes.
 ```bash
 cargo run --release -p siglus_scene_vm --bin siglus_engine -- --project-dir ~/Documents/siglus_rs-main/testcase
 ```
+
+## Community
+If you want to join the development and discussion of this project, you can join the following Discord server:
+* Discord: [https://discord.gg/g4rXucPZz3](https://discord.gg/g4rXucPZz3)
+* Personally, I only able to speak English, Chinese, Japanese, and very limited French. 
 
 ## Resource decryption key
 

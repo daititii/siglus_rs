@@ -193,6 +193,7 @@ pub struct MwndWindowRuntime {
     pub name_window_align: i64,
     pub name_window_pos: (i64, i64),
     pub name_window_size: (i64, i64),
+    pub name_window_rect: (i64, i64, i64, i64),
     pub name_message_pos: (i64, i64),
     pub name_message_pos_rep: (i64, i64),
     pub name_message_margin: (i64, i64, i64, i64),
@@ -484,6 +485,7 @@ pub struct MwndProjectionState {
     pub name_window_align: i64,
     pub name_window_pos: (i64, i64),
     pub name_window_size: (i64, i64),
+    pub name_window_rect: (i64, i64, i64, i64),
     pub name_message_pos: (i64, i64),
     pub name_message_pos_rep: (i64, i64),
     pub name_message_margin: (i64, i64, i64, i64),
@@ -884,29 +886,46 @@ impl UiRuntime {
     }
 
     fn name_layout(&self, w: u32, h: u32) -> ((i32, i32, u32, u32), (i32, i32)) {
-        let rect = self.window_rect(w, h);
-        let (mut x, y) = (
-            rect.x + self.mwnd.window.name_window_pos.0 as i32,
-            rect.y + self.mwnd.window.name_window_pos.1 as i32,
-        );
-        let width = self.mwnd.window.name_window_size.0.max(1) as u32;
-        let height = self.mwnd.window.name_window_size.1.max(1) as u32;
-        match self.mwnd.window.name_window_align {
-            1 => x -= (width / 2) as i32,
-            2 => x -= width as i32,
-            _ => {}
-        }
-        let msg_x = match self.mwnd.window.name_window_align {
-            1 => rect.x + self.mwnd.window.name_window_pos.0 as i32,
-            2 => rect.x + self.mwnd.window.name_window_pos.0 as i32
-                - self.mwnd.window.name_message_pos.0 as i32,
-            _ => rect.x + self.mwnd.window.name_window_pos.0 as i32
-                + self.mwnd.window.name_message_pos.0 as i32,
-        } + self.mwnd.window.name_message_pos_rep.0 as i32;
-        let msg_y = rect.y + self.mwnd.window.name_window_pos.1 as i32
-            + self.mwnd.window.name_message_pos.1 as i32
-            + self.mwnd.window.name_message_pos_rep.1 as i32;
-        ((x, y, width, height), (msg_x, msg_y))
+        // C_elm_mwnd::restruct_name_waku() stores the name-frame rectangle in
+        // name_window_rect.  Do not derive it again from NAME_WINDOW_SIZE: in
+        // NAME_EXTEND_TYPE=1 it is rebuilt from the current name's message
+        // rectangle and the *main* message margin.
+        let window = self.window_rect(w, h);
+        let (left, top, right, bottom) = self.mwnd.window.name_window_rect;
+        let width = right.saturating_sub(left).max(1) as u32;
+        let height = bottom.saturating_sub(top).max(1) as u32;
+        let base_x = window.x + self.mwnd.window.name_window_pos.0 as i32;
+        let base_y = window.y + self.mwnd.window.name_window_pos.1 as i32;
+        let frame_x = base_x.saturating_add(left as i32);
+        let frame_y = base_y.saturating_add(top as i32);
+
+        let (msg_x, msg_y) = if self.mwnd.window.name_extend_type == 1 {
+            let (margin_left, margin_top, margin_right, _) =
+                self.mwnd.window.name_message_margin;
+            let x = match self.mwnd.window.name_window_align {
+                1 => base_x,
+                2 => base_x.saturating_sub(margin_right as i32),
+                _ => base_x.saturating_add(margin_left as i32),
+            }
+            .saturating_add(self.mwnd.window.name_message_pos_rep.0 as i32);
+            let y = base_y
+                .saturating_add(margin_top as i32)
+                .saturating_add(self.mwnd.window.name_message_pos_rep.1 as i32);
+            (x, y)
+        } else {
+            let x = match self.mwnd.window.name_window_align {
+                1 => base_x,
+                2 => base_x.saturating_sub(self.mwnd.window.name_message_pos.0 as i32),
+                _ => base_x.saturating_add(self.mwnd.window.name_message_pos.0 as i32),
+            }
+            .saturating_add(self.mwnd.window.name_message_pos_rep.0 as i32);
+            let y = base_y
+                .saturating_add(self.mwnd.window.name_message_pos.1 as i32)
+                .saturating_add(self.mwnd.window.name_message_pos_rep.1 as i32);
+            (x, y)
+        };
+
+        ((frame_x, frame_y, width, height), (msg_x, msg_y))
     }
 
     fn face_rect(&self, w: u32, h: u32) -> UiRect {
@@ -2420,6 +2439,7 @@ impl UiRuntime {
             proj.name_window_align,
             proj.name_window_pos,
             proj.name_window_size,
+            proj.name_window_rect,
             proj.name_message_pos,
             proj.name_message_pos_rep,
             proj.name_message_margin,
@@ -2473,6 +2493,7 @@ impl UiRuntime {
         name_window_align: i64,
         name_window_pos: (i64, i64),
         name_window_size: (i64, i64),
+        name_window_rect: (i64, i64, i64, i64),
         name_message_pos: (i64, i64),
         name_message_pos_rep: (i64, i64),
         name_message_margin: (i64, i64, i64, i64),
@@ -2493,6 +2514,7 @@ impl UiRuntime {
         self.mwnd.window.name_window_align = name_window_align;
         self.mwnd.window.name_window_pos = name_window_pos;
         self.mwnd.window.name_window_size = name_window_size;
+        self.mwnd.window.name_window_rect = name_window_rect;
         self.mwnd.window.name_message_pos = name_message_pos;
         self.mwnd.window.name_message_pos_rep = name_message_pos_rep;
         self.mwnd.window.name_message_margin = name_message_margin;

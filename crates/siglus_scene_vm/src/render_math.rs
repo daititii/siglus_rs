@@ -196,20 +196,22 @@ fn signed_area(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
     (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
 }
 
-pub fn sprite_quad_points(
+pub fn sprite_quad_points_rect(
     sprite: &Sprite,
     dst_x: f32,
     dst_y: f32,
-    dst_w: f32,
-    dst_h: f32,
+    local_left: f32,
+    local_top: f32,
+    local_right: f32,
+    local_bottom: f32,
     win_w: f32,
     win_h: f32,
 ) -> Option<[ProjectedPoint; 4]> {
     if !uses_3d(sprite) {
-        let p0 = transform_local_point(sprite, 0.0, 0.0, dst_x, dst_y);
-        let p1 = transform_local_point(sprite, dst_w, 0.0, dst_x, dst_y);
-        let p2 = transform_local_point(sprite, dst_w, dst_h, dst_x, dst_y);
-        let p3 = transform_local_point(sprite, 0.0, dst_h, dst_x, dst_y);
+        let p0 = transform_local_point(sprite, local_left, local_top, dst_x, dst_y);
+        let p1 = transform_local_point(sprite, local_right, local_top, dst_x, dst_y);
+        let p2 = transform_local_point(sprite, local_right, local_bottom, dst_x, dst_y);
+        let p3 = transform_local_point(sprite, local_left, local_bottom, dst_x, dst_y);
         return Some([
             ProjectedPoint {
                 x: p0.x,
@@ -240,16 +242,50 @@ pub fn sprite_quad_points(
         transform_local_point as fn(&Sprite, f32, f32, f32, f32) -> Vec3
     };
 
-    let p0 = project_point(sprite, xf(sprite, 0.0, 0.0, dst_x, dst_y), win_w, win_h)?;
-    let p1 = project_point(sprite, xf(sprite, dst_w, 0.0, dst_x, dst_y), win_w, win_h)?;
-    let p2 = project_point(sprite, xf(sprite, dst_w, dst_h, dst_x, dst_y), win_w, win_h)?;
-    let p3 = project_point(sprite, xf(sprite, 0.0, dst_h, dst_x, dst_y), win_w, win_h)?;
+    let p0 = project_point(
+        sprite,
+        xf(sprite, local_left, local_top, dst_x, dst_y),
+        win_w,
+        win_h,
+    )?;
+    let p1 = project_point(
+        sprite,
+        xf(sprite, local_right, local_top, dst_x, dst_y),
+        win_w,
+        win_h,
+    )?;
+    let p2 = project_point(
+        sprite,
+        xf(sprite, local_right, local_bottom, dst_x, dst_y),
+        win_w,
+        win_h,
+    )?;
+    let p3 = project_point(
+        sprite,
+        xf(sprite, local_left, local_bottom, dst_x, dst_y),
+        win_w,
+        win_h,
+    )?;
 
     if sprite.culling && signed_area((p0.x, p0.y), (p1.x, p1.y), (p2.x, p2.y)) <= 0.0 {
         return None;
     }
 
     Some([p0, p1, p2, p3])
+}
+
+pub fn sprite_quad_points(
+    sprite: &Sprite,
+    dst_x: f32,
+    dst_y: f32,
+    dst_w: f32,
+    dst_h: f32,
+    win_w: f32,
+    win_h: f32,
+) -> Option<[ProjectedPoint; 4]> {
+    sprite_quad_points_rect(
+        sprite, dst_x, dst_y, 0.0, 0.0, dst_w, dst_h, win_w, win_h,
+    )
 }
 
 pub fn project_model_point(

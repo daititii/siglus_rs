@@ -135,6 +135,15 @@ impl GameexeEntry {
     }
 }
 
+// Gameexe is parsed once by the original C_tnm_ini and later subsystems index
+// the resulting arrays directly. Keep Rust lookup semantics identical while
+// avoiding repeated normalization of the same prefix for every candidate row.
+fn indexed_key_matches(key: &[String], prefix: &[String], index: usize) -> bool {
+    key.len() > prefix.len()
+        && key[..prefix.len()] == *prefix
+        && key[prefix.len()].parse::<usize>().ok() == Some(index)
+}
+
 fn unquote_token(s: &str) -> &str {
     let t = s.trim();
     if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
@@ -223,20 +232,22 @@ impl GameexeConfig {
         // non-padded decimal string, otherwise table-backed subsystems silently
         // miss registered rows. Keep reverse iteration to preserve get_entry
         // "last definition wins" behavior.
+        let parts = normalized_key_parts(prefix);
         self.entries
             .iter()
             .rev()
-            .find(|e| e.key_index(prefix) == Some(index))
+            .find(|e| indexed_key_matches(&e.key_parts, &parts, index))
     }
 
     pub fn get_indexed_field(&self, prefix: &str, index: usize, field: &str) -> Option<&str> {
+        let parts = normalized_key_parts(prefix);
         let nf = normalize_key(field);
         self.entries
             .iter()
             .rev()
             .find(|e| {
-                e.key_index(prefix) == Some(index)
-                    && e.key_field_after_index(prefix) == Some(nf.as_str())
+                indexed_key_matches(&e.key_parts, &parts, index)
+                    && e.key_parts.get(parts.len() + 1) == Some(&nf)
             })
             .map(|e| e.value.as_str())
     }
@@ -247,13 +258,14 @@ impl GameexeConfig {
         index: usize,
         field: &str,
     ) -> Option<&str> {
+        let parts = normalized_key_parts(prefix);
         let nf = normalize_key(field);
         self.entries
             .iter()
             .rev()
             .find(|e| {
-                e.key_index(prefix) == Some(index)
-                    && e.key_field_after_index(prefix) == Some(nf.as_str())
+                indexed_key_matches(&e.key_parts, &parts, index)
+                    && e.key_parts.get(parts.len() + 1) == Some(&nf)
             })
             .map(|e| e.scalar_unquoted())
     }
@@ -454,6 +466,44 @@ mod tests {
         let cfg = GameexeConfig::from_text("#COLOR_TABLE.000 = 255, 255, 255\n");
         assert_eq!(cfg.get_indexed_value("COLOR_TABLE", 0), Some("255, 255, 255"));
         assert_eq!(cfg.get_indexed_unquoted("COLOR_TABLE", 0), Some("255"));
+    }
+
+    #[test]
+    fn indexed_fast_path_matches_legacy_lookup_and_last_definition_wins() {
+        let cfg = GameexeConfig::from_text(
+            "#OBJECT.000.USE = 0\n#OBJECT.0.USE = 1\n#OBJECT.001.USE = \"0\"\n\
+             #OBJECT.OTHER.USE = 9\n#OBJECT.2 = 8\n#OBJECT.002.USE.EXTRA = 7\n\
+             #BUTTON.ACTION.003.FILE = \"button\", 4\n#OBJECT.EXTRA.0.USE = 6\n",
+        );
+        for prefix in ["OBJECT", "# object ", "BUTTON . ACTION", "MISSING"] {
+            for index in 0..5 {
+                let old_entry = cfg
+                    .entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.key_index(prefix) == Some(index));
+                assert_eq!(
+                    cfg.get_indexed_entry(prefix, index).map(|e| e.line_no),
+                    old_entry.map(|e| e.line_no)
+                );
+                for field in ["USE", " FILE ", "USE.EXTRA"] {
+                    let normalized = normalize_key(field);
+                    let old = cfg.entries.iter().rev().find(|e| {
+                        e.key_index(prefix) == Some(index)
+                            && e.key_field_after_index(prefix) == Some(normalized.as_str())
+                    });
+                    assert_eq!(
+                        cfg.get_indexed_field(prefix, index, field),
+                        old.map(|e| e.value.as_str())
+                    );
+                    assert_eq!(
+                        cfg.get_indexed_field_unquoted(prefix, index, field),
+                        old.map(|e| e.scalar_unquoted())
+                    );
+                }
+            }
+        }
+        assert_eq!(cfg.get_indexed_field("OBJECT", 0, "USE"), Some("1"));
     }
 }
 

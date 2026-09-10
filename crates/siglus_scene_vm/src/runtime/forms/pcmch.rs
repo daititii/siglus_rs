@@ -613,22 +613,20 @@ fn dispatch_inner(
             Ok(true)
         }
         codes::pcmch_op::WAIT_KEY => {
-            ctx.wait
-                .wait_audio(crate::runtime::wait::AudioWait::PcmSlot(ch as u8), true);
-            if ret_form.unwrap_or(0) != 0 {
-                ctx.push(Value::Int(0));
-            }
+            ctx.wait.wait_audio_with_return(
+                crate::runtime::wait::AudioWait::PcmSlot(ch as u8),
+                true,
+                ret_form.unwrap_or(0) != 0,
+            );
             Ok(true)
         }
         codes::pcmch_op::WAIT_FADE | codes::pcmch_op::WAIT_FADE_KEY => {
             let key = op == codes::pcmch_op::WAIT_FADE_KEY;
-            ctx.wait.wait_audio(
+            ctx.wait.wait_audio_with_return(
                 crate::runtime::wait::AudioWait::PcmSlotFade(ch as u8),
                 key,
+                ret_form.unwrap_or(0) != 0,
             );
-            if ret_form.unwrap_or(0) != 0 {
-                ctx.push(Value::Int(0));
-            }
             Ok(true)
         }
         codes::pcmch_op::CHECK => {

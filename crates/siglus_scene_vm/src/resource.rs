@@ -625,16 +625,110 @@ pub fn load_gameexe_decode_options(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectIniAppendEntry {
+    pub dir: String,
+    pub name: String,
+}
+
+/// Return the append selected by the original startup path.
+///
+/// `tnm_init_dir()` initializes `Gp_dir->append_dir/append_name` from the first
+/// `Select.ini` entry unless a command-line override is present.  The Rust host
+/// currently has no `select_scene_pck` CLI equivalent, so startup always uses
+/// this first entry.  Missing `Select.ini` is equivalent to an empty append.
+pub(crate) fn initial_select_ini_append(project_dir: &Path) -> SelectIniAppendEntry {
+    parse_select_ini_append_entries(project_dir)
+        .into_iter()
+        .next()
+        .unwrap_or(SelectIniAppendEntry {
+            dir: String::new(),
+            name: String::new(),
+        })
+}
+
+/// Resolve the one active Scene.pck used by the original lexer.
+///
+/// The C++ path is `Gp_dir->exe_dir + "\\" + Gp_dir->append_dir +
+/// "\\Scene.pck"`; it does not scan later append entries when a scene name is
+/// missing.  Keeping the active append explicit is important because save/load
+/// and return-to-menu can legitimately switch Scene.pck.
+pub fn find_scene_pck_path_for_append(project_dir: &Path, append_dir: &str) -> Result<PathBuf> {
+    let mut base = project_dir.to_path_buf();
+    if !append_dir.is_empty() {
+        base = base.join(append_dir);
+    }
+    let candidate = base.join("Scene.pck");
+    if let Some(path) = resolve_windows_case_insensitive_file(&candidate)? {
+        return Ok(path);
+    }
+
+    // Historical extracted layouts used by this port sometimes place the root
+    // Scene.pck under Data/. Preserve that compatibility only for the empty
+    // append; an explicit Select.ini append must remain exact like C++.
+    if append_dir.is_empty() {
+        let legacy = project_dir.join("Data").join("Scene.pck");
+        if let Some(path) = resolve_windows_case_insensitive_file(&legacy)? {
+            return Ok(path);
+        }
+    }
+
+    bail!(
+        "Scene.pck not found for append {:?} under {}",
+        append_dir,
+        project_dir.display()
+    )
+}
+
 pub fn find_scene_pck_path(project_dir: &Path) -> Result<PathBuf> {
-    for candidate in [
-        project_dir.join("Scene.pck"),
-        project_dir.join("Data").join("Scene.pck"),
-    ] {
+    let append = initial_select_ini_append(project_dir);
+    find_scene_pck_path_for_append(project_dir, &append.dir)
+}
+
+const GAMEEXE_CANDIDATES: &[&str] = &[
+    "Gameexe.dat",
+    "Gameexe.ini",
+    "gameexe.dat",
+    "gameexe.ini",
+    "GameexeEN.dat",
+    "GameexeEN.ini",
+    "GameexeZH.dat",
+    "GameexeZH.ini",
+    "GameexeZHTW.dat",
+    "GameexeZHTW.ini",
+    "GameexeDE.dat",
+    "GameexeDE.ini",
+    "GameexeES.dat",
+    "GameexeES.ini",
+    "GameexeFR.dat",
+    "GameexeFR.ini",
+    "GameexeID.dat",
+    "GameexeID.ini",
+];
+
+/// Resolve the Gameexe file used by the original startup path.
+///
+/// `C_tnm_ini::analize_func()` opens
+/// `module_dir + Select.ini.first_dir() + LCL_GAMEEXE_DAT`; Gameexe is therefore
+/// selected from the same initial append as Scene.pck, not independently from
+/// the project root. Localized candidate names are retained for this port.
+pub fn find_initial_gameexe_path(project_dir: &Path) -> Result<PathBuf> {
+    let append = initial_select_ini_append(project_dir);
+    let mut base = project_dir.to_path_buf();
+    if !append.dir.is_empty() {
+        base = base.join(&append.dir);
+    }
+    for name in GAMEEXE_CANDIDATES {
+        let candidate = base.join(name);
         if let Some(path) = resolve_windows_case_insensitive_file(&candidate)? {
             return Ok(path);
         }
     }
-    bail!("Scene.pck not found under {}", project_dir.display())
+    bail!(
+        "Gameexe.dat not found for initial append {:?} under {}",
+        append.dir,
+        project_dir.display()
+    )
 }
 
 fn format_tried_paths(paths: &[PathBuf]) -> String {
@@ -1089,17 +1183,30 @@ pub(crate) fn find_emote_psb_candidates(project_dir: &Path) -> Result<Vec<PathBu
     Ok(candidates.into_iter().map(|(_, path)| path).collect())
 }
 
-fn parse_select_ini_append_dirs(project_dir: &Path) -> Vec<String> {
-    let mut candidates = vec![project_dir.join("Select.ini")];
-    candidates.push(project_dir.join("select.ini"));
-
+fn parse_select_ini_append_entries(project_dir: &Path) -> Vec<SelectIniAppendEntry> {
+    let candidates = [project_dir.join("Select.ini"), project_dir.join("select.ini")];
     let path = match first_existing_file_windows_ci(candidates) {
         Ok(Some(path)) => path,
-        Ok(None) | Err(_) => return vec![String::new()],
+        Ok(None) | Err(_) => {
+            return vec![SelectIniAppendEntry {
+                dir: String::new(),
+                name: String::new(),
+            }];
+        }
     };
 
-    let Ok(text) = read_file_to_string(&path) else {
-        return vec![String::new()];
+    let Ok(bytes) = read_file_bytes(&path) else {
+        return vec![SelectIniAppendEntry {
+            dir: String::new(),
+            name: String::new(),
+        }];
+    };
+    let text = match String::from_utf8(bytes.clone()) {
+        Ok(text) => text,
+        Err(_) => {
+            let (text, _, _) = encoding_rs::SHIFT_JIS.decode(&bytes);
+            text.into_owned()
+        }
     };
 
     let mut out = Vec::new();
@@ -1110,17 +1217,30 @@ fn parse_select_ini_append_dirs(project_dir: &Path) -> Vec<String> {
         }
         let mut cols = line.split('\t');
         let dir = cols.next().unwrap_or("");
-        let _name = cols.next();
+        let name = cols.next().unwrap_or("");
         if cols.next().is_some() {
             continue;
         }
-        out.push(dir.to_string());
+        out.push(SelectIniAppendEntry {
+            dir: dir.to_string(),
+            name: name.to_string(),
+        });
     }
 
     if out.is_empty() {
-        out.push(String::new());
+        out.push(SelectIniAppendEntry {
+            dir: String::new(),
+            name: String::new(),
+        });
     }
     out
+}
+
+fn parse_select_ini_append_dirs(project_dir: &Path) -> Vec<String> {
+    parse_select_ini_append_entries(project_dir)
+        .into_iter()
+        .map(|entry| entry.dir)
+        .collect()
 }
 
 fn base_in_append(project_dir: &Path, append_dir: &str, subdir: &str) -> PathBuf {

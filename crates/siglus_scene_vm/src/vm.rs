@@ -3,6 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use crate::elm_code;
 use crate::runtime::forms::codes;
@@ -225,6 +226,7 @@ struct InlineExecCheckpoint {
 
 #[derive(Debug, Clone)]
 struct CallProp {
+    scn_no: i32,
     prop_id: i32,
     form: i32,
     decl_size: usize,
@@ -243,6 +245,8 @@ enum CallPropValue {
 
 #[derive(Debug, Clone)]
 struct CallFrame {
+    /// Original E_tnm_call_type on the callee frame: 0 NONE, 1 GOSUB, 2 FARCALL, 3 USER_CMD.
+    call_type: i32,
     return_pc: usize,
     // C_elm_call::m_call_save identifies the lexer state owned by this frame.
     // It is also the only scene-boundary metadata available in the original
@@ -292,8 +296,8 @@ struct SceneExecFrame<'a> {
     // Only lexer state and scene-local property selection change.  Keep the
     // caller stream by move (not clone) and leave all VM stacks resident.
     stream: SceneStream<'a>,
-    user_cmd_names: std::collections::HashMap<u32, String>,
-    call_cmd_names: std::collections::HashMap<u32, String>,
+    user_cmd_names: Arc<std::collections::HashMap<u32, String>>,
+    call_cmd_names: Arc<std::collections::HashMap<u32, String>>,
     current_scene_no: Option<usize>,
     current_scene_name: Option<String>,
     current_line_no: i32,
@@ -440,8 +444,8 @@ fn resize_string_vec(mut v: Vec<String>, n: usize) -> Vec<String> {
 #[derive(Clone)]
 struct VmResumePoint<'a> {
     stream: SceneStream<'a>,
-    user_cmd_names: std::collections::HashMap<u32, String>,
-    call_cmd_names: std::collections::HashMap<u32, String>,
+    user_cmd_names: Arc<std::collections::HashMap<u32, String>>,
+    call_cmd_names: Arc<std::collections::HashMap<u32, String>>,
     int_stack: Vec<i32>,
     str_stack: Vec<String>,
     element_points: Vec<usize>,
@@ -495,7 +499,6 @@ pub struct SceneVm<'a> {
     // Warn-once dedup for form command chains the runtime cannot dispatch yet.
     // A hard failure here would freeze the host tick loop with no visible
     // symptom, so unhandled chains are counted and skipped instead.
-    unhandled_form_chains: std::collections::HashSet<Vec<i32>>,
 
     steps: u64,
     halted: bool,
@@ -505,12 +508,13 @@ pub struct SceneVm<'a> {
     script_input_synced_this_frame: bool,
     yield_safe_after_step: bool,
 
-    user_cmd_names: std::collections::HashMap<u32, String>,
-    call_cmd_names: std::collections::HashMap<u32, String>,
+    user_cmd_names: Arc<std::collections::HashMap<u32, String>>,
+    call_cmd_names: Arc<std::collections::HashMap<u32, String>>,
 
     // C++ keeps the lexer / scene package resident. Do not reload and rebuild
     // Scene.pck for frame-action callbacks or scene-local user command calls.
     scene_pck_cache: Option<ScenePck>,
+    scene_pck_append_dir: Option<String>,
     scene_stream_cache: BTreeMap<usize, SceneStream<'a>>,
     scene_name_resolve_cache: std::collections::HashMap<String, Option<usize>>,
     user_cmd_resolve_cache: std::collections::HashMap<usize, std::collections::HashMap<String, ResolvedUserCommand>>,
@@ -579,10 +583,11 @@ impl<'a> SceneVm<'a> {
             )
         });
         CallFrame {
+            call_type: 0,
             return_pc: 0,
-            return_scene_no: self.current_scene_no,
-            return_scene_name: self.current_scene_name.clone(),
-            return_line_no: self.current_line_no,
+            return_scene_no: None,
+            return_scene_name: None,
+            return_line_no: -1,
             ret_form,
             return_override: None,
             excall_proc,
@@ -613,7 +618,11 @@ impl<'a> SceneVm<'a> {
             );
         };
 
+        frame.call_type = 0;
         frame.return_pc = 0;
+        frame.return_scene_no = None;
+        frame.return_scene_name = None;
+        frame.return_line_no = -1;
         frame.ret_form = ret_form;
         frame.return_override = None;
         frame.excall_proc = excall_proc;
@@ -767,6 +776,7 @@ impl<'a> SceneVm<'a> {
         let call_flag_count = Self::configured_call_flag_count(&ctx);
         let user_cmd_names = stream.scn_cmd_name_map.clone();
         let base_call = CallFrame {
+            call_type: 0,
             return_pc: 0,
             return_scene_no: None,
             return_scene_name: None,
@@ -806,7 +816,6 @@ impl<'a> SceneVm<'a> {
             legacy_saved_active_only: false,
             unknown_opcodes: BTreeMap::new(),
             unknown_forms: BTreeMap::new(),
-            unhandled_form_chains: std::collections::HashSet::new(),
 
             steps: 0,
             halted: false,
@@ -814,8 +823,9 @@ impl<'a> SceneVm<'a> {
             script_input_synced_this_frame: false,
             yield_safe_after_step: false,
             user_cmd_names,
-            call_cmd_names: std::collections::HashMap::new(),
+            call_cmd_names: Arc::default(),
             scene_pck_cache: None,
+            scene_pck_append_dir: None,
             scene_stream_cache: BTreeMap::new(),
             scene_name_resolve_cache: std::collections::HashMap::new(),
             user_cmd_resolve_cache: std::collections::HashMap::new(),
@@ -828,6 +838,7 @@ impl<'a> SceneVm<'a> {
         let call_flag_count = Self::configured_call_flag_count(&ctx);
         let user_cmd_names = stream.scn_cmd_name_map.clone();
         let base_call = CallFrame {
+            call_type: 0,
             return_pc: 0,
             return_scene_no: None,
             return_scene_name: None,
@@ -867,7 +878,6 @@ impl<'a> SceneVm<'a> {
             legacy_saved_active_only: false,
             unknown_opcodes: BTreeMap::new(),
             unknown_forms: BTreeMap::new(),
-            unhandled_form_chains: std::collections::HashSet::new(),
 
             steps: 0,
             halted: false,
@@ -875,8 +885,9 @@ impl<'a> SceneVm<'a> {
             script_input_synced_this_frame: false,
             yield_safe_after_step: false,
             user_cmd_names,
-            call_cmd_names: std::collections::HashMap::new(),
+            call_cmd_names: Arc::default(),
             scene_pck_cache: None,
+            scene_pck_append_dir: None,
             scene_stream_cache: BTreeMap::new(),
             scene_name_resolve_cache: std::collections::HashMap::new(),
             user_cmd_resolve_cache: std::collections::HashMap::new(),
@@ -1575,12 +1586,22 @@ impl<'a> SceneVm<'a> {
         self.halted = false;
         self.ctx.excall_state.ex_call_flag = true;
         self.ctx.excall_state.script_proc_requested = true;
+        // Original tnm_scene_proc_farcall(..., ex_call=true) pushes a
+        // TNM_PROC_TYPE_SCRIPT proc immediately.  Make that process-stack
+        // transition visible to the host at this exact instruction boundary.
+        self.ctx.request_proc_boundary(runtime::ProcKind::Script);
     }
 
     fn mark_excall_script_proc_pop_requested(&mut self) {
         self.ctx.excall_state.ex_call_flag = false;
         self.ctx.excall_state.script_proc_pop_requested = true;
         self.ctx.input.clear_all();
+        // Original tnm_scene_proc_return() pops the EXCALL SCRIPT proc before
+        // resuming the caller.  If Rust keeps executing here, caller script can
+        // create a new wait while the menu EXCALL is still on FlowState; the
+        // later wait restore then overwrites that new wait and leaves repeated
+        // SAVE/LOAD/CONFIG entry out of sync.
+        self.ctx.request_proc_boundary(runtime::ProcKind::Script);
     }
 
     fn push_call_arg_value(&mut self, arg: &Value) {
@@ -1623,18 +1644,22 @@ impl<'a> SceneVm<'a> {
                 );
             }
             caller.return_pc = return_pc;
+            caller.return_scene_no = self.current_scene_no;
+            caller.return_scene_name = self.current_scene_name.clone();
+            caller.return_line_no = self.current_line_no;
             caller.ret_form = ret_form;
         }
         for arg in call_args {
             self.push_call_arg_value(arg);
         }
-        let call_frame = self.take_call_frame(
+        let mut call_frame = self.take_call_frame(
             self.cfg.fm_void,
             false,
             frame_action_proc,
             call_args.len(),
             None,
         );
+        call_frame.call_type = 3;
         self.call_stack.push(call_frame);
         self.stream.set_prg_cntr(offset)?;
 
@@ -1730,38 +1755,65 @@ impl<'a> SceneVm<'a> {
     }
 
     fn ensure_scene_pck_cache(&mut self) -> Result<()> {
-        if self.scene_pck_cache.is_none() {
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            {
-                let scene_pck_path = self.ctx.project_dir.join("Scene.pck");
-                let bytes = crate::resource::read_file_bytes(&scene_pck_path)?;
-                let exe = ["key.toml", "Key.toml"]
-                    .iter()
-                    .find_map(|name| {
-                        let p = self.ctx.project_dir.join(name);
-                        if !crate::resource::wasm_path_is_file(&p) {
-                            return None;
-                        }
-                        let text = crate::resource::read_file_to_string(&p).ok()?;
-                        siglus_assets::key_toml::parse_key_toml(&text)
-                            .ok()
-                            .and_then(|cfg| cfg.exe_key16)
-                            .map(|v| v.to_vec())
-                    });
-                let opt = ScenePckDecodeOptions {
-                    exe_angou_element: exe,
-                    easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
-                };
-                self.scene_pck_cache = Some(ScenePck::load_and_rebuild_from_bytes(bytes, &opt)?);
-            }
-
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            {
-                let scene_pck_path = crate::resource::find_scene_pck_path(&self.ctx.project_dir)?;
-                let opt = ScenePckDecodeOptions::from_project_dir(&self.ctx.project_dir)?;
-                self.scene_pck_cache = Some(ScenePck::load_and_rebuild(&scene_pck_path, &opt)?);
-            }
+        let active_append = self.ctx.globals.append_dir.clone();
+        let append_changed = self
+            .scene_pck_append_dir
+            .as_deref()
+            .map(|cached| !cached.eq_ignore_ascii_case(&active_append))
+            .unwrap_or(true);
+        if self.scene_pck_cache.is_some() && !append_changed {
+            return Ok(());
         }
+
+        // Original `tnm_reload_scene_pck()` replaces the lexer package when the
+        // active append changes.  All scene-number/name caches belong to that
+        // package and must be discarded together.
+        self.scene_pck_cache = None;
+        self.scene_stream_cache.clear();
+        self.scene_name_resolve_cache.clear();
+        self.user_cmd_resolve_cache.clear();
+
+        let scene_pck_path = crate::resource::find_scene_pck_path_for_append(
+            &self.ctx.project_dir,
+            &active_append,
+        )?;
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let bytes = crate::resource::read_file_bytes(&scene_pck_path)?;
+            let exe = ["key.toml", "Key.toml"]
+                .iter()
+                .find_map(|name| {
+                    let p = self.ctx.project_dir.join(name);
+                    if !crate::resource::wasm_path_is_file(&p) {
+                        return None;
+                    }
+                    let text = crate::resource::read_file_to_string(&p).ok()?;
+                    siglus_assets::key_toml::parse_key_toml(&text)
+                        .ok()
+                        .and_then(|cfg| cfg.exe_key16)
+                        .map(|v| v.to_vec())
+                });
+            let opt = ScenePckDecodeOptions {
+                exe_angou_element: exe,
+                easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
+            };
+            self.scene_pck_cache = Some(ScenePck::load_and_rebuild_from_bytes(bytes, &opt)?);
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let opt = ScenePckDecodeOptions::from_project_dir(&self.ctx.project_dir)?;
+            self.scene_pck_cache = Some(ScenePck::load_and_rebuild(&scene_pck_path, &opt)?);
+        }
+
+        self.ctx.install_scene_metadata(
+            &active_append,
+            self.scene_pck_cache
+                .as_ref()
+                .expect("scene pck cache initialized"),
+        )?;
+        self.scene_pck_append_dir = Some(active_append);
         Ok(())
     }
 
@@ -2311,13 +2363,14 @@ impl<'a> SceneVm<'a> {
         for arg in call_args {
             self.push_call_arg_value(arg);
         }
-        let call_frame = self.take_call_frame(
+        let mut call_frame = self.take_call_frame(
             self.cfg.fm_void,
             excall_proc,
             frame_action_proc,
             call_args.len(),
             None,
         );
+        call_frame.call_type = 3;
         self.call_stack.push(call_frame);
         self.stream.set_prg_cntr(offset)?;
         if excall_proc {
@@ -2402,13 +2455,14 @@ impl<'a> SceneVm<'a> {
         for arg in call_args {
             self.push_call_arg_value(arg);
         }
-        let call_frame = self.take_call_frame(
+        let mut call_frame = self.take_call_frame(
             self.cfg.fm_void,
             ex_call_proc,
             frame_action_proc,
             call_args.len(),
             None,
         );
+        call_frame.call_type = 3;
         self.call_stack.push(call_frame);
         self.scene_stack.push(SceneExecFrame {
             stream: saved_stream,
@@ -2631,22 +2685,21 @@ impl<'a> SceneVm<'a> {
             }
         }
         for (child_idx, child) in obj.runtime.child_objects.iter().enumerate() {
-            let child_has_frame_action = !child.frame_action.cmd_name.is_empty()
-                || child.frame_action_ch.iter().any(|ch| !ch.cmd_name.is_empty());
-            let child_has_nested_work = !child.runtime.child_objects.is_empty();
-            if child.used || child_has_frame_action || child_has_nested_work {
-                let mut child_chain = object_chain.clone();
-                child_chain.push(crate::runtime::forms::codes::elm_value::OBJECT_CHILD);
-                child_chain.push(crate::runtime::forms::codes::ELM_ARRAY);
-                child_chain.push(child_idx as i32);
-                Self::collect_object_frame_action_work_recursive(
-                    child,
-                    stage_idx,
-                    child_idx,
-                    child_chain,
-                    out,
-                );
-            }
+            // CHILD object lists are initialized with use_ini=false in C++;
+            // every allocated child slot therefore has use_flag=true even when
+            // its current type is NONE.  Recurse over the list itself instead
+            // of treating ObjectState::used as C_elm_object::is_use().
+            let mut child_chain = object_chain.clone();
+            child_chain.push(crate::runtime::forms::codes::elm_value::OBJECT_CHILD);
+            child_chain.push(crate::runtime::forms::codes::ELM_ARRAY);
+            child_chain.push(child_idx as i32);
+            Self::collect_object_frame_action_work_recursive(
+                child,
+                stage_idx,
+                child_idx,
+                child_chain,
+                out,
+            );
         }
     }
 
@@ -3514,7 +3567,9 @@ impl<'a> SceneVm<'a> {
                     continue;
                 };
                 for (obj_idx, obj) in objs.iter().enumerate() {
-                    if st.is_embedded_object_slot(stage_idx, obj_idx) {
+                    if st.is_embedded_object_slot(stage_idx, obj_idx)
+                        || !st.object_slot_is_used(stage_idx, obj_idx)
+                    {
                         continue;
                     }
                     let object_chain = vec![
@@ -3695,8 +3750,11 @@ impl<'a> SceneVm<'a> {
     }
 
     pub fn restart_scene_name(&mut self, scene_name: &str, z_no: i32) -> Result<()> {
-        let (stream, scene_no) = self.load_scene_stream(scene_name, z_no)?;
+        // C++ restart paths call tnm_finish_local()/tnm_reinit_local() before
+        // resolving and entering the target scene.  Keep the same ordering so
+        // local teardown cannot depend on the new scene having loaded already.
         self.ctx.reset_for_scene_restart();
+        let (stream, scene_no) = self.load_scene_stream(scene_name, z_no)?;
         self.stream = stream;
         self.int_stack.clear();
         self.str_stack.clear();
@@ -4032,6 +4090,7 @@ impl<'a> SceneVm<'a> {
                     .last_mut()
                     .ok_or_else(|| anyhow!("call stack underflow"))?;
                 frame.user_props.push(CallProp {
+                    scn_no: self.current_scene_no.unwrap_or(0) as i32,
                     prop_id,
                     form: form_code,
                     decl_size: size,
@@ -4207,6 +4266,9 @@ impl<'a> SceneVm<'a> {
                     .last_mut()
                     .ok_or_else(|| anyhow!("call stack underflow"))?;
                 caller.return_pc = return_pc;
+                caller.return_scene_no = self.current_scene_no;
+                caller.return_scene_name = self.current_scene_name.clone();
+                caller.return_line_no = self.current_line_no;
                 caller.ret_form = self.cfg.fm_int;
                 self.gosub_return_stack.push((return_pc, self.cfg.fm_int));
 
@@ -4219,6 +4281,7 @@ impl<'a> SceneVm<'a> {
                     _args.len(),
                     Some(scratch_args),
                 );
+                callee.call_type = 1;
                 callee.return_override = Some((return_pc, self.cfg.fm_int));
                 self.call_stack.push(callee);
 
@@ -4238,6 +4301,9 @@ impl<'a> SceneVm<'a> {
                     .last_mut()
                     .ok_or_else(|| anyhow!("call stack underflow"))?;
                 caller.return_pc = return_pc;
+                caller.return_scene_no = self.current_scene_no;
+                caller.return_scene_name = self.current_scene_name.clone();
+                caller.return_line_no = self.current_line_no;
                 caller.ret_form = self.cfg.fm_str;
                 self.gosub_return_stack.push((return_pc, self.cfg.fm_str));
 
@@ -4249,6 +4315,7 @@ impl<'a> SceneVm<'a> {
                     _args.len(),
                     Some(scratch_args),
                 );
+                callee.call_type = 1;
                 callee.return_override = Some((return_pc, self.cfg.fm_str));
                 self.call_stack.push(callee);
 
@@ -5083,6 +5150,7 @@ impl<'a> SceneVm<'a> {
         while frame.user_props.len() <= target_idx {
             let idx = frame.user_props.len() as i32;
             frame.user_props.push(CallProp {
+                scn_no: self.current_scene_no.unwrap_or(0) as i32,
                 prop_id: idx,
                 form: self.cfg.fm_list,
                 decl_size: 0,
@@ -7657,6 +7725,10 @@ impl<'a> SceneVm<'a> {
                 self.exec_command(composed, al_id, ret_form, args)?;
                 return Ok(());
             }
+            if cell.form == self.cfg.fm_str && elm.len() == 2 {
+                self.call_prop_eval_str_op(&cell.str_value, elm[1], args, al_id)?;
+                return Ok(());
+            }
             self.push_default_for_ret(ret_form);
             return Ok(());
         }
@@ -7754,6 +7826,9 @@ impl<'a> SceneVm<'a> {
                     }
                     return Ok(());
                 }
+                if self.exec_syscom_save_value_intlistref(&elm, form_id, ret_form, args)? {
+                    return Ok(());
+                }
                 if self.exec_builtin_scene_form(&elm, form_id, al_id, ret_form, args)? {
                     return Ok(());
                 }
@@ -7800,15 +7875,7 @@ impl<'a> SceneVm<'a> {
 
                 if !runtime::dispatch_form_code(&mut self.ctx, form_id as u32, args)? {
                     self.ctx.vm_call = None;
-                    // Keep the VM alive on unhandled form chains: warn once per
-                    // chain shape and push a default return so downstream
-                    // take_ctx_return does not bail either. A hard failure here
-                    // previously stopped the host tick loop entirely.
-                    if self.unhandled_form_chains.insert(elm.clone()) {
-                        eprintln!("[warn] unhandled form command chain {:?}, skipping", elm);
-                        *self.unknown_forms.entry(form_id as i32).or_insert(0) += 1;
-                    }
-                    self.push_default_for_ret(ret_form);
+                    bail!("unhandled form command chain {:?}", elm);
                 }
                 self.ctx.vm_call = None;
                 self.drain_pending_frame_action_finishes()?;
@@ -8448,8 +8515,8 @@ impl<'a> SceneVm<'a> {
         Ok(())
     }
 
-    fn write_cpp_call_prop(&self, w: &mut crate::original_save::OriginalStreamWriter, prop: &CallProp, scene_no: Option<usize>) {
-        w.push_i32(scene_no.unwrap_or(0) as i32);
+    fn write_cpp_call_prop(&self, w: &mut crate::original_save::OriginalStreamWriter, prop: &CallProp) {
+        w.push_i32(prop.scn_no);
         w.push_i32(prop.prop_id);
         let mut cell = UserPropCell::new(prop.form, prop.element.clone());
         match &prop.value {
@@ -8463,7 +8530,7 @@ impl<'a> SceneVm<'a> {
     }
 
     fn read_cpp_call_prop(&self, rd: &mut crate::original_save::OriginalStreamReader<'_>) -> Result<CallProp> {
-        let _scn_no = rd.i32()?;
+        let scn_no = rd.i32()?;
         let declared_prop_id = rd.i32()?;
         let (_stored_id, cell) = self.read_cpp_prop(rd)?;
         let value = if cell.form == self.cfg.fm_int {
@@ -8478,6 +8545,7 @@ impl<'a> SceneVm<'a> {
             CallPropValue::Element(cell.element.clone())
         };
         Ok(CallProp {
+            scn_no,
             prop_id: declared_prop_id,
             form: cell.form,
             decl_size: cell.int_list.len().max(cell.str_list.len()).max(cell.list_items.len()),
@@ -8491,10 +8559,9 @@ impl<'a> SceneVm<'a> {
         w.push_extend_i32_list(&l);
         w.push_extend_str_list(&frame.str_args);
         w.push_extend_items(&frame.user_props, |w, prop| {
-            self.write_cpp_call_prop(w, prop, frame.return_scene_no)
+            self.write_cpp_call_prop(w, prop)
         });
-        let call_type = if frame.frame_action_proc { 3 } else if frame.return_pc != 0 { 1 } else { 0 };
-        w.push_i32(call_type);
+        w.push_i32(frame.call_type);
         w.push_i32(frame.ret_form);
         w.push_str(frame.return_scene_name.as_deref().unwrap_or(""));
         w.push_i32(frame.return_line_no);
@@ -8502,27 +8569,10 @@ impl<'a> SceneVm<'a> {
     }
 
     fn flattened_call_stack_for_save(&self) -> Vec<CallFrame> {
-        let mut frames = self.call_stack.clone();
-        let mut start = 0usize;
-        for saved in &self.scene_stack {
-            // call_depth includes the first callee frame. Frames before that
-            // boundary belong to the saved caller scene.
-            let end = saved.call_depth.saturating_sub(1).min(frames.len());
-            for frame in &mut frames[start.min(end)..end] {
-                frame.return_scene_no = saved.current_scene_no;
-                frame.return_scene_name = saved.current_scene_name.clone();
-                frame.return_line_no = saved.current_line_no;
-            }
-            start = end;
-        }
-        for frame in &mut frames[start..] {
-            frame.return_scene_no = self.current_scene_no;
-            frame.return_scene_name = self.current_scene_name.clone();
-            if frame.return_pc == 0 {
-                frame.return_line_no = self.current_line_no;
-            }
-        }
-        frames
+        // C++ saves C_elm_call_list verbatim. The caller lexer position is
+        // captured when a call is entered (tnm_save_call), so the save writer
+        // must not infer or rewrite scene ownership from Rust's scene_stack.
+        self.call_stack.clone()
     }
 
     fn read_cpp_call_frame(&self, rd: &mut crate::original_save::OriginalStreamReader<'_>) -> Result<CallFrame> {
@@ -8546,6 +8596,7 @@ impl<'a> SceneVm<'a> {
             user_props.len(),
         );
         Ok(CallFrame {
+            call_type,
             return_pc,
             return_scene_no: None,
             return_scene_name: (!scene_name.is_empty()).then_some(scene_name),
@@ -8553,7 +8604,9 @@ impl<'a> SceneVm<'a> {
             ret_form,
             return_override: None,
             excall_proc: false,
-            frame_action_proc: call_type == 3,
+            // C_elm_call::save() does not persist excall_flag or
+            // frame_action_flag. Do not reinterpret USER_CMD as frame_action.
+            frame_action_proc: false,
             arg_cnt: 0,
             delayed_ret_form: None,
             user_props,
@@ -10671,125 +10724,82 @@ impl<'a> SceneVm<'a> {
 
     fn restore_saved_scene_stack(
         &mut self,
-        frames: Vec<CallFrame>,
+        mut frames: Vec<CallFrame>,
         current_scene_name: &str,
     ) -> Result<Vec<CallFrame>> {
-        // Rust saves written before scene metadata was retained have every
-        // frame tagged with the active scene (or no tag at all). There is no
-        // caller identity in those bytes, so treating them as one active
-        // stack is the only non-guessing backward-compatible behavior.
-        let has_boundary = frames.iter().any(|frame| {
-            frame.return_scene_name.as_deref().is_some_and(|name| name != current_scene_name)
-        });
-        if !has_boundary {
-            // Legacy Rust saves wrote the active scene name into every call
-            // frame and omitted scene_stack entirely. Summer Pockets' scene 0
-            // is the scenario-flow dispatcher: story scene N returns at z=N+2.
-            // Use that migration only when both the legacy signature and the
-            // corresponding dispatcher label are present; otherwise do not
-            // invent a caller.
-            let legacy_active_only = !frames.is_empty()
-                && frames.iter().all(|frame| {
-                    frame.return_scene_name.as_deref() == Some(current_scene_name)
-                });
-            let current_scene_no = self
-                .scene_pck_cache
-                .as_ref()
-                .and_then(|cache| cache.find_scene_no(current_scene_name));
-            if legacy_active_only
-                && current_scene_no.is_some_and(|no| no > 0)
-                && !self.is_rewrite_plus_active_only_layout(current_scene_name)
-            {
-                let dispatcher_no = 0usize;
-                let dispatcher_name = self
-                    .scene_pck_cache
-                    .as_ref()
-                    .and_then(|cache| cache.find_scene_name(dispatcher_no))
-                    .map(ToOwned::to_owned);
-                if let (Some(scene_no), Some(scene_name)) = (current_scene_no, dispatcher_name) {
-                    let mut stream = self.cached_scene_stream(dispatcher_no)?;
-                    let z_no = scene_no + 2;
-                    if stream.jump_to_z_label(z_no).is_ok() {
-                        let user_cmd_names = stream.scn_cmd_name_map.clone();
-                        let call_cmd_names = self
-                            .scene_pck_cache
-                            .as_ref()
-                            .expect("scene pck cache initialized")
-                            .inc_cmd_name_map
-                            .clone();
-                        let mut restored_frames = Vec::with_capacity(frames.len() + 1);
-                        let mut caller = self.scene_base_call();
-                        caller.return_pc = stream.get_prg_cntr();
-                        caller.return_scene_no = Some(dispatcher_no);
-                        caller.return_scene_name = Some(scene_name.clone());
-                        caller.return_line_no = -1;
-                        caller.ret_form = self.cfg.fm_int;
-                        restored_frames.push(caller);
-                        restored_frames.extend(frames);
-                        self.scene_stack.push(SceneExecFrame {
-                            stream,
-                            user_cmd_names,
-                            call_cmd_names,
-                            current_scene_no: Some(dispatcher_no),
-                            current_scene_name: Some(scene_name),
-                            current_line_no: -1,
-                            call_depth: 2,
-                        });
-                        log::warn!(
-                            "[SG_SAVELOAD] migrated legacy caller continuation through scene 0 z{z_no}"
-                        );
-                        return Ok(restored_frames);
-                    }
-                }
-            }
-            return Ok(frames);
-        }
-
-        let mut groups: Vec<(String, Vec<CallFrame>)> = Vec::new();
-        for frame in frames {
-            let name = frame
-                .return_scene_name
-                .clone()
-                .unwrap_or_else(|| current_scene_name.to_string());
-            if groups.last().map(|(last, _)| last == &name).unwrap_or(false) {
-                groups.last_mut().expect("group exists").1.push(frame);
-            } else {
-                groups.push((name, vec![frame]));
-            }
-        }
-        let Some((active_name, active_frames)) = groups.pop() else {
+        // C++ does not save a separate cross-scene stack.  Each caller frame's
+        // C_elm_call::m_call_save stores the lexer scene/line/pc captured by
+        // tnm_save_call(), while the following callee frame stores call_type.
+        // Rebuild only boundaries proven by those bytes; never infer a
+        // dispatcher scene or synthesize z labels for a particular game.
+        self.scene_stack.clear();
+        if frames.is_empty() {
             return Ok(vec![self.scene_base_call()]);
-        };
-        if active_name != current_scene_name || groups.is_empty() {
-            // Metadata from a foreign/legacy layout is not sufficient to
-            // identify a valid caller chain. Do not invent a scene name.
-            let mut all_frames = groups
-                .into_iter()
-                .flat_map(|(_, frames)| frames)
-                .collect::<Vec<_>>();
-            all_frames.extend(active_frames);
-            return Ok(all_frames);
         }
 
-        let mut restored_frames = Vec::new();
-        for (scene_name, call_stack) in groups {
-            let Some(scene_no) = self
+        // Scene numbers are runtime package indices and are not serialized in
+        // C_elm_call. Resolve them from the saved scene names in the active
+        // Scene.pck after load/reload.
+        for frame in &mut frames {
+            frame.return_scene_no = frame
+                .return_scene_name
+                .as_deref()
+                .and_then(|name| {
+                    self.scene_pck_cache
+                        .as_ref()
+                        .and_then(|cache| cache.find_scene_no(name))
+                });
+        }
+
+        for callee_idx in 1..frames.len() {
+            let call_type = frames[callee_idx].call_type;
+            if call_type != 2 && call_type != 3 {
+                continue;
+            }
+
+            let Some(caller_scene_name) = frames[callee_idx - 1]
+                .return_scene_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+            else {
+                // A legacy/non-original Rust save may not contain caller lexer
+                // metadata. There is no C++-justified way to recover it.
+                continue;
+            };
+
+            let callee_scene_name = if callee_idx + 1 == frames.len() {
+                Some(current_scene_name)
+            } else {
+                frames[callee_idx]
+                    .return_scene_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+            };
+            let Some(callee_scene_name) = callee_scene_name else {
+                continue;
+            };
+
+            // USER_CMD can target the current scene. Only a real scene change
+            // needs a SceneExecFrame; same-scene calls are restored solely by
+            // the shared C_elm_call list.
+            if caller_scene_name.eq_ignore_ascii_case(callee_scene_name) {
+                continue;
+            }
+
+            let Some(caller_scene_no) = self
                 .scene_pck_cache
                 .as_ref()
-                .and_then(|cache| cache.find_scene_no(&scene_name))
+                .and_then(|cache| cache.find_scene_no(caller_scene_name))
             else {
-                log::warn!("[SG_SAVELOAD] saved caller scene not found: {scene_name}");
-                self.scene_stack.clear();
-                restored_frames.extend(call_stack);
-                restored_frames.extend(active_frames);
-                return Ok(restored_frames);
+                log::warn!(
+                    "[SG_SAVELOAD] saved caller scene not found in active Scene.pck: {}",
+                    caller_scene_name
+                );
+                continue;
             };
-            let mut stream = self.cached_scene_stream(scene_no)?;
-            let continuation_pc = call_stack.last().map(|frame| frame.return_pc);
-            let continuation_line = call_stack.last().map(|frame| frame.return_line_no).unwrap_or(-1);
-            if let Some(pc) = continuation_pc {
-                stream.set_prg_cntr(pc)?;
-            }
+
+            let mut stream = self.cached_scene_stream(caller_scene_no)?;
+            stream.set_prg_cntr(frames[callee_idx - 1].return_pc)?;
             let user_cmd_names = stream.scn_cmd_name_map.clone();
             let call_cmd_names = self
                 .scene_pck_cache
@@ -10797,20 +10807,22 @@ impl<'a> SceneVm<'a> {
                 .expect("scene pck cache initialized")
                 .inc_cmd_name_map
                 .clone();
-            restored_frames.extend(call_stack);
-            let call_depth = restored_frames.len() + 1;
+
             self.scene_stack.push(SceneExecFrame {
                 stream,
                 user_cmd_names,
                 call_cmd_names,
-                current_scene_no: Some(scene_no),
-                current_scene_name: Some(scene_name),
-                current_line_no: continuation_line,
-                call_depth,
+                current_scene_no: Some(caller_scene_no),
+                current_scene_name: Some(caller_scene_name.to_string()),
+                current_line_no: frames[callee_idx - 1].return_line_no,
+                // At call entry C_elm_call_list::add_call() creates callee_idx,
+                // so Rust's shared call stack length at this boundary is
+                // callee_idx + 1 (base frame included).
+                call_depth: callee_idx + 1,
             });
         }
-        restored_frames.extend(active_frames);
-        Ok(restored_frames)
+
+        Ok(frames)
     }
 
 
@@ -11351,25 +11363,26 @@ impl<'a> SceneVm<'a> {
                 crate::resource::game_file_len(&path).unwrap_or(0)
             );
         }
-        if let Some(saved_slot) = crate::original_save::read_slot_from_path(&path) {
-            match req.kind {
-                RuntimeSaveKind::Normal => {
-                    if self.ctx.globals.syscom.save_slots.len() <= req.index {
-                        self.ctx.globals.syscom.save_slots.resize_with(req.index + 1, Default::default);
-                    }
-                    self.ctx.globals.syscom.save_slots[req.index] = saved_slot;
+        // tnm_save_local_on_file() clears C_tnm_save_cache before writing and
+        // leaves that slot uncached.  Do not immediately repopulate the Rust
+        // header cache from the file; the next metadata query must reload it.
+        match req.kind {
+            RuntimeSaveKind::Normal => {
+                if self.ctx.globals.syscom.save_slots.len() <= req.index {
+                    self.ctx.globals.syscom.save_slots.resize_with(req.index + 1, Default::default);
                 }
-                RuntimeSaveKind::Quick => {
-                    if self.ctx.globals.syscom.quick_save_slots.len() <= req.index {
-                        self.ctx.globals.syscom.quick_save_slots.resize_with(req.index + 1, Default::default);
-                    }
-                    self.ctx.globals.syscom.quick_save_slots[req.index] = saved_slot;
-                }
-                RuntimeSaveKind::End => {
-                    self.ctx.globals.syscom.end_save_exists = true;
-                }
-                RuntimeSaveKind::Inner => {}
+                self.ctx.globals.syscom.save_slots[req.index].header_cache_valid = false;
             }
+            RuntimeSaveKind::Quick => {
+                if self.ctx.globals.syscom.quick_save_slots.len() <= req.index {
+                    self.ctx.globals.syscom.quick_save_slots.resize_with(req.index + 1, Default::default);
+                }
+                self.ctx.globals.syscom.quick_save_slots[req.index].header_cache_valid = false;
+            }
+            RuntimeSaveKind::End => {
+                self.ctx.globals.syscom.end_save_exists = true;
+            }
+            RuntimeSaveKind::Inner => {}
         }
         if let Some(save_kind) = Self::save_kind_to_original(req.kind) {
             let save_no = crate::original_save::original_save_no(
@@ -11437,13 +11450,8 @@ impl<'a> SceneVm<'a> {
             (env.local_stream, env.local_ex_stream, Some(meta))
         };
         if let Some(meta) = loaded_meta.as_ref() {
-            let append_dir = meta.append_dir.clone();
-            let append_name = meta.append_name.clone();
-            self.ctx.globals.append_dir = append_dir.clone();
-            self.ctx.globals.append_name = append_name;
-            self.ctx.images.set_current_append_dir(append_dir.clone());
-            self.ctx.movie.set_current_append_dir(append_dir.clone());
-            self.ctx.bgm.set_current_append_dir(append_dir);
+            self.ctx
+                .set_active_append(meta.append_dir.clone(), meta.append_name.clone());
         }
         // VM-side equivalent of C++ `tnm_finish_local`: drop excall frames, sel
         // points, and the stale save point. The loaded scene re-establishes its
@@ -11932,6 +11940,9 @@ impl<'a> SceneVm<'a> {
             );
         }
         caller.return_pc = return_pc;
+        caller.return_scene_no = self.current_scene_no;
+        caller.return_scene_name = self.current_scene_name.clone();
+        caller.return_line_no = self.current_line_no;
         caller.ret_form = ret_form;
 
         let target_user_cmd_names = target_stream.scn_cmd_name_map.clone();
@@ -11959,13 +11970,14 @@ impl<'a> SceneVm<'a> {
         self.ctx.current_line_no = -1;
 
         let scratch_args = self.call_scratch_from_args(scratch_source_args);
-        let call_frame = self.take_call_frame(
+        let mut call_frame = self.take_call_frame(
             self.cfg.fm_void,
             ex_call_proc,
             false,
             scratch_source_args.len(),
             Some(scratch_args),
         );
+        call_frame.call_type = 2;
         self.call_stack.push(call_frame);
         self.scene_stack.push(SceneExecFrame {
             stream: saved_stream,
@@ -12150,6 +12162,110 @@ impl<'a> SceneVm<'a> {
         }
     }
 
+    fn exec_syscom_save_value_intlistref(
+        &mut self,
+        elm: &[i32],
+        form_id: i32,
+        ret_form: i32,
+        args: &[Value],
+    ) -> Result<bool> {
+        use crate::runtime::forms::codes::{
+            elm_value, ELM_ARRAY, FORM_GLOBAL_SYSCOM, FM_SYSCOM,
+        };
+
+        if form_id != FORM_GLOBAL_SYSCOM as i32 && form_id != FM_SYSCOM {
+            return Ok(false);
+        }
+        let Some(op) = elm.get(1).copied() else {
+            return Ok(false);
+        };
+        let (quick, write) = match op {
+            elm_value::SYSCOM_GET_SAVE_VALUE => (false, false),
+            elm_value::SYSCOM_GET_QUICK_SAVE_VALUE => (true, false),
+            elm_value::SYSCOM_SET_SAVE_VALUE => (false, true),
+            elm_value::SYSCOM_SET_QUICK_SAVE_VALUE => (true, true),
+            _ => return Ok(false),
+        };
+
+        // All four commands are FM_VOID in def_element_Siglus.h. The second
+        // parameter is an actual INTLISTREF; C++ resolves the complete S_element
+        // with tnm_get_element_ptr(), so this cannot be reduced to chain[0].
+        if ret_form != self.cfg.fm_void {
+            return Ok(false);
+        }
+        let raw_save_no = args.first().and_then(Value::as_i64).unwrap_or(-1);
+        let Some(Value::Element(base_chain)) = args.get(1).map(Value::unwrap_named) else {
+            return Ok(true);
+        };
+        if base_chain.is_empty() {
+            return Ok(true);
+        }
+        let flag_index = args.get(2).and_then(Value::as_i64).unwrap_or(0);
+        let flag_cnt_raw = args.get(3).and_then(Value::as_i64).unwrap_or(0);
+        if flag_cnt_raw <= 0 {
+            return Ok(true);
+        }
+        let flag_cnt = usize::try_from(flag_cnt_raw)
+            .unwrap_or(usize::MAX)
+            .min(crate::original_save::SAVE_FLAG_MAX_CNT);
+
+        if !write {
+            let Some(values) = crate::runtime::forms::syscom::read_save_flag_values(
+                &mut self.ctx,
+                quick,
+                raw_save_no,
+                flag_cnt,
+            ) else {
+                return Ok(true);
+            };
+            for (i, value) in values.into_iter().enumerate() {
+                let Some(index) = flag_index.checked_add(i as i64) else {
+                    break;
+                };
+                if index < 0 {
+                    continue;
+                }
+                let Ok(index) = i32::try_from(index) else {
+                    continue;
+                };
+                let mut target = base_chain.clone();
+                target.push(ELM_ARRAY);
+                target.push(index);
+                self.exec_assign(target, 1, Value::Int(value))?;
+            }
+        } else {
+            let mut values = Vec::with_capacity(flag_cnt);
+            for i in 0..flag_cnt {
+                let Some(index) = flag_index.checked_add(i as i64) else {
+                    break;
+                };
+                if index < 0 {
+                    values.push(0);
+                    continue;
+                }
+                let Ok(index) = i32::try_from(index) else {
+                    values.push(0);
+                    continue;
+                };
+                let mut source = base_chain.clone();
+                source.push(ELM_ARRAY);
+                source.push(index);
+                self.exec_property(source)?;
+                values.push(i64::from(self.pop_int()?));
+            }
+            let _ = crate::runtime::forms::syscom::write_save_flag_values(
+                &mut self.ctx,
+                quick,
+                raw_save_no,
+                &values,
+            );
+        }
+
+        // The original command pushes nothing for FM_VOID.
+        self.ctx.stack.clear();
+        Ok(true)
+    }
+
     fn exec_builtin_scene_form(
         &mut self,
         elm: &[i32],
@@ -12179,7 +12295,6 @@ impl<'a> SceneVm<'a> {
                 &[]
             };
             self.farcall_scene_name_ex(scene_name, z_no, self.cfg.fm_void, true, scratch_args)?;
-            self.ctx.request_proc_boundary(runtime::ProcKind::Script);
             self.ctx.stack.clear();
             return Ok(true);
         }
@@ -12818,6 +12933,7 @@ mod call_property_reference_tests {
             .expect("base call frame")
             .user_props
             .push(CallProp {
+                scn_no: 0,
                 prop_id: call_prop_id,
                 form: FM_INTREF,
                 decl_size: 0,
@@ -12840,7 +12956,7 @@ mod call_property_reference_tests {
 }
 
 #[cfg(test)]
-mod user_prop_list_command_tests {
+mod user_prop_command_tests {
     use super::*;
     use crate::runtime::forms::codes::{
         ELM_ARRAY, ELM_INTLIST_GET_SIZE, ELM_INTLIST_RESIZE, ELM_STRLIST_GET_SIZE,
@@ -12869,6 +12985,30 @@ mod user_prop_list_command_tests {
         let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
         let stream = SceneStream::new(chunk).expect("empty scene stream");
         SceneVm::new(stream, CommandContext::new(PathBuf::from(".")))
+    }
+
+    #[test]
+    fn user_string_commands_extract_map_date_and_time() {
+        use crate::runtime::forms::codes::str_op;
+
+        let mut vm = test_vm();
+        let prop_id = 119;
+        vm.assign_user_prop(prop_id, None, Value::Str("0729a".into()));
+        let head = constants::elm::create(constants::elm::OWNER_USER_PROP, 0, prop_id as i32);
+        for (start, len, expected) in [(0, 4, "0729"), (4, 1, "a")] {
+            vm.exec_command(
+                vec![head, str_op::MID],
+                1,
+                vm.cfg.fm_str,
+                &mut vec![Value::Int(start), Value::Int(len)],
+            )
+            .expect("string MID command");
+            assert_eq!(vm.pop_str().expect("substring"), expected);
+        }
+        vm.exec_command(vec![head, str_op::CNT], 0, vm.cfg.fm_int, &mut vec![])
+            .expect("string CNT command");
+        assert_eq!(vm.pop_int().expect("string length"), 5);
+        assert_eq!(vm.user_props[&prop_id].str_value, "0729a");
     }
 
     #[test]
@@ -12996,6 +13136,7 @@ mod call_frame_save_metadata_tests {
         let stream = SceneStream::new(chunk).expect("empty scene stream");
         let vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
         let frame = CallFrame {
+            call_type: 2,
             return_pc: 0x1234,
             return_scene_no: Some(7),
             return_scene_name: Some("caller_scene".to_string()),
@@ -13015,6 +13156,7 @@ mod call_frame_save_metadata_tests {
         let bytes = writer.into_inner();
         let mut reader = OriginalStreamReader::new(&bytes);
         let restored = vm.read_cpp_call_frame(&mut reader).expect("call frame");
+        assert_eq!(restored.call_type, 2);
         assert_eq!(restored.return_pc, 0x1234);
         assert_eq!(restored.return_scene_name.as_deref(), Some("caller_scene"));
         assert_eq!(restored.return_line_no, 2605);

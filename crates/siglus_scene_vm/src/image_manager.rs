@@ -178,6 +178,8 @@ pub struct DebugImageInfo {
     pub version: u64,
     pub source_path: Option<PathBuf>,
     pub frame_index: Option<usize>,
+    pub composite_append_dir: Option<String>,
+    pub composite_descriptor: Option<String>,
 }
 
 fn compose_g00_cut(dst: &mut RgbaImage, src: &RgbaImage, x: i32, y: i32, blend_type: i32) {
@@ -594,6 +596,21 @@ impl ImageManager {
                 break;
             }
         }
+
+        // Composed G00 textures are synthetic ImageIds and therefore do not
+        // appear in key_to_id. Keep their original descriptor visible to the
+        // renderer HUD so a bad composed texture can be distinguished from a
+        // correctly decoded face/eye difference layer.
+        let mut composite_append_dir = None;
+        let mut composite_descriptor = None;
+        for ((append_dir, descriptor), composite_id) in &self.composite_to_id {
+            if *composite_id == id {
+                composite_append_dir = Some(append_dir.clone());
+                composite_descriptor = Some(descriptor.clone());
+                break;
+            }
+        }
+
         Some(DebugImageInfo {
             id,
             width: entry.img.width,
@@ -601,6 +618,8 @@ impl ImageManager {
             version: entry.version,
             source_path,
             frame_index,
+            composite_append_dir,
+            composite_descriptor,
         })
     }
 }
@@ -608,6 +627,31 @@ impl ImageManager {
 #[cfg(test)]
 mod composed_g00_tests {
     use super::*;
+
+    #[test]
+    fn debug_info_reports_composed_descriptor_origin() {
+        let mut images = ImageManager::new(PathBuf::from("."));
+        let id = images.insert_image(RgbaImage {
+            width: 1,
+            height: 1,
+            center_x: 0,
+            center_y: 0,
+            rgba: vec![255, 255, 255, 255],
+        });
+        images.composite_to_id.insert(
+            ("PDT".to_string(), "base(0,0,0)|face(0,0,2)".to_string()),
+            id,
+        );
+
+        let info = images.debug_image_info(id).expect("debug image info");
+        assert_eq!(info.composite_append_dir.as_deref(), Some("PDT"));
+        assert_eq!(
+            info.composite_descriptor.as_deref(),
+            Some("base(0,0,0)|face(0,0,2)")
+        );
+        assert!(info.source_path.is_none());
+        assert!(info.frame_index.is_none());
+    }
 
     #[test]
     fn parses_siglus_composed_descriptor() {

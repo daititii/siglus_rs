@@ -30,6 +30,10 @@ use siglus_scene_vm::image_manager::ImageId;
 use siglus_scene_vm::render::{Renderer, RendererDebugTexture};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use siglus_scene_vm::desktop_messagebox::{DesktopMessageBoxBridge, DesktopMessageBoxWindow};
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+use siglus_scene_vm::desktop_twitter::{DesktopTwitterAction, DesktopTwitterWindow};
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+use siglus_scene_vm::runtime::twitter;
 use siglus_scene_vm::runtime::globals::{
     SyscomPendingProc, SyscomPendingProcKind, SystemMessageBoxButton, SystemMessageBoxModalState,
     WipeState,
@@ -164,6 +168,7 @@ struct HudTextureCacheEntry {
 
 #[derive(Debug, Clone)]
 struct HudGalleryTile {
+    stage_form_id: u32,
     stage_idx: i64,
     stage_label: String,
     obj_idx: usize,
@@ -224,6 +229,8 @@ struct App {
     desktop_messagebox_bridge: DesktopMessageBoxBridge,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     desktop_messagebox_window: Option<DesktopMessageBoxWindow>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    desktop_twitter_window: Option<DesktopTwitterWindow>,
 }
 
 fn map_mouse_button(b: MouseButton) -> Option<VmMouseButton> {
@@ -428,6 +435,8 @@ impl App {
             desktop_messagebox_bridge: DesktopMessageBoxBridge::new(),
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             desktop_messagebox_window: None,
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            desktop_twitter_window: None,
         }
     }
 
@@ -497,24 +506,120 @@ impl App {
                     tile.file = Self::hud_file_name_from_source_path(&path);
                 }
                 tile.source_label = path.display().to_string();
+            } else if let Some(descriptor) = info.composite_descriptor {
+                tile.source_label = descriptor;
+                tile.source_kind = "composed-g00".to_string();
             }
         }
     }
 
-    fn collect_hud_tiles(vm: &mut SceneVm<'static>) -> Vec<HudGalleryTile> {
+    fn hud_renderer_image_id(texture: &RendererDebugTexture) -> Option<ImageId> {
+        texture
+            .key
+            .strip_prefix("image:")?
+            .parse::<u32>()
+            .ok()
+            .map(ImageId)
+    }
+
+    fn collect_hud_runtime_image_sources(
+        vm: &SceneVm<'static>,
+    ) -> HashMap<ImageId, Vec<String>> {
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
-        Self::collect_hud_tile_metadata_from_stage_forms(&*vm, &mut rows, &mut seen);
-        Self::collect_hud_tile_metadata_from_runtime_probe(&*vm, &mut rows, &mut seen);
+        Self::collect_hud_tile_metadata_from_stage_forms(vm, &mut rows, &mut seen);
+        Self::collect_hud_tile_metadata_from_runtime_probe(vm, &mut rows, &mut seen);
+
+        let mut sources: HashMap<ImageId, Vec<String>> = HashMap::new();
+        for tile in rows {
+            let Some(image_id) = tile.runtime_image_id else {
+                continue;
+            };
+            let line = format!(
+                "object={}[{}] backend={} file={} patno={} bind={} disp={} tr={} alpha={}",
+                tile.stage_label,
+                tile.obj_idx,
+                tile.backend,
+                tile.file,
+                tile.patno,
+                tile.bind,
+                if tile.disp { 1 } else { 0 },
+                tile.tr,
+                tile.alpha,
+            );
+            let entry = sources.entry(image_id).or_default();
+            if !entry.iter().any(|existing| existing == &line) {
+                entry.push(line);
+            }
+        }
+        sources
+    }
+
+    fn collect_hud_image_origins(
+        vm: &SceneVm<'static>,
+        textures: &[RendererDebugTexture],
+    ) -> HashMap<ImageId, Vec<String>> {
+        let mut origins = HashMap::new();
+        for texture in textures {
+            let Some(image_id) = Self::hud_renderer_image_id(texture) else {
+                continue;
+            };
+            let Some(info) = vm.ctx.images.debug_image_info(image_id) else {
+                continue;
+            };
+
+            let mut lines = Vec::new();
+            if let Some(descriptor) = info.composite_descriptor {
+                let append = info.composite_append_dir.unwrap_or_default();
+                lines.push(format!(
+                    "origin=composed-g00 append={} descriptor={}",
+                    if append.is_empty() { "<root>" } else { append.as_str() },
+                    descriptor,
+                ));
+            }
+            if let Some(path) = info.source_path {
+                if let Some(frame_index) = info.frame_index {
+                    lines.push(format!(
+                        "origin=file {} frame/cut={}",
+                        path.display(),
+                        frame_index,
+                    ));
+                } else {
+                    lines.push(format!("origin=file {}", path.display()));
+                }
+            }
+            if lines.is_empty() {
+                lines.push("origin=generated/runtime image (no file/composite key)".to_string());
+            }
+            origins.insert(image_id, lines);
+        }
+        origins
+    }
+
+    fn collect_hud_object_metadata(vm: &SceneVm<'static>) -> Vec<HudGalleryTile> {
+        // Passive object-tree snapshot for debugging.  Do not resolve or load
+        // preview images here: the HUD must not mutate ImageManager merely by
+        // being open.  This intentionally includes objects that currently have
+        // no runtime ImageId/binding, which are exactly the cases hidden by the
+        // renderer-texture view.
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        Self::collect_hud_tile_metadata_from_stage_forms(vm, &mut rows, &mut seen);
+        Self::collect_hud_tile_metadata_from_runtime_probe(vm, &mut rows, &mut seen);
+        rows.sort_by_key(|tile| (tile.stage_form_id, tile.stage_idx, tile.obj_idx));
+        rows
+    }
+
+    fn collect_hud_tiles(vm: &mut SceneVm<'static>) -> Vec<HudGalleryTile> {
+        let mut rows = Self::collect_hud_object_metadata(&*vm);
         Self::resolve_hud_tile_images(vm, &mut rows);
-        rows.sort_by_key(|tile| (tile.stage_idx, tile.obj_idx));
         rows
     }
 
     fn hud_object_participates_in_tree(
         obj: &siglus_scene_vm::runtime::globals::ObjectState,
     ) -> bool {
-        if obj.used {
+        if obj.object_type != 0 {
             return true;
         }
         if !obj.runtime.child_objects.is_empty() {
@@ -529,7 +634,7 @@ impl App {
     fn collect_hud_tile_metadata_from_stage_forms(
         vm: &SceneVm<'static>,
         rows: &mut Vec<HudGalleryTile>,
-        seen: &mut HashSet<(i64, usize)>,
+        seen: &mut HashSet<(u32, i64, usize)>,
     ) {
         let mut stage_form_keys = vm
             .ctx
@@ -550,6 +655,9 @@ impl App {
                     continue;
                 };
                 for (obj_idx, obj) in objs.iter().enumerate() {
+                    // Debug HUD intentionally inspects stale/disabled payloads too.
+                    // Rendering is gated by object_slot_use, but hiding those rows
+                    // here would make lifecycle corruption harder to diagnose.
                     Self::collect_hud_tile_metadata_from_object_tree(
                         vm,
                         rows,
@@ -567,7 +675,7 @@ impl App {
     fn collect_hud_tile_metadata_from_object_tree(
         vm: &SceneVm<'static>,
         rows: &mut Vec<HudGalleryTile>,
-        seen: &mut HashSet<(i64, usize)>,
+        seen: &mut HashSet<(u32, i64, usize)>,
         stage_form_id: u32,
         stage_idx: i64,
         obj_idx: usize,
@@ -578,7 +686,7 @@ impl App {
         }
 
         let runtime_slot = obj.runtime_slot_or(obj_idx);
-        let key = (stage_idx, runtime_slot);
+        let key = (stage_form_id, stage_idx, runtime_slot);
         if seen.insert(key) {
             let mut disp = obj.base.disp != 0;
             let mut tr = obj.base.tr;
@@ -679,9 +787,20 @@ impl App {
             .to_string();
 
             let file = obj.file_name.clone().unwrap_or_else(|| "-".to_string());
+            let normal_stage_form_id = if vm.ctx.ids.form_global_stage != 0 {
+                vm.ctx.ids.form_global_stage
+            } else {
+                siglus_scene_vm::runtime::forms::codes::FORM_GLOBAL_STAGE
+            };
+            let stage_label = if stage_form_id == normal_stage_form_id {
+                Self::hud_stage_name(stage_idx).to_string()
+            } else {
+                format!("EXCALL.{}", Self::hud_stage_name(stage_idx))
+            };
             let mut tile = HudGalleryTile {
+                stage_form_id,
                 stage_idx,
-                stage_label: Self::hud_stage_name(stage_idx).to_string(),
+                stage_label,
                 obj_idx: runtime_slot,
                 file: file.clone(),
                 backend,
@@ -723,8 +842,13 @@ impl App {
     fn collect_hud_tile_metadata_from_runtime_probe(
         vm: &SceneVm<'static>,
         rows: &mut Vec<HudGalleryTile>,
-        seen: &mut HashSet<(i64, usize)>,
+        seen: &mut HashSet<(u32, i64, usize)>,
     ) {
+        let normal_stage_form_id = if vm.ctx.ids.form_global_stage != 0 {
+            vm.ctx.ids.form_global_stage
+        } else {
+            siglus_scene_vm::runtime::forms::codes::FORM_GLOBAL_STAGE
+        };
         for stage_idx in 0..Self::HUD_STAGE_COUNT {
             for obj_idx in 0..Self::HUD_OBJECT_COUNT {
                 let Some((layer_id, sprite_id)) =
@@ -739,7 +863,7 @@ impl App {
                     continue;
                 };
 
-                let key = (stage_idx, obj_idx);
+                let key = (normal_stage_form_id, stage_idx, obj_idx);
                 let runtime_image_id = sprite.image_id;
                 let mut file = format!("<obj {}>", obj_idx);
                 let mut source_label = format!("runtime L{}:S{}", layer_id, sprite_id);
@@ -759,7 +883,11 @@ impl App {
                 if !seen.insert(key) {
                     if let Some(tile) = rows
                         .iter_mut()
-                        .find(|tile| tile.stage_idx == stage_idx && tile.obj_idx == obj_idx)
+                        .find(|tile| {
+                            tile.stage_form_id == normal_stage_form_id
+                                && tile.stage_idx == stage_idx
+                                && tile.obj_idx == obj_idx
+                        })
                     {
                         tile.bind = format!("L{}:S{}", layer_id, sprite_id);
                         tile.disp = sprite.visible;
@@ -796,6 +924,7 @@ impl App {
                 }
 
                 rows.push(HudGalleryTile {
+                    stage_form_id: normal_stage_form_id,
                     stage_idx,
                     stage_label: Self::hud_stage_name(stage_idx).to_string(),
                     obj_idx,
@@ -1060,6 +1189,16 @@ impl App {
             };
             renderer.borrow().debug_read_render_chain_textures()?
         };
+        let (image_origins, runtime_image_sources, stage_objects) =
+            if let Some(vm) = self.vm.as_ref() {
+                (
+                    Self::collect_hud_image_origins(vm, &textures),
+                    Self::collect_hud_runtime_image_sources(vm),
+                    Self::collect_hud_object_metadata(vm),
+                )
+            } else {
+                (HashMap::new(), HashMap::new(), Vec::new())
+            };
 
         let card_w_px = 340u32;
         let card_h_px = 360u32;
@@ -1113,13 +1252,14 @@ impl App {
                     ui.heading("Siglus texture HUD");
                     ui.separator();
                     ui.label(format!(
-                        "textures={} usages={} image={} external={} target={} default={} rows={}/{} cols={} F2 hide, Wheel/PgUp/PgDn/Home/End scroll",
+                        "textures={} usages={} image={} external={} target={} default={} objects={} rows={}/{} cols={} F2 hide, Wheel/PgUp/PgDn/Home/End scroll",
                         textures.len(),
                         usage_total,
                         image_count,
                         external_count,
                         target_count,
                         default_count,
+                        stage_objects.len(),
                         scroll,
                         total_rows,
                         columns,
@@ -1127,6 +1267,38 @@ impl App {
                 });
             });
             egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CollapsingHeader::new(format!(
+                    "Stage objects ({}) — includes invisible/unbound objects",
+                    stage_objects.len(),
+                ))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
+                        for tile in &stage_objects {
+                            let image = tile
+                                .runtime_image_id
+                                .map(|id| format!("ImageId({})", id.index()))
+                                .unwrap_or_else(|| "-".to_string());
+                            let line = format!(
+                                "{}[{}] disp={} backend={} file={} patno={} bind={} image={} tr={} alpha={}",
+                                tile.stage_label,
+                                tile.obj_idx,
+                                if tile.disp { 1 } else { 0 },
+                                tile.backend,
+                                tile.file,
+                                tile.patno,
+                                tile.bind,
+                                image,
+                                tile.tr,
+                                tile.alpha,
+                            );
+                            ui.monospace(Self::shorten_for_hud(&line, 220))
+                                .on_hover_text(line);
+                        }
+                    });
+                });
+                ui.separator();
+
                 if textures.is_empty() {
                     ui.label("no renderer GPU textures recorded for the current render chain");
                     return;
@@ -1168,6 +1340,26 @@ impl App {
                                             texture.usage_count,
                                         ));
                                         ui.small("source=renderer GPU texture readback, preview=raw RGB forced opaque");
+                                        if let Some(image_id) = Self::hud_renderer_image_id(texture) {
+                                            if let Some(lines) = image_origins.get(&image_id) {
+                                                for line in lines {
+                                                    ui.small(Self::shorten_for_hud(line, 160))
+                                                        .on_hover_text(line);
+                                                }
+                                            }
+                                            if let Some(lines) = runtime_image_sources.get(&image_id) {
+                                                for line in lines.iter().take(4) {
+                                                    ui.small(Self::shorten_for_hud(line, 160))
+                                                        .on_hover_text(line);
+                                                }
+                                                if lines.len() > 4 {
+                                                    ui.small(format!(
+                                                        "object=... +{} more bindings",
+                                                        lines.len() - 4
+                                                    ));
+                                                }
+                                            }
+                                        }
 
                                         let (rect, _) = ui.allocate_exact_size(
                                             egui::vec2(thumb_w, thumb_h),
@@ -1352,39 +1544,8 @@ impl App {
         image::save_buffer(path, rgba, width, height, ColorType::Rgba8)
             .with_context(|| format!("write capture png: {}", path.display()))
     }
-    fn find_gameexe_path(project_dir: &Path) -> Option<PathBuf> {
-        let candidates = [
-            "Gameexe.dat",
-            "Gameexe.ini",
-            "gameexe.dat",
-            "gameexe.ini",
-            "GameexeEN.dat",
-            "GameexeEN.ini",
-            "GameexeZH.dat",
-            "GameexeZH.ini",
-            "GameexeZHTW.dat",
-            "GameexeZHTW.ini",
-            "GameexeDE.dat",
-            "GameexeDE.ini",
-            "GameexeES.dat",
-            "GameexeES.ini",
-            "GameexeFR.dat",
-            "GameexeFR.ini",
-            "GameexeID.dat",
-            "GameexeID.ini",
-        ];
-        for name in candidates {
-            let p = project_dir.join(name);
-            if let Some(path) = siglus_scene_vm::resource::resolve_game_file(&p).ok().flatten() {
-                return Some(path);
-            }
-        }
-        None
-    }
-
-
     fn try_load_gameexe(project_dir: &Path) -> Option<GameexeConfig> {
-        let path = Self::find_gameexe_path(project_dir)?;
+        let path = siglus_scene_vm::resource::find_initial_gameexe_path(project_dir).ok()?;
         let raw = siglus_scene_vm::resource::read_file_bytes(&path).ok()?;
         if path
             .extension()
@@ -1432,12 +1593,20 @@ impl App {
         };
         stream.jump_to_z_label(start_z.max(0) as usize)?;
         let mut ctx = CommandContext::new(project_dir);
+        let active_append = ctx.globals.append_dir.clone();
+        ctx.install_scene_metadata(&active_append, &pck)?;
         ctx.screen_w = self.game_size.0;
         ctx.screen_h = self.game_size.1;
         let mut vm = SceneVm::with_config(VmConfig::from_env(), stream, ctx);
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         vm.ctx
             .set_native_ui_backend(Some(self.desktop_messagebox_bridge.backend()));
+        // Original init_global() loads global/read/config state before start()
+        // initializes local scene state.
+        if self.args.scene_id.is_none() && self.args.scene_name.is_none() {
+            siglus_scene_vm::runtime::forms::syscom::load_global_save(&mut vm.ctx)
+                .context("load global save during engine initialization")?;
+        }
         if self.args.scene_id.is_none() {
             let scene_name = if let Some(name) = self.args.scene_name.as_ref() {
                 name.clone()
@@ -1445,10 +1614,6 @@ impl App {
                 self.boot.start_scene.clone()
             };
             vm.restart_scene_name(&scene_name, start_z)?;
-        }
-        if self.args.scene_id.is_none() && self.args.scene_name.is_none() {
-            siglus_scene_vm::runtime::forms::syscom::load_global_save(&mut vm.ctx)
-                .context("load global save during engine initialization")?;
         }
         Ok(vm)
     }
@@ -1991,6 +2156,7 @@ impl App {
         } else {
             None
         };
+        vm.ctx.reset_active_append_to_initial();
         vm.restart_scene_name(&target_scene, target_z)?;
         if let Some(renderer) = self.renderer.as_ref() {
             renderer.borrow_mut().clear_runtime_image_textures();
@@ -2391,6 +2557,12 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
+        // Native Windows-style message boxes are synchronous in the original
+        // engine.  While one owns the UI thread, no script/frame processing
+        // occurs behind it.
+        if self.native_messagebox_pending() {
+            return Ok(());
+        }
         if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
             let scene = self.vm.as_ref().and_then(|vm| vm.current_scene_name()).unwrap_or("<none>");
             let line = self.vm.as_ref().map(|vm| vm.current_line_no()).unwrap_or(-1);
@@ -2474,6 +2646,11 @@ impl App {
             }
         }
 
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        if !render_suppressed {
+            self.materialize_tweet_capture_after_disp()?;
+        }
+
         if self.script_resume_after_redraw {
             self.script_resume_after_redraw = false;
             self.script_needs_pump = true;
@@ -2493,6 +2670,25 @@ impl App {
             }
         }
 
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn materialize_tweet_capture_after_disp(&mut self) -> Result<()> {
+        let pending = self
+            .vm
+            .as_ref()
+            .map(|vm| vm.ctx.globals.capture_for_tweet_pending)
+            .unwrap_or(false);
+        if !pending {
+            return Ok(());
+        }
+        let Some(vm) = self.vm.as_mut() else {
+            return Ok(());
+        };
+        let image = syscom::capture_for_tweet(&mut vm.ctx)?;
+        vm.ctx.globals.capture_image = Some(image);
+        vm.ctx.globals.capture_for_tweet_pending = false;
         Ok(())
     }
 
@@ -2698,6 +2894,14 @@ impl App {
         }
     }
 
+    fn native_messagebox_pending(&self) -> bool {
+        self.vm
+            .as_ref()
+            .and_then(|vm| vm.ctx.globals.system.messagebox_modal.as_ref())
+            .map(|modal| modal.native_pending)
+            .unwrap_or(false)
+    }
+
     fn needs_continuous_frame(&self) -> bool {
         if self.pending_exit {
             return false;
@@ -2750,6 +2954,131 @@ impl App {
                 vm.ctx.submit_native_messagebox_result(request_id, value);
             }
             self.wake_for_input();
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn sync_desktop_twitter_account(&mut self) {
+        let account = self.vm.as_ref().map(|vm| {
+            let state = &vm.ctx.globals.twitter;
+            (
+                state.is_authorized(),
+                state.user_name.clone(),
+                state.screen_name.clone(),
+            )
+        });
+        if let (Some(window), Some((authorized, user_name, screen_name))) =
+            (self.desktop_twitter_window.as_mut(), account)
+        {
+            window.set_account_state(authorized, &user_name, &screen_name);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn pump_desktop_twitter_request(&mut self, elwt: &ActiveEventLoop) {
+        let request = self
+            .vm
+            .as_mut()
+            .and_then(|vm| vm.ctx.globals.twitter_dialog_request.take());
+        let Some(request) = request else {
+            return;
+        };
+
+        if let Some(old) = self.desktop_twitter_window.take() {
+            old.hide();
+        }
+        match DesktopTwitterWindow::new(elwt, request) {
+            Ok(window) => {
+                self.desktop_twitter_window = Some(window);
+                self.sync_desktop_twitter_account();
+            }
+            Err(err) => {
+                log::error!("desktop Twitter window creation failed: {err:#}");
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn handle_desktop_twitter_window_event(&mut self, event: WindowEvent) {
+        self.sync_desktop_twitter_account();
+        let action = self
+            .desktop_twitter_window
+            .as_mut()
+            .and_then(|window| window.handle_window_event(event));
+        let Some(action) = action else {
+            return;
+        };
+
+        match action {
+            DesktopTwitterAction::Close => {
+                if let Some(window) = self.desktop_twitter_window.take() {
+                    window.hide();
+                }
+            }
+            DesktopTwitterAction::Authorize => {
+                let result = self
+                    .vm
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("VM is not available"))
+                    .and_then(|vm| twitter::begin_authorize(&mut vm.ctx));
+                match result {
+                    Ok(_) => {
+                        if let Some(window) = self.desktop_twitter_window.as_mut() {
+                            window.show_authorization_entry();
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(window) = self.desktop_twitter_window.as_mut() {
+                            window.show_error(format!("Twitter 認証を開始できませんでした。\n\n{err:#}"));
+                        }
+                    }
+                }
+                self.sync_desktop_twitter_account();
+            }
+            DesktopTwitterAction::CompleteAuthorize(callback_or_verifier) => {
+                let result = self
+                    .vm
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("VM is not available"))
+                    .and_then(|vm| {
+                        twitter::complete_authorize(&mut vm.ctx, &callback_or_verifier)
+                    });
+                match result {
+                    Ok(()) => {
+                        self.sync_desktop_twitter_account();
+                        if let Some(window) = self.desktop_twitter_window.as_mut() {
+                            window.authentication_succeeded();
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(window) = self.desktop_twitter_window.as_mut() {
+                            window.show_error(format!("Twitter 認証に失敗しました。\n\n{err:#}"));
+                        }
+                    }
+                }
+            }
+            DesktopTwitterAction::Tweet(text) => {
+                let image_path = self
+                    .desktop_twitter_window
+                    .as_ref()
+                    .map(|window| window.image_path().to_path_buf());
+                let result = match (self.vm.as_mut(), image_path) {
+                    (Some(vm), Some(path)) => twitter::tweet(&mut vm.ctx, &text, &path),
+                    _ => Err(anyhow::anyhow!("Twitter dialog lost its VM or capture image")),
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(window) = self.desktop_twitter_window.as_mut() {
+                            window.tweet_succeeded();
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(window) = self.desktop_twitter_window.as_mut() {
+                            window.show_error(format!("Twitter への投稿に失敗しました。\n\n{err:#}"));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2879,9 +3208,25 @@ impl ApplicationHandler for App {
             return;
         }
 
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        if self
+            .desktop_twitter_window
+            .as_ref()
+            .map(|window| window.window_id())
+            == Some(id)
+        {
+            self.handle_desktop_twitter_window_event(event);
+            return;
+        }
+
         let is_main = self.window_id == Some(id);
         let is_hud = self.hud_window_id == Some(id);
         if !is_main && !is_hud {
+            return;
+        }
+        if is_main && self.native_messagebox_pending() {
+            // The original owner window is disabled for the duration of the
+            // blocking MessageBox call; do not queue input for later VM frames.
             return;
         }
         match event {
@@ -3188,7 +3533,17 @@ impl ApplicationHandler for App {
         }
 
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-        self.pump_desktop_messagebox_requests(elwt);
+        {
+            self.pump_desktop_messagebox_requests(elwt);
+            self.pump_desktop_twitter_request(elwt);
+        }
+
+        if self.native_messagebox_pending() {
+            // `tnm_game_warning_box()` does not return until the user chooses a
+            // button.  Freeze the VM exactly at that call boundary.
+            elwt.set_control_flow(ControlFlow::Wait);
+            return;
+        }
 
         let capture_pending = self.args.capture_png.is_some() && !self.captured;
         let continuous_before = self.needs_continuous_frame();
@@ -3250,7 +3605,10 @@ impl ApplicationHandler for App {
             }
             self.apply_syscom_window_config();
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-            self.pump_desktop_messagebox_requests(elwt);
+            {
+                self.pump_desktop_messagebox_requests(elwt);
+                self.pump_desktop_twitter_request(elwt);
+            }
             self.frame_dirty = true;
         }
 
