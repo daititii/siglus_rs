@@ -3863,6 +3863,7 @@ impl<'a> SceneVm<'a> {
     /// as a hard error if a script never reaches a proc/wait boundary.
     pub fn begin_script_proc_pump(&mut self) {
         self.steps = 0;
+        self.ctx.begin_frame_main_proc_pass();
     }
 
     /// Execute one standalone SCRIPT proc pass. Direct callers get a fresh
@@ -3881,12 +3882,20 @@ impl<'a> SceneVm<'a> {
         if self.halted {
             return Ok(false);
         }
+        // A completed MESSAGE_KEY_WAIT can itself request the DISP boundary
+        // used by the original skip-rate limiter. Detect that boundary even
+        // though wait_poll() has just made the VM unblocked.
+        let proc_generation_before_wait = self.ctx.proc_generation();
         if self.is_blocked() {
+            return Ok(true);
+        }
+        if self.ctx.proc_generation() != proc_generation_before_wait {
             return Ok(true);
         }
 
         if !self.script_input_synced_this_frame {
             self.ctx.sync_script_input_from_runtime();
+            self.ctx.begin_input_frame();
             self.ctx.input.next_frame();
             self.script_input_synced_this_frame = true;
         }

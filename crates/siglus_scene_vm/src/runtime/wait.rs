@@ -758,11 +758,22 @@ fn finish_event_wait_by_key(w: &EventWait, globals: &mut GlobalState, ids: &Runt
 pub struct VmWait {
     pub until: Option<Instant>,
     pub until_frame: Option<u64>,
+    /// True only when `until` represents MWND OPEN/CLOSE animation wait.
+    mwnd_animation_wait: bool,
     pub waiting_for_key: bool,
+    /// TNM_PROC_TYPE_KEY_WAIT created by KEYLIST.WAIT/WAIT_FORCE. Selection
+    /// waits also use `waiting_for_key`, so this separate bit prevents skip
+    /// from accidentally accepting a selection.
+    generic_key_wait: bool,
+    generic_key_wait_skip_disabled: bool,
     /// TNM_PROC_TYPE_MESSAGE_WAIT: block only until the typewriter has
     /// revealed the complete message.  This is deliberately distinct from
     /// MESSAGE_KEY_WAIT, which waits for user input after reveal.
     pub message_reveal: bool,
+    /// PP/R/PAGE push MESSAGE_KEY_WAIT below MESSAGE_WAIT. It must not become
+    /// active until MESSAGE_WAIT has popped.
+    message_key_after_reveal: bool,
+    message_key_wait: bool,
     /// If set, a key press cancels the current time wait (TIMEWAIT_KEY behavior).
     skip_time_on_key: bool,
 
@@ -810,6 +821,8 @@ impl VmWait {
 
     pub fn needs_runtime_poll(&self) -> bool {
         self.message_reveal
+            || self.message_key_wait
+            || self.generic_key_wait
             || self.until.is_some()
             || self.until_frame.is_some()
             || self.audio.is_some()
@@ -861,6 +874,7 @@ impl VmWait {
                 let key_skippable_timewait = self.skip_time_on_key;
                 self.until = None;
                 self.skip_time_on_key = false;
+                self.mwnd_animation_wait = false;
                 if key_skippable_timewait {
                     anim_skip_trace("timewait_key naturally finished pending=0");
                     self.pending_value = Some(Value::Int(0));
@@ -868,10 +882,31 @@ impl VmWait {
             }
         }
 
+        // C++ TIMEWAIT/TIMEWAIT_KEY are released immediately by global skip
+        // unless the current proc has skip_disable_flag. TIMEWAIT_KEY returns
+        // the same 0 value as a natural timeout.
+        if skipping && self.until.is_some() {
+            let return_value = self.skip_time_on_key;
+            self.until = None;
+            self.skip_time_on_key = false;
+            self.mwnd_animation_wait = false;
+            if return_value {
+                self.pending_value = Some(Value::Int(0));
+            }
+        }
+
         if let Some(frame) = self.until_frame {
             if globals.render_frame >= frame {
                 self.until_frame = None;
             }
+        }
+
+        // KEYLIST.WAIT is TNM_PROC_TYPE_KEY_WAIT and obeys global skip.
+        // WAIT_FORCE sets C_tnm_proc::skip_disable_flag, so it remains blocked.
+        if skipping && self.generic_key_wait && !self.generic_key_wait_skip_disabled {
+            self.generic_key_wait = false;
+            self.generic_key_wait_skip_disabled = false;
+            self.waiting_for_key = false;
         }
 
         // Auto-clear audio waits when the predicate is satisfied.
@@ -1046,6 +1081,21 @@ impl VmWait {
             self.event_return_value = false;
         }
 
+        // COUNTER.WAIT/WAIT_KEY is represented by CounterThreshold. Unlike
+        // general INTEVENT waits, the original counter flow proc releases on
+        // global skip and WAIT_KEY returns 0.
+        if skipping
+            && matches!(self.event, Some(EventWait::CounterThreshold { .. }))
+        {
+            self.event = None;
+            self.event_key_skip = false;
+            if self.event_return_value {
+                self.pending_value = Some(Value::Int(0));
+            }
+            self.event_return_value = false;
+            self.waiting_for_key = false;
+        }
+
         if self
             .quake
             .map(|wait| !quake_wait_active(globals, wait))
@@ -1054,6 +1104,13 @@ impl VmWait {
             self.quake = None;
             self.quake_key_skip = false;
             self.waiting_for_key = false;
+        }
+        if skipping {
+            if let Some(wait) = self.quake.take() {
+                stop_waited_quake(globals, wait);
+                self.quake_key_skip = false;
+                self.waiting_for_key = false;
+            }
         }
 
         // Auto-clear GLOBAL.MOV waits when playback ends.
@@ -1169,6 +1226,21 @@ impl VmWait {
         self.mark_block_request();
         self.until = Some(Instant::now() + Duration::from_millis(ms));
         self.skip_time_on_key = false;
+        self.mwnd_animation_wait = false;
+    }
+
+    pub fn wait_mwnd_animation(&mut self, ms: u64) {
+        if ms == 0 {
+            return;
+        }
+        self.mark_block_request();
+        self.until = Some(Instant::now() + Duration::from_millis(ms));
+        self.skip_time_on_key = false;
+        self.mwnd_animation_wait = true;
+    }
+
+    pub fn mwnd_animation_waiting(&self) -> bool {
+        self.mwnd_animation_wait && self.until.is_some()
     }
 
     pub fn wait_next_frame(&mut self, current_frame: u64) {
@@ -1186,12 +1258,20 @@ impl VmWait {
         self.mark_block_request();
         self.until = Some(Instant::now() + Duration::from_millis(ms));
         self.skip_time_on_key = true;
+        self.mwnd_animation_wait = false;
         anim_skip_trace(format!("wait_ms_key start ms={} block_generation={}", ms, self.block_generation));
     }
 
     pub fn wait_key(&mut self) {
         self.mark_block_request();
         self.waiting_for_key = true;
+    }
+
+    pub fn wait_input_key(&mut self, skip_disabled: bool) {
+        self.mark_block_request();
+        self.waiting_for_key = true;
+        self.generic_key_wait = true;
+        self.generic_key_wait_skip_disabled = skip_disabled;
     }
 
     pub fn waiting_for_key(&self) -> bool {
@@ -1201,14 +1281,41 @@ impl VmWait {
     pub fn wait_message_reveal(&mut self) {
         self.mark_block_request();
         self.message_reveal = true;
+        self.message_key_after_reveal = false;
+    }
+
+    pub fn wait_message_reveal_then_key(&mut self) {
+        self.mark_block_request();
+        self.message_reveal = true;
+        self.message_key_after_reveal = true;
+        self.message_key_wait = false;
     }
 
     pub fn message_reveal_waiting(&self) -> bool {
         self.message_reveal
     }
 
-    pub fn finish_message_reveal(&mut self) {
+    /// Pop MESSAGE_WAIT and expose the MESSAGE_KEY_WAIT that PP/R/PAGE had
+    /// already pushed below it. Returns true when that second proc became active.
+    pub fn finish_message_reveal(&mut self) -> bool {
         self.message_reveal = false;
+        if self.message_key_after_reveal {
+            self.message_key_after_reveal = false;
+            self.message_key_wait = true;
+            self.waiting_for_key = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn message_key_waiting(&self) -> bool {
+        self.message_key_wait
+    }
+
+    pub fn finish_message_key_wait(&mut self) {
+        self.message_key_wait = false;
+        self.waiting_for_key = false;
     }
 
     pub fn wait_quake(&mut self, wait: QuakeWait, key_skip: bool) {
@@ -1503,6 +1610,8 @@ impl VmWait {
     pub fn notify_key(&mut self, _globals: &mut GlobalState, _ids: &RuntimeConstants) -> bool {
         let wipe_skipped = self.wipe && self.wipe_key_skip;
         self.waiting_for_key = false;
+        self.generic_key_wait = false;
+        self.generic_key_wait_skip_disabled = false;
         // C++ TIMEWAIT_KEY, event WAIT_KEY, and MOV/OBJECT movie waits are
         // not skipped by arbitrary key-down/mouse-down input here. They
         // consume DECIDE/CANCEL down-up in notify_movie_down_up(). Audio
@@ -1638,8 +1747,13 @@ impl VmWait {
 
     pub fn clear(&mut self) {
         self.until = None;
+        self.mwnd_animation_wait = false;
         self.waiting_for_key = false;
+        self.generic_key_wait = false;
+        self.generic_key_wait_skip_disabled = false;
         self.message_reveal = false;
+        self.message_key_after_reveal = false;
+        self.message_key_wait = false;
         self.skip_time_on_key = false;
         self.audio = None;
         self.audio_key_skip = false;
@@ -1725,6 +1839,56 @@ mod audio_wait_parity_tests {
         assert!(!wait.audio_key_skip);
         assert!(!wait.waiting_for_key);
         assert_eq!(wait.pending_value.take().and_then(|v| v.as_i64()), Some(0));
+    }
+
+    #[test]
+    fn message_wait_preserves_cpp_proc_stack_order() {
+        let mut wait = VmWait::default();
+
+        wait.wait_message_reveal_then_key();
+        assert!(wait.message_reveal_waiting());
+        assert!(!wait.message_key_waiting());
+        assert!(!wait.waiting_for_key());
+
+        assert!(wait.finish_message_reveal());
+        assert!(!wait.message_reveal_waiting());
+        assert!(wait.message_key_waiting());
+        assert!(wait.waiting_for_key());
+
+        wait.finish_message_key_wait();
+        assert!(!wait.message_key_waiting());
+        assert!(!wait.waiting_for_key());
+    }
+
+    #[test]
+    fn keylist_wait_obeys_skip_but_wait_force_does_not() {
+        let (mut bgm, mut koe, mut se, mut pcm) = engines();
+        let mut globals = GlobalState::default();
+        let ids = RuntimeConstants::default();
+
+        let mut wait = VmWait::default();
+        wait.wait_input_key(false);
+        assert!(!wait.is_blocked(
+            &mut bgm,
+            &mut koe,
+            &mut se,
+            &mut pcm,
+            &mut globals,
+            &ids,
+            true,
+        ));
+
+        let mut forced = VmWait::default();
+        forced.wait_input_key(true);
+        assert!(forced.is_blocked(
+            &mut bgm,
+            &mut koe,
+            &mut se,
+            &mut pcm,
+            &mut globals,
+            &ids,
+            true,
+        ));
     }
 
     #[test]

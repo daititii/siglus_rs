@@ -2332,6 +2332,22 @@ impl UiRuntime {
         self.begin_message_window_anim(false, anime_type, duration_ms.max(0) as u64, true);
     }
 
+    pub fn finish_mwnd_animation(&mut self) {
+        // C_elm_mwnd::end_open_anime/end_close_anime: snap the active
+        // transition to its target state instead of merely releasing the wait.
+        self.mwnd.anim.started_at = None;
+        self.mwnd.anim.duration_ms = 0;
+        self.mwnd.anim.progress = if self.mwnd.anim.target_visible { 1.0 } else { 0.0 };
+        self.mwnd.anim.from = self.mwnd.anim.progress;
+        self.mwnd.anim.to = self.mwnd.anim.progress;
+        self.mwnd.anim.visible = self.mwnd.anim.target_visible;
+        if !self.mwnd.anim.target_visible && self.mwnd.anim.clear_text_on_close_end {
+            self.mwnd.anim.clear_text_on_close_end = false;
+            self.clear_message();
+            self.clear_name();
+        }
+    }
+
     pub fn set_message_filter(&mut self, img: Option<ImageId>) {
         self.mwnd.waku.filter_image = img;
     }

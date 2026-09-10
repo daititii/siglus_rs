@@ -450,6 +450,37 @@ pub struct CommandContext {
     /// the flag only after the form handler returns.
     pending_mwnd_read_flag_target: Option<(u32, i64, usize, i64)>,
 
+    // Original C_tnm_global skip state.  SCRIPT.skip_trigger is local/armed;
+    // these fields are global frame/runtime state and deliberately live outside
+    // ScriptRuntimeState so EXCALL/local-state replacement cannot erase an
+    // already activated skip.
+    skip_because_skip_trigger: bool,
+    msg_wait_skip_by_click: bool,
+    read_skip_enable_flag: bool,
+    cant_auto_skip_before_click: bool,
+    // C_tnm_btn_mng keeps the active button across DECIDE down/up even when
+    // C_elm_object::button_event() later rejects a DISABLE button. Keep that
+    // capture separate from event/action state so a disabled toolbar button
+    // can consume the click without producing sounds or actions.
+    button_decide_capture: bool,
+
+    // flow_proc.cpp::tnm_message_key_wait_proc() deliberately yields back to
+    // drawing while message skip is active instead of draining every skipped
+    // MESSAGE_KEY_WAIT in one frame_main_proc pass.  The original engine tunes
+    // how many message waits may be consumed between draws from its rolling
+    // ~1-second frame-rate sample.  Keep the same global counters here.
+    disp_because_msg_wait_cnt: i32,
+    disp_because_msg_wait_cnt_max: i32,
+    frame_rate_100msec: [i32; 10],
+    frame_rate_100msec_index: usize,
+    frame_rate_100msec_total: i32,
+    frame_rate_bucket_frame_cnt: u32,
+    frame_rate_bucket_elapsed_ms: u64,
+    // Gp_timer->real_time is refreshed at the start of each original
+    // frame_main_proc pass.  The port needs an equivalent wall-clock guard so
+    // one aggressive skip pump cannot monopolize the event loop for >100 ms.
+    frame_main_proc_started_at: Option<crate::platform_time::Instant>,
+
     /// Deferred VM-owned save request. The form handler can only see CommandContext;
     /// the VM consumes this after the command returns so the saved stream includes
     /// the current lexer pc and stacks.
@@ -544,7 +575,14 @@ impl CommandContext {
     pub fn submit_read_flag_no(&mut self, value: i32) {
         if std::mem::take(&mut self.pending_selbtn_read_flag_no) {
             self.pending_mwnd_read_flag_target = None;
+            let scene_no = self.current_scene_no.unwrap_or(-1);
+            self.globals.selbtn.read_flag_scene_no = scene_no;
             self.globals.selbtn.read_flag_flag_no = value as i64;
+            // eng_message.cpp::tnm_msg_proc_selbtn_start() updates the current
+            // read flag and both read-skip/auto-skip gates before starting the
+            // selection proc.  The previous port only stored SELBTN's flag, so
+            // toolbar READ_SKIP could retain stale eligibility across choices.
+            self.set_current_read_flag_for_skip(scene_no, value as i64);
             return;
         }
 
@@ -553,8 +591,7 @@ impl CommandContext {
         else {
             return;
         };
-        self.globals.script.cur_read_flag_scn_no = scene_no;
-        self.globals.script.cur_read_flag_flag_no = value as i64;
+        self.set_current_read_flag_for_skip(scene_no, value as i64);
         let mut commit_now = false;
         if let Some(mwnd) = self
             .globals
@@ -644,6 +681,9 @@ impl CommandContext {
         self.pending_mwnd_read_flag_target = None;
         self.pending_sel_point_result = None;
         self.frame_clock_last = None;
+        self.frame_main_proc_started_at = None;
+        self.disp_because_msg_wait_cnt = 0;
+        self.disp_because_msg_wait_cnt_max = 0;
         self.last_button_hover_sound_pos = None;
         // The save/load menu runs as an EXCALL scene. Loading replaces that
         // script context without executing EXCALL.FREE, so its ready flag must
@@ -906,9 +946,80 @@ impl CommandContext {
         skipped
     }
 
+    fn runtime_ctrl_skip_flags(&self) -> (bool, bool) {
+        // eng_frame.cpp suppresses Ctrl/Ctrl+Shift skip while an editbox owns
+        // keyboard focus. Ctrl+Shift is message-only skip (`cs_skip_flag`).
+        if self.globals.focused_editbox.is_some() {
+            return (false, false);
+        }
+        let ctrl = self.input.vk_is_down(0x11);
+        let shift = self.input.vk_is_down(0x10);
+        (ctrl && !shift, ctrl && shift)
+    }
+
+    fn runtime_is_skip_unread_msg(&self) -> bool {
+        let configured = self
+            .globals
+            .syscom
+            .config_int
+            .get(&syscom_op::GET_SKIP_UNREAD_MESSAGE_ONOFF)
+            .copied()
+            .unwrap_or_else(|| {
+                if self.globals.syscom.original_config.skip_unread_message_flag { 1 } else { 0 }
+            })
+            != 0;
+        self.globals.script.skip_unread_message || configured
+    }
+
+    fn runtime_read_skip_is_enable(&self) -> bool {
+        let f = self.globals.syscom.read_skip;
+        f.enable
+            && f.exist
+            && (self.runtime_is_skip_unread_msg() || self.read_skip_enable_flag)
+    }
+
+    fn set_current_read_flag_for_skip(&mut self, scene_no: i64, flag_no: i64) {
+        self.globals.script.cur_read_flag_scn_no = scene_no;
+        self.globals.script.cur_read_flag_flag_no = flag_no;
+        // eng_message.cpp updates against the previously committed value. The
+        // new flag is only committed later by tnm_msg_proc_clear_ready().
+        self.runtime_update_read_skip();
+        self.runtime_update_start_skip();
+    }
+
+    fn runtime_update_read_skip(&mut self) {
+        let scene_no = self.globals.script.cur_read_flag_scn_no;
+        let flag_no = self.globals.script.cur_read_flag_flag_no;
+        self.read_skip_enable_flag = self.globals.read_flag(scene_no, flag_no);
+        if !self.read_skip_enable_flag && !self.runtime_is_skip_unread_msg() {
+            self.globals.syscom.read_skip.onoff = false;
+            self.cant_auto_skip_before_click = true;
+        }
+        if !self.runtime_read_skip_is_enable() {
+            self.globals.syscom.read_skip.onoff = false;
+        }
+    }
+
+    fn runtime_update_start_skip(&mut self) {
+        if self.cant_auto_skip_before_click {
+            return;
+        }
+        if self.globals.syscom.auto_skip.onoff
+            && (self.read_skip_enable_flag || self.runtime_is_skip_unread_msg())
+            && self.runtime_read_skip_is_enable()
+        {
+            self.globals.syscom.read_skip.onoff = true;
+        }
+    }
+
+    fn runtime_update_read_skip_menu(&mut self) {
+        if !self.runtime_read_skip_is_enable() {
+            self.globals.syscom.read_skip.onoff = false;
+        }
+    }
+
     fn runtime_is_skipping(&self) -> bool {
-        // eng_frame.cpp suppresses skip acceleration while message-back is
-        // open, even if Ctrl/read-skip/script-trigger remain logically set.
+        // Exact ordering from eng_etc.cpp::tnm_is_skipping().
         if self.globals.syscom.msg_back_open {
             return false;
         }
@@ -916,13 +1027,105 @@ impl CommandContext {
         if script.ctrl_disable {
             return false;
         }
-        if self.input.vk_is_down(0x11) {
+        let (ctrl_skip, _) = self.runtime_ctrl_skip_flags();
+        if ctrl_skip {
             return true;
         }
         if script.skip_disable {
             return false;
         }
-        script.skip_trigger || self.globals.syscom.read_skip.onoff
+        self.skip_because_skip_trigger || self.globals.syscom.read_skip.onoff
+    }
+
+    fn runtime_is_skipping_msg(&self) -> bool {
+        // Exact ordering from eng_etc.cpp::tnm_is_skipping_msg().
+        if self.globals.syscom.msg_back_open {
+            return false;
+        }
+        let script = &self.globals.script;
+        if script.ctrl_disable {
+            return false;
+        }
+        let (ctrl_skip, ctrl_shift_skip) = self.runtime_ctrl_skip_flags();
+        if ctrl_skip || ctrl_shift_skip {
+            return true;
+        }
+        if script.skip_disable {
+            return false;
+        }
+        self.skip_because_skip_trigger || self.globals.syscom.read_skip.onoff
+    }
+
+    fn clear_script_trigger_skip(&mut self) {
+        self.skip_because_skip_trigger = false;
+    }
+
+    fn register_skip_user_action(&mut self) {
+        // eng_frame.cpp drops the auto-skip guard on DECIDE/CANCEL/Ctrl down.
+        self.cant_auto_skip_before_click = false;
+    }
+
+    fn stop_read_skip_by_decide_down(&mut self, vk: u8) -> bool {
+        self.register_skip_user_action();
+        // eng_frame.cpp consumes DECIDE-DOWN when it stops read-skip. tona3's
+        // BUTTON::use_down_stock() also clears down_up_stock, which is crucial:
+        // the matching release must not advance MESSAGE_KEY_WAIT as a second
+        // logical click.
+        if self.globals.syscom.read_skip.onoff
+            && !self.globals.script.not_stop_skip_by_click
+            && self.input.use_vk_down_stock(vk)
+        {
+            self.globals.syscom.read_skip.onoff = false;
+            self.cant_auto_skip_before_click = true;
+            return true;
+        }
+        false
+    }
+
+    /// eng_frame.cpp script-trigger promotion for a DECIDE source. Returns true
+    /// iff this input edge was consumed by the trigger logic.
+    fn process_script_skip_trigger_decide(&mut self, vk: u8) -> bool {
+        if self.excall_state.ex_call_flag || !self.globals.script.skip_trigger {
+            return false;
+        }
+
+        if self.wait.message_reveal_waiting() && !self.ui.message_wait_text_fully_revealed() {
+            if self.globals.script.not_skip_msg_by_click
+                || !self.input.use_vk_down_up_stock(vk)
+            {
+                return false;
+            }
+            self.msg_wait_skip_by_click = true;
+            self.ui.reveal_message_now();
+            return true;
+        }
+
+        // Fully revealed text uses UP stock in the original, not DOWN_UP.
+        // Consuming UP also invalidates the pair and prevents the same physical
+        // release from immediately advancing MESSAGE_KEY_WAIT.
+        if self.input.use_vk_up_stock(vk) {
+            self.skip_because_skip_trigger = true;
+            return true;
+        }
+        false
+    }
+
+    /// Wheel-down follows the same script-trigger state transition, but the
+    /// platform event itself is already the consumable stock.
+    fn process_script_skip_trigger_wheel_down(&mut self) -> bool {
+        if self.excall_state.ex_call_flag || !self.globals.script.skip_trigger {
+            return false;
+        }
+        if self.wait.message_reveal_waiting() && !self.ui.message_wait_text_fully_revealed() {
+            if self.globals.script.not_skip_msg_by_click {
+                return false;
+            }
+            self.msg_wait_skip_by_click = true;
+            self.ui.reveal_message_now();
+            return true;
+        }
+        self.skip_because_skip_trigger = true;
+        true
     }
 
     fn should_wheel_advance_message(&self) -> bool {
@@ -1090,6 +1293,12 @@ impl CommandContext {
             self.ui.reveal_message_now();
             return true;
         }
+        // MESSAGE_WAIT completing is not itself a click/key wait. PP/R/PAGE
+        // expose MESSAGE_KEY_WAIT only after the reveal proc has popped.
+        if !self.wait.message_key_waiting() {
+            return false;
+        }
+        self.wait.finish_message_key_wait();
         match self.ui.end_wait_message() {
             ui::MessageWaitClearAction::None => {}
             ui::MessageWaitClearAction::Clear => self.clear_current_mwnd_after_wait(),
@@ -1107,6 +1316,9 @@ impl CommandContext {
     }
 
     fn clear_current_mwnd_after_wait(&mut self) {
+        // eng_message.cpp::tnm_msg_proc_clear_ready stops a sustained
+        // SCRIPT.SET_SKIP_TRIGGER skip at the normal clear boundary.
+        self.clear_script_trigger_skip();
         let default_form_id = if self.ids.form_global_stage != 0 {
             self.ids.form_global_stage
         } else {
@@ -1212,6 +1424,19 @@ impl CommandContext {
             pending_read_flag_no: false,
             pending_selbtn_read_flag_no: false,
             pending_mwnd_read_flag_target: None,
+            skip_because_skip_trigger: false,
+            msg_wait_skip_by_click: false,
+            read_skip_enable_flag: false,
+            cant_auto_skip_before_click: false,
+            button_decide_capture: false,
+            disp_because_msg_wait_cnt: 0,
+            disp_because_msg_wait_cnt_max: 0,
+            frame_rate_100msec: [0; 10],
+            frame_rate_100msec_index: 0,
+            frame_rate_100msec_total: 0,
+            frame_rate_bucket_frame_cnt: 0,
+            frame_rate_bucket_elapsed_ms: 0,
+            frame_main_proc_started_at: None,
             pending_runtime_save: None,
             pending_runtime_load: None,
             runtime_load_completed: false,
@@ -1972,6 +2197,19 @@ impl CommandContext {
         self.pending_read_flag_no = false;
         self.pending_selbtn_read_flag_no = false;
         self.pending_mwnd_read_flag_target = None;
+        self.skip_because_skip_trigger = false;
+        self.msg_wait_skip_by_click = false;
+        self.read_skip_enable_flag = false;
+        self.cant_auto_skip_before_click = false;
+        self.button_decide_capture = false;
+        self.disp_because_msg_wait_cnt = 0;
+        self.disp_because_msg_wait_cnt_max = 0;
+        self.frame_rate_100msec = [0; 10];
+        self.frame_rate_100msec_index = 0;
+        self.frame_rate_100msec_total = 0;
+        self.frame_rate_bucket_frame_cnt = 0;
+        self.frame_rate_bucket_elapsed_ms = 0;
+        self.frame_main_proc_started_at = None;
         self.pending_runtime_save = None;
         self.pending_runtime_load = None;
         self.runtime_load_completed = false;
@@ -2102,6 +2340,7 @@ impl CommandContext {
         let Some(form_id) = self.active_button_stage_form_id() else {
             return;
         };
+        let read_skip_runtime_enabled = self.runtime_read_skip_is_enable();
         let mut hit_sounds = Vec::new();
         if sg_input_trace_enabled() {
             eprintln!("[SG_DEBUG][INPUT] hover mouse=({}, {})", mx, my);
@@ -2191,6 +2430,7 @@ impl CommandContext {
                             gfx,
                             ids,
                             &self.globals.syscom,
+                            read_skip_runtime_enabled,
                             stage_idx,
                             group_idx,
                             mx,
@@ -2205,15 +2445,23 @@ impl CommandContext {
 
                     if !tied {
                         if let Some(hit) = best {
-                            g.hit_button_no = hit.button_no;
-                            g.hit_runtime_slot = Some(hit.runtime_slot);
+                            if hit.event_enabled {
+                                g.hit_button_no = hit.button_no;
+                                g.hit_runtime_slot = Some(hit.runtime_slot);
+                            } else {
+                                // The native button manager still owns the hit,
+                                // but C_elm_object::button_event() returns before
+                                // notifying its group when the real state is DISABLE.
+                                g.hit_button_no = -1;
+                                g.hit_runtime_slot = None;
+                            }
                             if sg_debug_enabled() {
                                 eprintln!(
                                     "[SG_DEBUG][INPUT] group stage={} group={} hit_button={} slot={} order={} started={} pushed={} decided={}",
                                     stage_idx, group_idx, hit.button_no, hit.runtime_slot, hit.sort_key.display_tuple(), g.started, g.pushed_button_no, g.decided_button_no
                                 );
                             }
-                            if play_hover_sound && !hit.was_hit {
+                            if hit.event_enabled && play_hover_sound && !hit.was_hit {
                                 hit_sounds.push(hit.se_no);
                             }
                             for (obj_idx, obj) in objs.iter_mut().enumerate() {
@@ -2287,6 +2535,8 @@ impl CommandContext {
                         gfx,
                         ids,
                         &self.globals.syscom,
+                        read_skip_runtime_enabled,
+                        None,
                         *stage_idx,
                         mx,
                         my,
@@ -2300,7 +2550,7 @@ impl CommandContext {
             }
             if !standalone_tied {
                 if let Some(hit) = standalone_best {
-                    if play_hover_sound && !hit.was_hit {
+                    if hit.event_enabled && play_hover_sound && !hit.was_hit {
                         hit_sounds.push(hit.se_no);
                     }
                     for stage_idx in &stage_ids {
@@ -2389,12 +2639,6 @@ impl CommandContext {
                             let skip = {
                                 let obj = &mwnd.button_list[button_idx];
                                 !object_button_renderable_by_syscom(&self.globals.syscom, obj)
-                                    || button_effective_disabled(
-                                        &self.globals.syscom,
-                                        obj,
-                                        Some(button_idx),
-                                    )
-                                    || self.globals.syscom.mwnd_btn_touch_disable
                             };
                             if skip {
                                 continue;
@@ -2412,6 +2656,8 @@ impl CommandContext {
                                 gfx,
                                 ids,
                                 &self.globals.syscom,
+                                read_skip_runtime_enabled,
+                                Some(button_idx),
                                 *stage_idx,
                                 mx,
                                 my,
@@ -2435,6 +2681,8 @@ impl CommandContext {
                                 gfx,
                                 ids,
                                 &self.globals.syscom,
+                                read_skip_runtime_enabled,
+                                None,
                                 *stage_idx,
                                 mx,
                                 my,
@@ -2458,6 +2706,8 @@ impl CommandContext {
                                 gfx,
                                 ids,
                                 &self.globals.syscom,
+                                read_skip_runtime_enabled,
+                                None,
                                 *stage_idx,
                                 mx,
                                 my,
@@ -2472,7 +2722,7 @@ impl CommandContext {
                 }
                 if !standalone_tied {
                     if let Some(hit) = standalone_best {
-                        if play_hover_sound && !hit.was_hit {
+                        if hit.event_enabled && play_hover_sound && !hit.was_hit {
                             hit_sounds.push(hit.se_no);
                         }
                         for stage_idx in &stage_ids {
@@ -2636,6 +2886,7 @@ impl CommandContext {
         let Some(form_id) = self.active_button_stage_form_id() else {
             return false;
         };
+        let read_skip_runtime_enabled = self.runtime_read_skip_is_enable();
         let mut template_sounds = Vec::new();
         let mut direct_sounds = Vec::new();
         let mut consumed_button = false;
@@ -2721,12 +2972,16 @@ impl CommandContext {
                             {
                                 continue;
                             }
-                            if standalone_button_hit_recursive(obj) {
+                            if registered_button_hit_recursive(obj) {
                                 consumed_button = true;
                             }
-                            if let Some(se_no) =
-                                mark_standalone_button_pushed_from_hit_recursive(obj_idx, obj)
-                            {
+                            if let Some(se_no) = mark_standalone_button_pushed_from_hit_recursive(
+                                obj_idx,
+                                obj,
+                                &self.globals.syscom,
+                                read_skip_runtime_enabled,
+                                None,
+                            ) {
                                 template_sounds.push(se_no);
                             }
                         }
@@ -2805,50 +3060,53 @@ impl CommandContext {
                             continue;
                         }
                         for (button_idx, obj) in mwnd.button_list.iter_mut().enumerate() {
-                            if !object_button_renderable_by_syscom(&syscom, obj)
-                                || button_effective_disabled(&syscom, obj, Some(button_idx))
-                                || syscom.mwnd_btn_touch_disable
-                            {
+                            if !object_button_renderable_by_syscom(&syscom, obj) {
                                 continue;
                             }
-                            if standalone_button_hit_recursive(obj) {
+                            if registered_button_hit_recursive(obj) {
                                 consumed_button = true;
                             }
-                            if let Some(se_no) =
-                                mark_standalone_button_pushed_from_hit_recursive(button_idx, obj)
-                            {
+                            if let Some(se_no) = mark_standalone_button_pushed_from_hit_recursive(
+                                button_idx,
+                                obj,
+                                &syscom,
+                                read_skip_runtime_enabled,
+                                Some(button_idx),
+                            ) {
                                 template_sounds.push(se_no);
                             }
                         }
                         for (face_idx, obj) in mwnd.face_list.iter_mut().enumerate() {
-                            if !object_button_renderable_by_syscom(&syscom, obj)
-                                || button_effective_disabled(&syscom, obj, None)
-                                || syscom.mwnd_btn_touch_disable
-                            {
+                            if !object_button_renderable_by_syscom(&syscom, obj) {
                                 continue;
                             }
-                            if standalone_button_hit_recursive(obj) {
+                            if registered_button_hit_recursive(obj) {
                                 consumed_button = true;
                             }
-                            if let Some(se_no) =
-                                mark_standalone_button_pushed_from_hit_recursive(face_idx, obj)
-                            {
+                            if let Some(se_no) = mark_standalone_button_pushed_from_hit_recursive(
+                                face_idx,
+                                obj,
+                                &syscom,
+                                read_skip_runtime_enabled,
+                                None,
+                            ) {
                                 template_sounds.push(se_no);
                             }
                         }
                         for (object_idx, obj) in mwnd.object_list.iter_mut().enumerate() {
-                            if !object_button_renderable_by_syscom(&syscom, obj)
-                                || button_effective_disabled(&syscom, obj, None)
-                                || syscom.mwnd_btn_touch_disable
-                            {
+                            if !object_button_renderable_by_syscom(&syscom, obj) {
                                 continue;
                             }
-                            if standalone_button_hit_recursive(obj) {
+                            if registered_button_hit_recursive(obj) {
                                 consumed_button = true;
                             }
-                            if let Some(se_no) =
-                                mark_standalone_button_pushed_from_hit_recursive(object_idx, obj)
-                            {
+                            if let Some(se_no) = mark_standalone_button_pushed_from_hit_recursive(
+                                object_idx,
+                                obj,
+                                &syscom,
+                                read_skip_runtime_enabled,
+                                None,
+                            ) {
                                 template_sounds.push(se_no);
                             }
                         }
@@ -2858,6 +3116,13 @@ impl CommandContext {
         }
 
         let consumed = consumed_button || !template_sounds.is_empty() || !direct_sounds.is_empty();
+        if consumed && matches!(b, input::VmMouseButton::Left) {
+            // C_tnm_btn_mng::hit_test_proc owns the active button until the
+            // matching release. This capture exists even when button_event()
+            // rejects DISABLE, so both DECIDE edges must remain out of script.
+            self.button_decide_capture = true;
+            let _ = self.input.use_vk_down_stock(0x01);
+        }
         for se_no in template_sounds {
             self.play_button_template_se(se_no, ButtonSeEvent::Push);
         }
@@ -2871,6 +3136,7 @@ impl CommandContext {
         if !matches!(b, input::VmMouseButton::Left) {
             return false;
         }
+        let captured_by_button_manager = std::mem::take(&mut self.button_decide_capture);
 
         self.update_object_button_hover();
         if self.handle_mwnd_message_button_mouse_up() {
@@ -2878,8 +3144,13 @@ impl CommandContext {
         }
 
         let Some(form_id) = self.active_button_stage_form_id() else {
-            return false;
+            if captured_by_button_manager {
+                let _ = self.input.use_vk_up_stock(0x01);
+            }
+            return captured_by_button_manager;
         };
+        let read_skip_runtime_enabled = self.runtime_read_skip_is_enable();
+        let syscom = self.globals.syscom.clone();
         let mut pending_button_actions = Vec::new();
         let mut sounds = Vec::new();
         let mut consumed_button = false;
@@ -2921,7 +3192,18 @@ impl CommandContext {
                     if released_on_same_button {
                         let was_waiting = g.wait_flag;
                         let action_slot = pushed_slot.unwrap();
-                        if g.decide(pushed) {
+                        let event_enabled = object_lists
+                            .get(&stage_idx)
+                            .map(|objs| {
+                                button_event_enabled_in_list_by_runtime_slot(
+                                    objs,
+                                    action_slot,
+                                    &syscom,
+                                    read_skip_runtime_enabled,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if event_enabled && g.decide(pushed) {
                             if sg_debug_enabled() {
                                 eprintln!(
                                     "[SG_DEBUG][GROUP] decide form={} stage={} group={} button={} slot={} wait={}",
@@ -2996,6 +3278,9 @@ impl CommandContext {
                         obj,
                         &mut pending_button_actions,
                         &mut sounds,
+                        &syscom,
+                        read_skip_runtime_enabled,
+                        None,
                     );
                 }
             }
@@ -3049,7 +3334,7 @@ impl CommandContext {
                         }
                         for (button_idx, obj) in mwnd.button_list.iter().enumerate() {
                             if !object_button_renderable_by_syscom(&syscom, obj)
-                                || button_effective_disabled(&syscom, obj, Some(button_idx))
+                                || button_effective_disabled(&syscom, obj, Some(button_idx), read_skip_runtime_enabled)
                                 || syscom.mwnd_btn_touch_disable
                             {
                                 continue;
@@ -3058,11 +3343,14 @@ impl CommandContext {
                                 obj,
                                 &mut pending_button_actions,
                                 &mut sounds,
+                                &syscom,
+                                read_skip_runtime_enabled,
+                                Some(button_idx),
                             );
                         }
                         for obj in &mwnd.face_list {
                             if !object_button_renderable_by_syscom(&syscom, obj)
-                                || button_effective_disabled(&syscom, obj, None)
+                                || button_effective_disabled(&syscom, obj, None, read_skip_runtime_enabled)
                                 || syscom.mwnd_btn_touch_disable
                             {
                                 continue;
@@ -3071,11 +3359,14 @@ impl CommandContext {
                                 obj,
                                 &mut pending_button_actions,
                                 &mut sounds,
+                                &syscom,
+                                read_skip_runtime_enabled,
+                                None,
                             );
                         }
                         for obj in &mwnd.object_list {
                             if !object_button_renderable_by_syscom(&syscom, obj)
-                                || button_effective_disabled(&syscom, obj, None)
+                                || button_effective_disabled(&syscom, obj, None, read_skip_runtime_enabled)
                                 || syscom.mwnd_btn_touch_disable
                             {
                                 continue;
@@ -3084,6 +3375,9 @@ impl CommandContext {
                                 obj,
                                 &mut pending_button_actions,
                                 &mut sounds,
+                                &syscom,
+                                read_skip_runtime_enabled,
+                                None,
                             );
                         }
                     }
@@ -3107,7 +3401,16 @@ impl CommandContext {
             }
         }
 
-        let consumed = consumed_button || !pending_button_actions.is_empty() || !sounds.is_empty();
+        let consumed = captured_by_button_manager
+            || consumed_button
+            || !pending_button_actions.is_empty()
+            || !sounds.is_empty();
+        if consumed {
+            // The native button manager consumes DECIDE-UP before
+            // C_elm_object::button_event() checks DISABLE.  Without this, a
+            // toolbar click can leak into SCRIPT.SET_SKIP_TRIGGER/message wait.
+            let _ = self.input.use_vk_up_stock(0x01);
+        }
         self.globals
             .pending_button_actions
             .extend(pending_button_actions);
@@ -3179,6 +3482,15 @@ impl CommandContext {
         if !input_recorded {
             self.input.on_key_down(k);
         }
+        match k {
+            input::VmKey::Enter | input::VmKey::Space => {
+                if let Some(vk) = input::vmkey_to_vk_code(k) {
+                    let _ = self.stop_read_skip_by_decide_down(vk);
+                }
+            }
+            input::VmKey::Escape | input::VmKey::Control => self.register_skip_user_action(),
+            _ => {}
+        }
         if Self::is_modifier_key(k) {
             return;
         }
@@ -3238,9 +3550,6 @@ impl CommandContext {
             }
         }
 
-        if !self.advance_message_wait(true) {
-            self.notify_wait_key();
-        }
     }
 
     pub fn on_key_up(&mut self, k: input::VmKey) {
@@ -3261,16 +3570,31 @@ impl CommandContext {
             return;
         }
         if let Some(vk) = input::vmkey_to_vk_code(k) {
-            if self.input.vk_down_up_stock(vk) {
-                match k {
-                    input::VmKey::Enter | input::VmKey::Space => {
-                        self.notify_movie_wait_down_up(1);
+            match k {
+                input::VmKey::Enter | input::VmKey::Space => {
+                    // eng_frame.cpp checks the script trigger's DECIDE-UP stock
+                    // independently from DOWN_UP once the message is fully
+                    // revealed.  The helper itself requires DOWN_UP only for
+                    // the still-revealing path.
+                    if self.process_script_skip_trigger_decide(vk) {
+                        return;
                     }
-                    input::VmKey::Escape => {
-                        self.notify_movie_wait_down_up(-1);
+                    if self.input.vk_down_up_stock(vk) {
+                        if self.notify_movie_wait_down_up(1) {
+                            return;
+                        }
+                        if !self.advance_message_wait(true) {
+                            // TNM_PROC_TYPE_KEY_WAIT consumes DECIDE down-up.
+                            self.notify_wait_key();
+                        }
                     }
-                    _ => {}
                 }
+                input::VmKey::Escape => {
+                    if self.input.vk_down_up_stock(vk) {
+                        let _ = self.notify_movie_wait_down_up(-1);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -3472,9 +3796,13 @@ impl CommandContext {
         if matches!(b, input::VmMouseButton::Right) && handled_button {
             self.suppress_next_right_syscom_open = true;
         }
-        if !handled_button {
-            if !self.advance_message_wait(true) {
-                self.notify_wait_key();
+        if !handled_button && !handled_mwnd_selection {
+            match b {
+                input::VmMouseButton::Left => {
+                    let _ = self.stop_read_skip_by_decide_down(0x01);
+                }
+                input::VmMouseButton::Right => self.register_skip_user_action(),
+                _ => {}
             }
         }
     }
@@ -3572,19 +3900,21 @@ impl CommandContext {
         if self.handle_selbtn_mouse_up(b) {
             return;
         }
-        let movie_skipped = match b {
-            input::VmMouseButton::Left if self.input.vk_down_up_stock(0x01) => {
-                self.notify_movie_wait_down_up(1)
-            }
-            input::VmMouseButton::Right if self.input.vk_down_up_stock(0x02) => {
-                self.notify_movie_wait_down_up(-1)
-            }
-            _ => false,
+        let left_down_up =
+            matches!(b, input::VmMouseButton::Left) && self.input.vk_down_up_stock(0x01);
+        let right_down_up =
+            matches!(b, input::VmMouseButton::Right) && self.input.vk_down_up_stock(0x02);
+        let movie_skipped = if left_down_up {
+            self.notify_movie_wait_down_up(1)
+        } else if right_down_up {
+            self.notify_movie_wait_down_up(-1)
+        } else {
+            false
         };
         if movie_skipped {
             return;
         }
-        if matches!(b, input::VmMouseButton::Right) && self.input.vk_down_up_stock(0x02) {
+        if right_down_up {
             if std::mem::take(&mut self.suppress_next_right_syscom_open) {
                 return;
             }
@@ -3592,14 +3922,20 @@ impl CommandContext {
                 return;
             }
         }
-        let _ = self.handle_object_button_mouse_up(b);
-        // Generic/message key waits are already advanced from mouse-down.
-        // Do not consume the same physical click again on mouse-up: the
-        // original engine uses consumable DOWN_UP stock
-        // (tnm_input_use_key_down_up), so one click cannot both reveal the
-        // current message and dismiss the following MESSAGE_KEY_WAIT.
-        // Down-up-specific waits (TIMEWAIT_KEY/MOV/OBJECT movie etc.) were
-        // handled above by notify_movie_wait_down_up().
+        let handled_button = self.handle_object_button_mouse_up(b);
+        if handled_button {
+            return;
+        }
+        if matches!(b, input::VmMouseButton::Left)
+            && self.process_script_skip_trigger_decide(0x01)
+        {
+            return;
+        }
+        if left_down_up {
+            if !self.advance_message_wait(true) {
+                self.notify_wait_key();
+            }
+        }
     }
 
     pub fn on_mouse_wheel(&mut self, delta_y: i32) {
@@ -3616,8 +3952,11 @@ impl CommandContext {
             self.open_msg_back_proc();
             return;
         }
-        if !self.advance_message_wait(self.should_wheel_advance_message()) {
-            self.notify_wait_key();
+        if delta_y < 0 && self.should_wheel_advance_message() {
+            if self.process_script_skip_trigger_wheel_down() {
+                return;
+            }
+            let _ = self.advance_message_wait(true);
         }
     }
 
@@ -3768,19 +4107,141 @@ impl CommandContext {
         consumed
     }
 
+    pub fn begin_input_frame(&mut self) {
+        // eng_frame.cpp clears this one-frame consumable at frame start.
+        self.msg_wait_skip_by_click = false;
+    }
+
+    /// Mark the start of one C++-style `frame_main_proc` script pass.
+    pub fn begin_frame_main_proc_pass(&mut self) {
+        self.frame_main_proc_started_at = Some(crate::platform_time::Instant::now());
+    }
+
+    fn update_skip_frame_rate_sample(&mut self, real_delta_ms: i32) {
+        // eng_frame.cpp keeps ten 100-ms samples. `frame_cnt` counts rendered
+        // frames since the current bucket began and, if several buckets elapsed,
+        // divides by that number before inserting the sample.
+        self.frame_rate_bucket_elapsed_ms = self
+            .frame_rate_bucket_elapsed_ms
+            .saturating_add(real_delta_ms.max(0) as u64);
+        let periods = self.frame_rate_bucket_elapsed_ms / 100;
+        if periods > 0 {
+            let sample = (self.frame_rate_bucket_frame_cnt as u64 / periods)
+                .min(i32::MAX as u64) as i32;
+            self.frame_rate_100msec[self.frame_rate_100msec_index] = sample;
+            self.frame_rate_100msec_index = (self.frame_rate_100msec_index + 1) % 10;
+            self.frame_rate_100msec_total = self.frame_rate_100msec.iter().copied().sum();
+            self.frame_rate_bucket_elapsed_ms -= periods * 100;
+            self.frame_rate_bucket_frame_cnt = 0;
+        }
+        self.frame_rate_bucket_frame_cnt = self.frame_rate_bucket_frame_cnt.saturating_add(1);
+    }
+
+    fn should_draw_after_message_key_wait_advance(&mut self) -> bool {
+        // flow_proc.cpp::tnm_message_key_wait_proc(): without vsync waiting the
+        // engine always leaves frame_main_proc for drawing after a message.
+        // With vsync enabled it adaptively allows a small number of messages to
+        // be skipped between draws, targeting roughly 30 fps and never more than
+        // 30 message waits per draw (max == 3000, scaled by 100).
+        if self.globals.script.wait_display_vsync_off_flag {
+            return true;
+        }
+
+        self.disp_because_msg_wait_cnt = self.disp_because_msg_wait_cnt.saturating_add(1);
+
+        let pump_over_100ms = self
+            .frame_main_proc_started_at
+            .as_ref()
+            .map(|start| {
+                crate::platform_time::Instant::now()
+                    .saturating_duration_since(start.clone())
+                    .as_millis()
+                    > 100
+            })
+            .unwrap_or(false);
+        if pump_over_100ms {
+            self.disp_because_msg_wait_cnt = 0;
+            self.disp_because_msg_wait_cnt_max = 0;
+            return true;
+        }
+
+        if self.disp_because_msg_wait_cnt >= self.disp_because_msg_wait_cnt_max / 100 {
+            self.disp_because_msg_wait_cnt = 0;
+            if self.frame_rate_100msec_total < 30 {
+                self.disp_because_msg_wait_cnt_max = self
+                    .disp_because_msg_wait_cnt_max
+                    .saturating_sub((30 - self.frame_rate_100msec_total) * 10)
+                    .max(0);
+            } else {
+                self.disp_because_msg_wait_cnt_max = self
+                    .disp_because_msg_wait_cnt_max
+                    .saturating_add(self.frame_rate_100msec_total - 29)
+                    .min(3000);
+            }
+            return true;
+        }
+
+        false
+    }
+
     pub fn wait_poll(&mut self) -> bool {
         self.poll_native_messagebox_result();
+
+        // flow_proc.cpp::tnm_message_wait_proc(): click/message-skip first
+        // forces every pending glyph visible, then MESSAGE_WAIT can pop.
+        let skipping_msg_before_reveal = self.runtime_is_skipping_msg();
+        if self.wait.message_reveal_waiting()
+            && (self.msg_wait_skip_by_click || skipping_msg_before_reveal)
+            && !self.ui.message_wait_text_fully_revealed()
+        {
+            self.ui.reveal_message_now();
+        }
+
         // TNM_PROC_TYPE_MESSAGE_WAIT is not a key wait: it completes as soon
-        // as C_elm_mwnd has revealed the full typewriter message.
+        // as C_elm_mwnd has revealed the full typewriter message. PP/R/PAGE
+        // then expose the MESSAGE_KEY_WAIT that was pushed below it.
         if self.wait.message_reveal_waiting() && self.ui.message_wait_text_fully_revealed() {
-            self.wait.finish_message_reveal();
-            // PP/R/PAGE may still have MESSAGE_KEY_WAIT active; in that case
-            // keep UiRuntime::waiting alive so input/auto-mode can advance it.
-            if !self.wait.waiting_for_key() {
+            let promoted_to_key_wait = self.wait.finish_message_reveal();
+            if promoted_to_key_wait {
+                // tnm_message_key_wait_proc clears the local trigger every pass.
+                self.globals.script.skip_trigger = false;
+            } else {
                 self.ui.finish_message_reveal_wait();
             }
         }
+
+        // A sustained Ctrl/read/script-trigger skip immediately releases
+        // MESSAGE_KEY_WAIT. `msg_wait_skip_by_click` intentionally does not.
+        if self.wait.message_key_waiting() {
+            self.globals.script.skip_trigger = false;
+            if self.runtime_is_skipping_msg() {
+                let was_waiting = self.wait.message_key_waiting();
+                let _ = self.advance_message_wait(true);
+                let advanced = was_waiting && !self.wait.message_key_waiting();
+                if advanced && self.should_draw_after_message_key_wait_advance() {
+                    // `tnm_message_key_wait_proc()` returns false here. In the
+                    // original frame_main_proc loop that means: stop processing
+                    // procs, draw once, then resume SCRIPT on the next frame.
+                    self.request_disp_proc_boundary();
+                }
+            }
+        }
+
         let skipping = self.runtime_is_skipping();
+        if !skipping {
+            // eng_frame.cpp resets only the adaptive maximum when fast-forward
+            // is no longer active.
+            self.disp_because_msg_wait_cnt_max = 0;
+        }
+        if skipping && self.wait.mwnd_animation_waiting() {
+            // flow_proc.cpp ends the concrete MWND animation before releasing
+            // OPEN_WAIT/CLOSE_WAIT; do not leave the renderer mid-transition.
+            self.ui.finish_mwnd_animation();
+        }
+        if skipping && self.wait.wipe {
+            // tnm_wipe_wait_proc calls C_tnm_wipe::end() on skip.
+            self.finish_wipe_runtime();
+        }
         let (wait, stack, bgm, koe, se, pcm, globals) = (
             &mut self.wait,
             &mut self.stack,
@@ -4136,6 +4597,7 @@ impl CommandContext {
         if trace {
             eprintln!("[SG_CTX_TICK] after apply_object_disp_override");
         }
+        self.update_skip_frame_rate_sample(real_delta_ms);
     }
 
     fn apply_syscom_skip_flags(&mut self) {
@@ -8450,6 +8912,7 @@ struct ButtonHitCandidate {
     runtime_slot: usize,
     se_no: i64,
     was_hit: bool,
+    event_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8458,6 +8921,7 @@ struct ButtonOwnerInfo {
     runtime_slot: usize,
     se_no: i64,
     was_hit: bool,
+    event_enabled: bool,
 }
 
 fn push_object_button_decided_action(
@@ -8527,12 +8991,16 @@ fn push_object_button_decided_action(
 fn syscom_feature_enabled_for_button(
     syscom: &globals::SyscomRuntimeState,
     button: &globals::ObjectButtonState,
+    read_skip_runtime_enabled: bool,
 ) -> bool {
     match button.sys_type {
         TNM_SYSCOM_TYPE_NONE => true,
         TNM_SYSCOM_TYPE_SAVE => syscom.save_feature.check_enabled() != 0,
         TNM_SYSCOM_TYPE_LOAD => syscom.load_feature.check_enabled() != 0,
-        TNM_SYSCOM_TYPE_READ_SKIP => syscom.read_skip.check_enabled() != 0,
+        // elm_object_btn.cpp::C_elm_object::get_button_real_state() calls
+        // tnm_syscom_read_skip_is_enable(), which includes the current
+        // committed read flag / unread-skip gate in addition to enable/exist.
+        TNM_SYSCOM_TYPE_READ_SKIP => read_skip_runtime_enabled,
         TNM_SYSCOM_TYPE_AUTO_MODE => syscom.auto_mode.check_enabled() != 0,
         TNM_SYSCOM_TYPE_RETURN_SEL => syscom.return_to_sel.check_enabled() != 0,
         TNM_SYSCOM_TYPE_HIDE_MWND => syscom.hide_mwnd.check_enabled() != 0,
@@ -8585,14 +9053,16 @@ fn button_effective_disabled(
     syscom: &globals::SyscomRuntimeState,
     obj: &globals::ObjectState,
     mwnd_button_idx: Option<usize>,
+    read_skip_runtime_enabled: bool,
 ) -> bool {
-    button_disabled_reason(syscom, obj, mwnd_button_idx).is_some()
+    button_disabled_reason(syscom, obj, mwnd_button_idx, read_skip_runtime_enabled).is_some()
 }
 
 fn button_disabled_reason(
     syscom: &globals::SyscomRuntimeState,
     obj: &globals::ObjectState,
     mwnd_button_idx: Option<usize>,
+    read_skip_runtime_enabled: bool,
 ) -> Option<&'static str> {
     if obj.button.is_disabled() {
         return Some("object_state_disable");
@@ -8600,7 +9070,7 @@ fn button_disabled_reason(
     if mwnd_button_forced_disabled(syscom, mwnd_button_idx) {
         return Some("syscom_mwnd_button_disable");
     }
-    if !syscom_feature_enabled_for_button(syscom, &obj.button) {
+    if !syscom_feature_enabled_for_button(syscom, &obj.button, read_skip_runtime_enabled) {
         return Some("syscom_feature_disable");
     }
     None
@@ -8630,8 +9100,14 @@ fn button_real_state_for_visual(
     stage_idx: i64,
     obj: &globals::ObjectState,
     mwnd_button_idx: Option<usize>,
+    read_skip_runtime_enabled: bool,
 ) -> i64 {
-    if let Some(reason) = button_disabled_reason(syscom, obj, mwnd_button_idx) {
+    if let Some(reason) = button_disabled_reason(
+        syscom,
+        obj,
+        mwnd_button_idx,
+        read_skip_runtime_enabled,
+    ) {
         if sg_debug_enabled() {
             eprintln!(
                 "[SG_DEBUG][BUTTON_TRACE][VISUAL] real_state=disable reason={} stage={} file={:?} mwnd_button_idx={:?} button_no={} group_no={} group_idx={:?} action_no={} raw_state={} enabled={} hit={} pushed={} sys_type={} sys_opt={} mode={} touch_disable={}",
@@ -8714,6 +9190,52 @@ fn collect_button_decided_action_by_runtime_slot_recursive(
         }
     }
     false
+}
+
+fn button_event_enabled_by_runtime_slot_recursive(
+    obj_idx: usize,
+    obj: &globals::ObjectState,
+    runtime_slot: usize,
+    syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
+) -> Option<bool> {
+    if object_runtime_slot(obj_idx, obj) == runtime_slot {
+        return Some(button_event_enabled(
+            syscom,
+            obj,
+            None,
+            read_skip_runtime_enabled,
+        ));
+    }
+    for (child_idx, child) in obj.runtime.child_objects.iter().enumerate() {
+        if let Some(enabled) = button_event_enabled_by_runtime_slot_recursive(
+            child_idx,
+            child,
+            runtime_slot,
+            syscom,
+            read_skip_runtime_enabled,
+        ) {
+            return Some(enabled);
+        }
+    }
+    None
+}
+
+fn button_event_enabled_in_list_by_runtime_slot(
+    objs: &[globals::ObjectState],
+    runtime_slot: usize,
+    syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
+) -> bool {
+    objs.iter().enumerate().find_map(|(obj_idx, obj)| {
+        button_event_enabled_by_runtime_slot_recursive(
+            obj_idx,
+            obj,
+            runtime_slot,
+            syscom,
+            read_skip_runtime_enabled,
+        )
+    }).unwrap_or(false)
 }
 
 fn find_button_se_no_by_runtime_slot_recursive(
@@ -8837,24 +9359,46 @@ fn set_button_pushed_recursive(obj: &mut globals::ObjectState, group_idx: usize,
 fn mark_standalone_button_pushed_from_hit_recursive(
     _obj_idx: usize,
     obj: &mut globals::ObjectState,
+    syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
+    mwnd_button_idx: Option<usize>,
 ) -> Option<i64> {
-    if has_standalone_button_action(obj) && obj.button.hit {
+    if has_standalone_button_registration(obj) && obj.button.hit {
         let was_pushed = obj.button.pushed;
         obj.button.last_pushed = obj.button.pushed;
         obj.button.pushed = true;
-        if !was_pushed {
+        if !was_pushed
+            && button_event_enabled(syscom, obj, mwnd_button_idx, read_skip_runtime_enabled)
+        {
             return Some(obj.button.se_no);
         }
     }
     for (child_idx, child) in obj.runtime.child_objects.iter_mut().enumerate() {
-        if let Some(se_no) = mark_standalone_button_pushed_from_hit_recursive(child_idx, child) {
+        if let Some(se_no) = mark_standalone_button_pushed_from_hit_recursive(
+            child_idx,
+            child,
+            syscom,
+            read_skip_runtime_enabled,
+            mwnd_button_idx,
+        ) {
             return Some(se_no);
         }
     }
     None
 }
+
+fn registered_button_hit_recursive(obj: &globals::ObjectState) -> bool {
+    if obj.button.enabled && obj.button.action_no >= 0 && obj.button.hit {
+        return true;
+    }
+    obj.runtime
+        .child_objects
+        .iter()
+        .any(registered_button_hit_recursive)
+}
+
 fn standalone_button_hit_recursive(obj: &globals::ObjectState) -> bool {
-    if has_standalone_button_action(obj) && obj.button.hit {
+    if has_standalone_button_registration(obj) && obj.button.hit {
         return true;
     }
     obj.runtime
@@ -8864,7 +9408,7 @@ fn standalone_button_hit_recursive(obj: &globals::ObjectState) -> bool {
 }
 
 fn standalone_button_pushed_recursive(obj: &globals::ObjectState) -> bool {
-    if has_standalone_button_action(obj) && obj.button.pushed {
+    if has_standalone_button_registration(obj) && obj.button.pushed {
         return true;
     }
     obj.runtime
@@ -9038,11 +9582,25 @@ fn button_sort_ge(lhs: ButtonSortKey, rhs: ButtonSortKey) -> bool {
     lhs.order > rhs.order || (lhs.order == rhs.order && lhs.layer >= rhs.layer)
 }
 
+fn has_standalone_button_registration(obj: &globals::ObjectState) -> bool {
+    // C_elm_object::regist_button() registers an action button independently
+    // of get_button_real_state().  DISABLE is an event-layer state: the button
+    // manager must still hit/capture it so DECIDE cannot leak to the script.
+    obj.button.enabled && obj.button.group_idx().is_none() && obj.button.action_no >= 0
+}
+
 fn has_standalone_button_action(obj: &globals::ObjectState) -> bool {
-    obj.button.enabled
-        && !obj.button.is_disabled()
-        && obj.button.group_idx().is_none()
-        && obj.button.action_no >= 0
+    has_standalone_button_registration(obj) && !obj.button.is_disabled()
+}
+
+fn button_event_enabled(
+    syscom: &globals::SyscomRuntimeState,
+    obj: &globals::ObjectState,
+    mwnd_button_idx: Option<usize>,
+    read_skip_runtime_enabled: bool,
+) -> bool {
+    !syscom.mwnd_btn_touch_disable
+        && !button_effective_disabled(syscom, obj, mwnd_button_idx, read_skip_runtime_enabled)
 }
 
 fn merge_button_hit(
@@ -9245,16 +9803,27 @@ fn collect_standalone_button_decided_actions_recursive(
     obj: &globals::ObjectState,
     out: &mut Vec<globals::PendingButtonAction>,
     sounds: &mut Vec<i64>,
+    syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
+    mwnd_button_idx: Option<usize>,
 ) {
-    if has_standalone_button_action(obj)
+    if has_standalone_button_registration(obj)
         && obj.button.pushed
         && (obj.button.hit || obj.button.push_keep)
+        && button_event_enabled(syscom, obj, mwnd_button_idx, read_skip_runtime_enabled)
     {
         push_object_button_decided_action(obj, out);
         sounds.push(obj.button.se_no);
     }
     for child in &obj.runtime.child_objects {
-        collect_standalone_button_decided_actions_recursive(child, out, sounds);
+        collect_standalone_button_decided_actions_recursive(
+            child,
+            out,
+            sounds,
+            syscom,
+            read_skip_runtime_enabled,
+            mwnd_button_idx,
+        );
     }
 }
 
@@ -9507,6 +10076,7 @@ fn object_button_hit_sort_key_from_render(
     gfx: &graphics::GfxRuntime,
     ids: &constants::RuntimeConstants,
     syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
     stage_idx: i64,
     obj_idx: usize,
     obj: &globals::ObjectState,
@@ -9514,10 +10084,10 @@ fn object_button_hit_sort_key_from_render(
     my: i32,
     parent_state: Option<ParentRenderState>,
 ) -> Option<ButtonSortKey> {
-    if !object_button_renderable_by_syscom(syscom, obj)
-        || button_effective_disabled(syscom, obj, None)
-        || syscom.mwnd_btn_touch_disable
-    {
+    // C_tnm_btn_mng hit-tests every registered button first.  Dynamic/static
+    // DISABLE and mwnd_btn_touch_disable are checked later by button_event();
+    // they suppress the event, not physical input capture.
+    if !object_button_renderable_by_syscom(syscom, obj) {
         if sg_debug_enabled() && obj.button.enabled {
             eprintln!(
                 "[SG_DEBUG][BUTTON_TRACE][HIT] reject stage={} obj_idx={} runtime_slot={} file={:?} mx={} my={} visible={} disabled_reason={:?} touch_disable={} button_no={} group_no={} group_idx={:?} action_no={} state={} hit={} pushed={} alpha_test={} sys_type={} sys_opt={} mode={}",
@@ -9528,7 +10098,7 @@ fn object_button_hit_sort_key_from_render(
                 mx,
                 my,
                 object_button_renderable_by_syscom(syscom, obj),
-                button_disabled_reason(syscom, obj, None),
+                button_disabled_reason(syscom, obj, None, read_skip_runtime_enabled),
                 syscom.mwnd_btn_touch_disable,
                 obj.button.button_no,
                 obj.button.group_no,
@@ -9662,6 +10232,8 @@ fn hit_test_standalone_action_button_recursive(
     gfx: &graphics::GfxRuntime,
     ids: &constants::RuntimeConstants,
     syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
+    mwnd_button_idx: Option<usize>,
     stage_idx: i64,
     mx: i32,
     my: i32,
@@ -9675,6 +10247,8 @@ fn hit_test_standalone_action_button_recursive(
         gfx: &graphics::GfxRuntime,
         ids: &constants::RuntimeConstants,
         syscom: &globals::SyscomRuntimeState,
+        read_skip_runtime_enabled: bool,
+        mwnd_button_idx: Option<usize>,
         stage_idx: i64,
         mx: i32,
         my: i32,
@@ -9684,12 +10258,18 @@ fn hit_test_standalone_action_button_recursive(
         inherited_owner: Option<ButtonOwnerInfo>,
     ) -> Option<ButtonHitCandidate> {
         let runtime_slot = object_runtime_slot(obj_idx, obj);
-        let current_owner = if has_standalone_button_action(obj) && !obj.base.no_event_hint {
+        let current_owner = if has_standalone_button_registration(obj) && !obj.base.no_event_hint {
             Some(ButtonOwnerInfo {
                 button_no: obj.button.button_no,
                 runtime_slot,
                 se_no: obj.button.se_no,
                 was_hit: obj.button.last_hit,
+                event_enabled: button_event_enabled(
+                    syscom,
+                    obj,
+                    mwnd_button_idx,
+                    read_skip_runtime_enabled,
+                ),
             })
         } else {
             None
@@ -9706,6 +10286,7 @@ fn hit_test_standalone_action_button_recursive(
                     gfx,
                     ids,
                     syscom,
+                    read_skip_runtime_enabled,
                     stage_idx,
                     obj_idx,
                     obj,
@@ -9719,6 +10300,7 @@ fn hit_test_standalone_action_button_recursive(
                         runtime_slot: owner.runtime_slot,
                         se_no: owner.se_no,
                         was_hit: owner.was_hit,
+                        event_enabled: owner.event_enabled,
                     });
                 }
             }
@@ -9732,6 +10314,8 @@ fn hit_test_standalone_action_button_recursive(
                 gfx,
                 ids,
                 syscom,
+                read_skip_runtime_enabled,
+                mwnd_button_idx,
                 stage_idx,
                 mx,
                 my,
@@ -9756,6 +10340,8 @@ fn hit_test_standalone_action_button_recursive(
         gfx,
         ids,
         syscom,
+        read_skip_runtime_enabled,
+        mwnd_button_idx,
         stage_idx,
         mx,
         my,
@@ -9772,6 +10358,7 @@ fn hit_test_object_button_recursive(
     gfx: &graphics::GfxRuntime,
     ids: &constants::RuntimeConstants,
     syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
     stage_idx: i64,
     group_idx: usize,
     mx: i32,
@@ -9786,6 +10373,7 @@ fn hit_test_object_button_recursive(
         gfx: &graphics::GfxRuntime,
         ids: &constants::RuntimeConstants,
         syscom: &globals::SyscomRuntimeState,
+        read_skip_runtime_enabled: bool,
         stage_idx: i64,
         group_idx: usize,
         mx: i32,
@@ -9797,7 +10385,6 @@ fn hit_test_object_button_recursive(
     ) -> Option<ButtonHitCandidate> {
         let runtime_slot = object_runtime_slot(obj_idx, obj);
         let current_owner = if obj.button.enabled
-            && !obj.button.is_disabled()
             && !obj.base.no_event_hint
             && obj.button.action_no >= 0
             && obj.button.group_idx() == Some(group_idx)
@@ -9807,6 +10394,7 @@ fn hit_test_object_button_recursive(
                 runtime_slot,
                 se_no: obj.button.se_no,
                 was_hit: obj.button.last_hit,
+                event_enabled: button_event_enabled(syscom, obj, None, read_skip_runtime_enabled),
             })
         } else {
             None
@@ -9823,6 +10411,7 @@ fn hit_test_object_button_recursive(
                     gfx,
                     ids,
                     syscom,
+                    read_skip_runtime_enabled,
                     stage_idx,
                     obj_idx,
                     obj,
@@ -9836,6 +10425,7 @@ fn hit_test_object_button_recursive(
                         runtime_slot: owner.runtime_slot,
                         se_no: owner.se_no,
                         was_hit: owner.was_hit,
+                        event_enabled: owner.event_enabled,
                     });
                 }
             }
@@ -9849,6 +10439,7 @@ fn hit_test_object_button_recursive(
                 gfx,
                 ids,
                 syscom,
+                read_skip_runtime_enabled,
                 stage_idx,
                 group_idx,
                 mx,
@@ -9874,6 +10465,7 @@ fn hit_test_object_button_recursive(
         gfx,
         ids,
         syscom,
+        read_skip_runtime_enabled,
         stage_idx,
         group_idx,
         mx,
@@ -12317,7 +12909,7 @@ fn append_object_tree_nodes(
             obj.button.action_no,
             obj.button.hit,
             obj.button.pushed,
-            button_disabled_reason(&ctx.globals.syscom, obj, None),
+            button_disabled_reason(&ctx.globals.syscom, obj, None, ctx.runtime_read_skip_is_enable()),
             parent_state.is_some()
         ));
     }
@@ -14271,6 +14863,7 @@ fn collect_button_visuals_recursive(
                 stage_idx,
                 obj,
                 mwnd_button_idx,
+                ctx.runtime_read_skip_is_enable(),
             );
             if sg_debug_enabled() {
                 let runtime_slot = object_runtime_slot(obj_idx, obj);
@@ -14286,7 +14879,7 @@ fn collect_button_visuals_recursive(
                     obj.button.state,
                     obj.button.enabled,
                     button_syscom_mode_visible(&ctx.globals.syscom, &obj.button),
-                    button_disabled_reason(&ctx.globals.syscom, obj, mwnd_button_idx),
+                    button_disabled_reason(&ctx.globals.syscom, obj, mwnd_button_idx, ctx.runtime_read_skip_is_enable()),
                     obj.button.button_no,
                     obj.button.group_no,
                     obj.button.group_idx(),
@@ -15152,6 +15745,139 @@ fn ensure_font_list(syscom: &mut globals::SyscomRuntimeState, project_dir: &Path
         }
     }
     syscom.font_list.sort();
+}
+
+#[cfg(test)]
+mod skip_state_parity_tests {
+    use super::*;
+
+    #[test]
+    fn read_skip_and_script_trigger_obey_local_skip_disable() {
+        let mut ctx = CommandContext::new(std::path::PathBuf::from("."));
+
+        ctx.globals.syscom.read_skip.onoff = true;
+        assert!(ctx.runtime_is_skipping());
+
+        ctx.globals.script.skip_disable = true;
+        assert!(!ctx.runtime_is_skipping());
+
+        ctx.globals.syscom.read_skip.onoff = false;
+        ctx.skip_because_skip_trigger = true;
+        assert!(!ctx.runtime_is_skipping());
+
+        ctx.globals.script.skip_disable = false;
+        assert!(ctx.runtime_is_skipping());
+    }
+
+    #[test]
+    fn decide_down_that_stops_read_skip_cannot_advance_message_on_release() {
+        let mut ctx = CommandContext::new(std::path::PathBuf::from("."));
+        ctx.globals.syscom.read_skip.onoff = true;
+        ctx.ui.begin_wait_message();
+        ctx.wait.wait_message_reveal_then_key();
+        assert!(ctx.wait.finish_message_reveal());
+        assert!(ctx.wait.message_key_waiting());
+
+        ctx.on_mouse_down(input::VmMouseButton::Left);
+        assert!(!ctx.globals.syscom.read_skip.onoff);
+        ctx.on_mouse_up(input::VmMouseButton::Left);
+
+        // eng_frame.cpp consumed DECIDE-DOWN while stopping read-skip, so the
+        // release is not a MESSAGE_KEY_WAIT decision.
+        assert!(ctx.wait.message_key_waiting());
+        assert!(ctx.ui.message_waiting());
+    }
+
+    #[test]
+    fn active_read_skip_releases_message_key_wait_without_another_click() {
+        let mut ctx = CommandContext::new(std::path::PathBuf::from("."));
+        ctx.ui.begin_wait_message();
+        ctx.wait.wait_message_reveal_then_key();
+        assert!(ctx.wait.finish_message_reveal());
+        ctx.globals.syscom.read_skip.onoff = true;
+
+        let generation = ctx.proc_generation();
+        assert!(!ctx.wait_poll());
+        assert!(!ctx.wait.message_key_waiting());
+        assert!(!ctx.ui.message_waiting());
+        // flow_proc.cpp::tnm_message_key_wait_proc() initially returns false
+        // after each skipped message so frame_main_proc reaches drawing instead
+        // of draining the whole scene to the next selection.
+        assert_ne!(ctx.proc_generation(), generation);
+        assert_eq!(ctx.last_proc_kind(), ProcKind::Disp);
+    }
+
+    #[test]
+    fn message_skip_without_vsync_wait_always_requests_a_draw() {
+        let mut ctx = CommandContext::new(std::path::PathBuf::from("."));
+        ctx.globals.script.wait_display_vsync_off_flag = true;
+        ctx.globals.syscom.read_skip.onoff = true;
+        // A high adaptive maximum must not suppress drawing when script-level
+        // vsync waiting is disabled; this is the explicit else branch in
+        // tnm_message_key_wait_proc().
+        ctx.disp_because_msg_wait_cnt_max = 3000;
+        ctx.ui.begin_wait_message();
+        ctx.wait.wait_message_reveal_then_key();
+        assert!(ctx.wait.finish_message_reveal());
+
+        let generation = ctx.proc_generation();
+        assert!(!ctx.wait_poll());
+        assert_ne!(ctx.proc_generation(), generation);
+        assert_eq!(ctx.last_proc_kind(), ProcKind::Disp);
+    }
+
+    #[test]
+    fn skip_draw_throttle_matches_original_adaptive_bounds() {
+        let mut ctx = CommandContext::new(std::path::PathBuf::from("."));
+        ctx.frame_rate_100msec_total = 60;
+        ctx.disp_because_msg_wait_cnt = 0;
+        ctx.disp_because_msg_wait_cnt_max = 0;
+
+        assert!(ctx.should_draw_after_message_key_wait_advance());
+        assert_eq!(ctx.disp_because_msg_wait_cnt, 0);
+        assert_eq!(ctx.disp_because_msg_wait_cnt_max, 31);
+
+        ctx.disp_because_msg_wait_cnt_max = 3000;
+        ctx.disp_because_msg_wait_cnt = 29;
+        assert!(ctx.should_draw_after_message_key_wait_advance());
+        assert_eq!(ctx.disp_because_msg_wait_cnt, 0);
+        assert_eq!(ctx.disp_because_msg_wait_cnt_max, 3000);
+
+        ctx.frame_rate_100msec_total = 20;
+        ctx.disp_because_msg_wait_cnt_max = 50;
+        assert!(ctx.should_draw_after_message_key_wait_advance());
+        assert_eq!(ctx.disp_because_msg_wait_cnt_max, 0);
+    }
+
+    #[test]
+    fn read_skip_button_uses_full_runtime_eligibility() {
+        let mut syscom = globals::SyscomRuntimeState::default();
+        syscom.read_skip.enable = true;
+        syscom.read_skip.exist = true;
+        let mut button = globals::ObjectButtonState::default();
+        button.sys_type = TNM_SYSCOM_TYPE_READ_SKIP;
+
+        assert!(!syscom_feature_enabled_for_button(&syscom, &button, false));
+        assert!(syscom_feature_enabled_for_button(&syscom, &button, true));
+    }
+
+    #[test]
+    fn ctrl_precedes_skip_disable_but_ctrl_shift_is_message_only() {
+        let mut ctx = CommandContext::new(std::path::PathBuf::from("."));
+        ctx.globals.script.skip_disable = true;
+
+        ctx.input.on_key_down(input::VmKey::Control);
+        assert!(ctx.runtime_is_skipping());
+        assert!(ctx.runtime_is_skipping_msg());
+
+        ctx.input.on_key_down(input::VmKey::Shift);
+        assert!(!ctx.runtime_is_skipping());
+        assert!(ctx.runtime_is_skipping_msg());
+
+        ctx.globals.script.ctrl_disable = true;
+        assert!(!ctx.runtime_is_skipping());
+        assert!(!ctx.runtime_is_skipping_msg());
+    }
 }
 
 #[cfg(test)]

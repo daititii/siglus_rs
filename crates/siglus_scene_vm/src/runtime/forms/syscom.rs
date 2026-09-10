@@ -4184,6 +4184,28 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
     let op = call.op;
     let params = call.params;
 
+    // eng_syscom.cpp::tnm_syscom_read_skip_is_enable() also gates read skip
+    // on the current message's committed read flag unless unread-skip is on.
+    if op == CHECK_READ_SKIP_ENABLE {
+        ctx.push(Value::Int(if ctx.runtime_read_skip_is_enable() { 1 } else { 0 }));
+        return Ok(true);
+    }
+    if matches!(
+        op,
+        SET_READ_SKIP_ONOFF_FLAG | SET_READ_SKIP_ENABLE_FLAG | SET_READ_SKIP_EXIST_FLAG
+    ) {
+        let value = p_bool(params, 0);
+        match op {
+            SET_READ_SKIP_ONOFF_FLAG => ctx.globals.syscom.read_skip.onoff = value,
+            SET_READ_SKIP_ENABLE_FLAG => ctx.globals.syscom.read_skip.enable = value,
+            SET_READ_SKIP_EXIST_FLAG => ctx.globals.syscom.read_skip.exist = value,
+            _ => unreachable!(),
+        }
+        ctx.runtime_update_read_skip_menu();
+        ctx.push(Value::Int(0));
+        return Ok(true);
+    }
+
     {
         let st = &ctx.globals.syscom;
         if let Some(v) = get_local_extra(op, params, st) {
@@ -4290,6 +4312,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             ctx.globals.syscom.save_feature = enabled;
             ctx.globals.syscom.load_feature = enabled;
             ctx.globals.syscom.msg_back_open = false;
+            ctx.runtime_update_read_skip_menu();
         }
         OPEN_MSG_BACK => {
             if open_msg_back_proc(ctx) {

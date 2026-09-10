@@ -7123,6 +7123,76 @@ fn dispatch_object_op(
     )
 }
 
+fn split_object_frame_action_chain(
+    element: &[i32],
+    op: i32,
+    tail: &[i32],
+    frame_action_ch_op: i32,
+    elm_array: i32,
+) -> (Vec<i32>, Option<Vec<i32>>) {
+    if element.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    // `tail` is the suffix after the OBJECT operation selected by parse_target().
+    // Recover that operation by its structural position, never by searching for its
+    // numeric value.  Object/list indices are ordinary integers and may legally be
+    // identical to an OBJECT opcode (for example OBJECT[115].FRAME_ACTION_CH).
+    let Some(op_pos) = element.len().checked_sub(tail.len().saturating_add(1)) else {
+        return (Vec::new(), None);
+    };
+    if element.get(op_pos).copied() != Some(op) {
+        panic!(
+            "invalid FRAME_ACTION element chain: op={} tail={:?} element={:?} expected_op_pos={}",
+            op, tail, element, op_pos
+        );
+    }
+
+    let mut frame_action_end = op_pos + 1;
+    if op == frame_action_ch_op
+        && tail.len() >= 2
+        && (tail[0] == elm_array || tail[0] == crate::runtime::forms::codes::ELM_ARRAY)
+    {
+        // A channel entry's element is OBJECT.FRAME_ACTION_CH[index].  Keep the
+        // ELM_ARRAY/index pair as part of the frame-action element, while m_target
+        // remains the complete owning OBJECT element, matching C_elm_object::init().
+        frame_action_end += 2;
+    }
+
+    let frame_action_chain = element[..frame_action_end].to_vec();
+    let object_chain = (op_pos > 0).then(|| element[..op_pos].to_vec());
+    (frame_action_chain, object_chain)
+}
+
+#[cfg(test)]
+mod frame_action_chain_tests {
+    use super::split_object_frame_action_chain;
+
+    #[test]
+    fn frame_action_ch_does_not_confuse_object_index_with_opcode() {
+        let element = [38, 2, -1, 115, 115, -1, 0, 1];
+        let tail = [-1, 0, 1];
+
+        let (frame_action, object) =
+            split_object_frame_action_chain(&element, 115, &tail, 115, -1);
+
+        assert_eq!(frame_action, vec![38, 2, -1, 115, 115, -1, 0]);
+        assert_eq!(object, Some(vec![38, 2, -1, 115]));
+    }
+
+    #[test]
+    fn frame_action_does_not_confuse_object_index_with_opcode() {
+        let element = [38, 2, -1, 114, 114, 1];
+        let tail = [1];
+
+        let (frame_action, object) =
+            split_object_frame_action_chain(&element, 114, &tail, 115, -1);
+
+        assert_eq!(frame_action, vec![38, 2, -1, 114, 114]);
+        assert_eq!(object, Some(vec![38, 2, -1, 114]));
+    }
+}
+
 fn dispatch_object_state_op(
     ctx: &mut CommandContext,
     stage: &mut ObjectDispatchStage<'_>,
@@ -7181,29 +7251,15 @@ fn dispatch_object_state_op(
         let element = ctx
             .vm_call
             .as_ref()
-            .map(|m| m.element.clone())
+            .map(|m| m.element.as_slice())
             .unwrap_or_default();
-        if element.is_empty() {
-            return (Vec::new(), None);
-        }
-        let pos = element
-            .iter()
-            .position(|v| *v == op)
-            .unwrap_or_else(|| element.len().saturating_sub(1));
-        let mut end = pos + 1;
-        if op == ctx.ids.obj_frame_action_ch
-            && tail.len() >= 2
-            && (tail[0] == ctx.ids.elm_array || tail[0] == crate::runtime::forms::codes::ELM_ARRAY)
-        {
-            end = (pos + 3).min(element.len());
-        }
-        let frame_action_chain = element[..end].to_vec();
-        let object_chain = if pos > 0 {
-            Some(element[..pos].to_vec())
-        } else {
-            None
-        };
-        (frame_action_chain, object_chain)
+        split_object_frame_action_chain(
+            element,
+            op,
+            tail,
+            ctx.ids.obj_frame_action_ch,
+            ctx.ids.elm_array,
+        )
     }
 
     fn queue_finish(
@@ -12897,7 +12953,7 @@ fn dispatch_mwnd_list_op(
             ctx.ui.begin_mwnd_close(0, anim_time);
             if matches!(k, MwndListOpKind::CloseAll | MwndListOpKind::CloseAllWait) && anim_time > 0
             {
-                ctx.wait.wait_ms(anim_time.max(0) as u64);
+                ctx.wait.wait_mwnd_animation(anim_time.max(0) as u64);
             }
             if let Some(rf) = ret_form {
                 if rf != 0 {
@@ -13851,6 +13907,9 @@ pub(crate) fn close_current_mwnd_for_scene_transition(ctx: &mut CommandContext) 
 }
 
 fn mark_mwnd_clear_ready(ctx: &mut CommandContext, m: &mut MwndState) {
+    // C++ tnm_msg_proc_clear_ready clears the global script-trigger skip.
+    // NovelClear intentionally does not call this helper.
+    ctx.clear_script_trigger_skip();
     m.clear_ready = true;
     m.msg_block_started = false;
     m.multi_msg = false;
@@ -13905,7 +13964,9 @@ pub fn cd_text_current_mwnd(ctx: &mut CommandContext, text: &str, rf_flag_no: i6
                 start_mwnd_auto_message(ctx, m);
                 ctx.ui.append_message(accepted);
                 msgbk_add_text(ctx, accepted);
-                mwnd_add_read_flag(m, ctx.current_scene_no.unwrap_or(-1), rf_flag_no);
+                let read_scene_no = ctx.current_scene_no.unwrap_or(-1);
+                ctx.set_current_read_flag_for_skip(read_scene_no, rf_flag_no);
+                mwnd_add_read_flag(m, read_scene_no, rf_flag_no);
                 m.text_dirty = true;
                 wait_after_mwnd_print_if_needed(ctx, m);
             }
@@ -14159,7 +14220,7 @@ fn dispatch_mwnd_item_op(
             ctx.ui.show_message_bg(true);
             ctx.ui.begin_mwnd_open(m.open_anime_type, anime_time);
             if matches!(k, MwndOpKind::OpenWait) && anime_time > 0 {
-                ctx.wait.wait_ms(anime_time.max(0) as u64);
+                ctx.wait.wait_mwnd_animation(anime_time.max(0) as u64);
             }
             push_ok(ctx, ret_form);
             true
@@ -14193,7 +14254,7 @@ fn dispatch_mwnd_item_op(
             ctx.ui
                 .begin_mwnd_close(m.close_anime_type, anime_time);
             if matches!(k, MwndOpKind::CloseWait) && anime_time > 0 {
-                ctx.wait.wait_ms(anime_time.max(0) as u64);
+                ctx.wait.wait_mwnd_animation(anime_time.max(0) as u64);
             }
             push_ok(ctx, ret_form);
             true
@@ -14308,11 +14369,10 @@ fn dispatch_mwnd_item_op(
         }
         MwndOpKind::Pp => {
             // Original order is MESSAGE_WAIT then MESSAGE_KEY_WAIT.  Keeping
-            // both blockers armed is equivalent in the cooperative VM: the
-            // first click can reveal text without dismissing the key wait.
+            // C++ pushes MESSAGE_KEY_WAIT below MESSAGE_WAIT. Preserve that
+            // proc order so reveal completion cannot consume the key wait.
             set_mwnd_key_icon_wait(ctx, m, 0);
-            ctx.wait.wait_message_reveal();
-            ctx.wait.wait_key();
+            ctx.wait.wait_message_reveal_then_key();
             ctx.request_message_wait_proc_boundary();
             m.text_dirty = false;
             push_ok(ctx, ret_form);
@@ -14335,8 +14395,7 @@ fn dispatch_mwnd_item_op(
             } else {
                 ctx.ui.request_clear_message_on_wait_end();
             }
-            ctx.wait.wait_message_reveal();
-            ctx.wait.wait_key();
+            ctx.wait.wait_message_reveal_then_key();
             ctx.request_message_wait_proc_boundary();
             m.text_dirty = false;
             push_ok(ctx, ret_form);
@@ -14346,8 +14405,7 @@ fn dispatch_mwnd_item_op(
             let icon_mode = if m.novel_mode == 1 { 1 } else { 0 };
             set_mwnd_key_icon_wait(ctx, m, icon_mode);
             ctx.ui.request_clear_message_on_wait_end();
-            ctx.wait.wait_message_reveal();
-            ctx.wait.wait_key();
+            ctx.wait.wait_message_reveal_then_key();
             ctx.request_message_wait_proc_boundary();
             m.text_dirty = false;
             push_ok(ctx, ret_form);

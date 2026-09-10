@@ -262,6 +262,45 @@ impl InputState {
         self.keys[vk as usize].down_up_stock == 2
     }
 
+    /// Consume one key-down edge while preserving the held state.
+    ///
+    /// Matches `C_input_state::BUTTON::use_down_stock()`: consuming DOWN also
+    /// invalidates any in-progress DOWN_UP sequence so the later release cannot
+    /// be observed as a second logical input.
+    pub fn use_vk_down_stock(&mut self, vk: u8) -> bool {
+        let st = &mut self.keys[vk as usize];
+        if !st.down_stock {
+            return false;
+        }
+        st.down_stock = false;
+        st.down_up_stock = 0;
+        true
+    }
+
+    /// Consume one key-up edge. Matches tona3 `use_up_stock()`.
+    pub fn use_vk_up_stock(&mut self, vk: u8) -> bool {
+        let st = &mut self.keys[vk as usize];
+        if !st.up_stock {
+            return false;
+        }
+        st.up_stock = false;
+        st.down_up_stock = 0;
+        true
+    }
+
+    /// Consume a completed key down/up pair. Matches tona3
+    /// `C_input_state::BUTTON::use_down_up_stock()`.
+    pub fn use_vk_down_up_stock(&mut self, vk: u8) -> bool {
+        let st = &mut self.keys[vk as usize];
+        if st.down_up_stock != 2 {
+            return false;
+        }
+        st.down_stock = false;
+        st.up_stock = false;
+        st.down_up_stock = 0;
+        true
+    }
+
     /// Returns true if a flick was detected since the last `next_frame`.
     pub fn vk_flick_stock(&self, vk: u8) -> bool {
         self.keys[vk as usize].flick_stock
@@ -627,6 +666,37 @@ mod joypad_mode_tests {
         assert!(!input.joypad_is_down(0));
         assert!(input.joypad_up_stock(0));
         assert!(input.joypad_down_up_stock(0));
+    }
+
+    #[test]
+    fn consuming_down_prevents_release_from_becoming_down_up() {
+        let mut input = InputState::default();
+        input.on_mouse_down(super::VmMouseButton::Left);
+        assert!(input.vk_down_stock(0x01));
+        assert!(input.use_vk_down_stock(0x01));
+        assert!(!input.vk_down_stock(0x01));
+
+        input.on_mouse_up(super::VmMouseButton::Left);
+        assert!(input.vk_up_stock(0x01));
+        assert!(!input.vk_down_up_stock(0x01));
+    }
+
+    #[test]
+    fn consuming_up_or_down_up_matches_tona_button_stock_semantics() {
+        let mut input = InputState::default();
+        input.on_key_down(VmKey::Enter);
+        input.on_key_up(VmKey::Enter);
+        assert!(input.vk_down_up_stock(0x0d));
+        assert!(input.use_vk_up_stock(0x0d));
+        assert!(!input.vk_up_stock(0x0d));
+        assert!(!input.vk_down_up_stock(0x0d));
+
+        input.on_key_down(VmKey::Enter);
+        input.on_key_up(VmKey::Enter);
+        assert!(input.use_vk_down_up_stock(0x0d));
+        assert!(!input.vk_down_stock(0x0d));
+        assert!(!input.vk_up_stock(0x0d));
+        assert!(!input.vk_down_up_stock(0x0d));
     }
 
     #[test]
