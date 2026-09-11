@@ -52,9 +52,26 @@ pub unsafe extern "C" fn siglus_android_init_context(java_vm_ptr: *mut c_void, c
         unsafe {
             ndk_context::initialize_android_context(java_vm_ptr, context_ptr);
         }
+        // Default to Warn: at Debug the frame loop emits ~950 lines/s on device
+        // (91% of them Debug), and formatting + one logcat write per line dominated
+        // the frame budget -- the app sat at ~106% CPU and felt permanently laggy.
+        // Every diagnostic we actually grep for is log::warn!, so Warn keeps them.
+        // Override with SIGLUS_LOG=<level> when a Debug-level trace is really needed.
+        let level = std::env::var("SIGLUS_LOG")
+            .ok()
+            .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                "off" => Some(log::LevelFilter::Off),
+                "error" => Some(log::LevelFilter::Error),
+                "warn" => Some(log::LevelFilter::Warn),
+                "info" => Some(log::LevelFilter::Info),
+                "debug" => Some(log::LevelFilter::Debug),
+                "trace" => Some(log::LevelFilter::Trace),
+                _ => None,
+            })
+            .unwrap_or(log::LevelFilter::Warn);
         let _ = android_logger::init_once(
             android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Debug)
+                .with_max_level(level)
                 .with_tag("siglus_rs"),
         );
         log::info!("siglus_android_init_context: ndk_context initialized");

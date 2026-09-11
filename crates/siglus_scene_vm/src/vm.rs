@@ -60,6 +60,70 @@ const CD_ASSIGN: u8 = constants::cd::ASSIGN;
 const CD_OPERATE_1: u8 = constants::cd::OPERATE_1;
 const CD_OPERATE_2: u8 = constants::cd::OPERATE_2;
 
+// ---------------------------------------------------------------------------
+// SG_VM_RING: bounded per-instruction ring buffer (diagnostic, SG_VM_RING=1).
+//
+// A `pop_int` underflow only reports the *current* pc, which is useless when the
+// value went missing several instructions earlier: compiled `switch` chains keep
+// a selector alive across dozens of compares, and our stream's operand order is
+// not self-describing. Keeping the last N executed instructions together with the
+// int-stack depth seen *at entry* turns "the stack is empty" into "here is the
+// exact instruction after which the value stopped existing".
+// ---------------------------------------------------------------------------
+const SG_RING_CAP: usize = 128;
+
+thread_local! {
+    // (pc, opcode, int depth at entry, element_points len, int stack top, scn len, call depth)
+    static SG_OP_RING: std::cell::RefCell<std::collections::VecDeque<(u32, u8, u32, u32, i64, u32, u32)>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
+    static SG_OP_RING_ON: bool = std::env::var_os("SG_VM_RING").is_some();
+    // Per-call/per-return tracing needs its own opt-in: in a map frame loop it emits
+    // hundreds of thousands of lines and produced a 350 MB log in a single run.
+    static SG_RET_TRACE_ON: bool = std::env::var_os("SG_VM_RET_TRACE").is_some();
+}
+
+#[inline]
+fn sg_ring_on() -> bool {
+    SG_OP_RING_ON.with(|on| *on) && SG_RET_TRACE_ON.with(|on| *on)
+}
+
+#[inline]
+fn sg_ring_push(
+    pc: usize,
+    opcode: u8,
+    depth: usize,
+    elm: usize,
+    top: Option<i32>,
+    scn_len: usize,
+    call_depth: usize,
+) {
+    SG_OP_RING_ON.with(|on| {
+        if !*on {
+            return;
+        }
+        SG_OP_RING.with(|ring| {
+            let mut ring = ring.borrow_mut();
+            // A different stream (cross-scene call / proc stream) invalidates every
+            // recorded pc, so start over rather than mixing two address spaces.
+            if ring.back().map(|e| e.5) != Some(scn_len as u32) {
+                ring.clear();
+            }
+            if ring.len() >= SG_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back((
+                pc as u32,
+                opcode,
+                depth as u32,
+                elm as u32,
+                top.map(|v| v as i64).unwrap_or(i64::MIN),
+                scn_len as u32,
+                call_depth as u32,
+            ));
+        });
+    });
+}
+
 const CD_COMMAND: u8 = constants::cd::COMMAND;
 const CD_TEXT: u8 = constants::cd::TEXT;
 const CD_NAME: u8 = constants::cd::NAME;
@@ -1308,6 +1372,36 @@ impl<'a> SceneVm<'a> {
         }
     }
 
+    /// Render the SG_VM_RING buffer oldest -> newest for the `pop_int` underflow
+    /// report. Read the `depth=` column downwards: the first entry whose depth is
+    /// lower than the entry above it is the instruction that consumed the value.
+    fn sg_ring_dump(&self) -> String {
+        SG_OP_RING.with(|ring| {
+            let ring = ring.borrow();
+            if ring.is_empty() {
+                return "\n    [no SG_VM_RING data: rerun with SG_VM_RING=1]".to_string();
+            }
+            let mut out = String::with_capacity(ring.len() * 72);
+            for (pc, opcode, depth, elm, top, _scn_len, call_depth) in ring.iter() {
+                let top = if *top == i64::MIN {
+                    "<empty>".to_string()
+                } else {
+                    top.to_string()
+                };
+                out.push_str(&format!(
+                    "\n    pc=0x{:x} {:<16} depth={} elm_pts={} call={} top={}",
+                    pc,
+                    Self::vm_opcode_name(*opcode as u8),
+                    depth,
+                    elm,
+                    call_depth,
+                    top
+                ));
+            }
+            out
+        })
+    }
+
     #[inline(always)]
     fn vm_trace_opcode(&self, pc: usize, opcode: u8, phase: &str) {
         vm_trace!(
@@ -1863,6 +1957,7 @@ impl<'a> SceneVm<'a> {
             None,
         );
         call_frame.call_type = 3;
+        call_frame.return_override = Some((return_pc, ret_form));
         self.call_stack.push(call_frame);
         self.stream.set_prg_cntr(offset)?;
 
@@ -2420,6 +2515,13 @@ impl<'a> SceneVm<'a> {
     ) -> Result<bool> {
         let checkpoint = self.inline_exec_checkpoint();
         let saved_scene_no = checkpoint.scene_no;
+        // The callback runs on the *shared* interpreter stacks, so it can consume
+        // values the suspended caller already pushed (a frame action may be drained
+        // while the scenario sits in the middle of an expression). Lengths alone
+        // cannot bring those back, so snapshot the values too.
+        let saved_int_stack = self.int_stack.clone();
+        let saved_str_stack = self.str_stack.clone();
+        let saved_element_points = self.element_points.clone();
         let saved_scene_stack_len = checkpoint.scene_depth;
         let saved_call_depth = checkpoint.call_depth;
 
@@ -2525,6 +2627,19 @@ impl<'a> SceneVm<'a> {
                     run_error.is_some()
                 );
             }
+            if completed_by_return {
+                // The callback RETURNed normally, so execution resumes in the caller
+                // at the pc recorded when the frame action was drained. That pc can be
+                // mid-expression: the next opcode then pops an operand the callback
+                // consumed, and the VM dies with `int stack underflow` (observed at
+                // sys40_mp20 line 3178, pc=0x3b3cc, ring depth 3 -> 0 across the call).
+                // Restore the caller's operand stacks verbatim. On the boundary paths
+                // the callback is still parked in the call stack, so leave the tail
+                // alone and keep the original discard-the-tail behaviour.
+                self.int_stack = saved_int_stack;
+                self.str_stack = saved_str_stack;
+                self.element_points = saved_element_points;
+            }
             self.restore_inline_exec_checkpoint(checkpoint)?;
         }
 
@@ -2563,6 +2678,21 @@ impl<'a> SceneVm<'a> {
         caller.return_scene_name = self.current_scene_name.clone();
         caller.return_line_no = self.current_line_no;
         caller.ret_form = ret_form;
+        if sg_ring_on() {
+            eprintln!(
+                "[SG_CALL_ENTER] scene={} pc=0x{:x} offset=0x{:x} ret_form={} (void={} int={}) excall={} frame_action={} argc={} depth={}",
+                self.current_scene_name.as_deref().unwrap_or("<none>"),
+                return_pc,
+                offset,
+                ret_form,
+                self.cfg.fm_void,
+                self.cfg.fm_int,
+                excall_proc,
+                frame_action_proc,
+                call_args.len(),
+                depth
+            );
+        }
         for arg in call_args {
             self.push_call_arg_value(arg);
         }
@@ -2574,6 +2704,7 @@ impl<'a> SceneVm<'a> {
             None,
         );
         call_frame.call_type = 3;
+        call_frame.return_override = Some((return_pc, ret_form));
         self.call_stack.push(call_frame);
         self.stream.set_prg_cntr(offset)?;
         if excall_proc {
@@ -4162,6 +4293,16 @@ impl<'a> SceneVm<'a> {
 
         self.vm_trace_opcode(pc_before, opcode, "before");
 
+        sg_ring_push(
+            pc_before,
+            opcode,
+            self.int_stack.len(),
+            self.element_points.len(),
+            self.int_stack.last().copied(),
+            self.stream.debug_len(),
+            self.call_stack.len(),
+        );
+
         match opcode {
             CD_NL => {
                 let line_no = self.stream.pop_i32()?;
@@ -4471,6 +4612,49 @@ impl<'a> SceneVm<'a> {
             }
             CD_RETURN => {
                 let args = self.pop_arg_list()?;
+                if sg_ring_on() {
+                    // `exec_return` reads the continuation AND the result form from the
+                    // frame *under* the callee, so log that one too: if it says fm_void
+                    // while the call site expects an int, the result is silently dropped
+                    // and the caller's next pop underflows.
+                    if let Some(c) = self.call_stack.iter().rev().nth(1) {
+                        eprintln!(
+                            "[SG_RETURN_CALLER] caller_return_pc=0x{:x} caller_ret_form={} (void={} int={}) caller_call_type={} caller_scene={:?}",
+                            c.return_pc,
+                            c.ret_form,
+                            self.cfg.fm_void,
+                            self.cfg.fm_int,
+                            c.call_type,
+                            c.return_scene_name
+                        );
+                    }
+                    match self.call_stack.last() {
+                        Some(f) => eprintln!(
+                            "[SG_RETURN] scene={} line={} pc=0x{:x} -> return_pc=0x{:x} return_scene={:?} return_line={} call_type={} depth={} scene_stack={} int_depth={} callee_ret_form={} override={:?} args={:?}",
+                            self.current_scene_name.as_deref().unwrap_or("<none>"),
+                            self.current_line_no,
+                            pc_before,
+                            f.return_pc,
+                            f.return_scene_name,
+                            f.return_line_no,
+                            f.call_type,
+                            self.call_stack.len(),
+                            self.scene_stack.len(),
+                            self.int_stack.len(),
+                            f.ret_form,
+                            f.return_override,
+                            args
+                        ),
+                        None => eprintln!(
+                            "[SG_RETURN] scene={} line={} pc=0x{:x} frame=<none> depth=0 scene_stack={} int_depth={}",
+                            self.current_scene_name.as_deref().unwrap_or("<none>"),
+                            self.current_line_no,
+                            pc_before,
+                            self.scene_stack.len(),
+                            self.int_stack.len()
+                        ),
+                    }
+                }
                 if self.vm_trace_matches() {
                     if let Some(frame) = self.call_stack.last() {
                         self.vm_trace_emit(
@@ -4744,14 +4928,38 @@ impl<'a> SceneVm<'a> {
             }
             None => {
                 vm_trace!(self, None, "pop_int underflow");
+                // Report the site as precisely as possible. `pc` alone lands in
+                // the middle of a long compiled `if/else if` chain and cannot be
+                // mapped back to a source line, so include the element the VM was
+                // evaluating (when the pop happens inside a property/command
+                // dispatch) and the remaining stack depth.
+                let call = self
+                    .ctx
+                    .vm_call
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            "element={:?} al_id={:?} ret_form={}",
+                            m.element, m.al_id, m.ret_form
+                        )
+                    })
+                    .unwrap_or_else(|| "element=<none>".to_string());
+                let pc = self.stream.get_prg_cntr();
+                let (win_start, win) = self.stream.debug_bytes_around(pc, 24, 24);
+                let ring = self.sg_ring_dump();
                 Err(anyhow!(
-                    "int stack underflow: scene={} scene_no={} line={} pc=0x{:x}",
+                    "int stack underflow: scene={} scene_no={} line={} pc=0x{:x} depth={} {} bytes@0x{:x}={:02x?}{}",
                     self.current_scene_name.as_deref().unwrap_or("<none>"),
                     self.current_scene_no
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                     self.current_line_no,
-                    self.stream.get_prg_cntr()
+                    pc,
+                    self.int_stack.len(),
+                    call,
+                    win_start,
+                    win,
+                    ring
                 ))
             }
         }
@@ -11715,8 +11923,19 @@ impl<'a> SceneVm<'a> {
         // Frame-action/user-command inline calls may run nested gosubs while a
         // script gosub is waiting, so the authoritative continuation must be
         // the caller frame here rather than any callee-local scratch state.
-        let return_pc = caller.return_pc;
-        let ret_form = caller.ret_form;
+        // The continuation belongs to the *callee*: it is recorded when the call is
+        // made. The caller-frame slots are shared with every other dispatch that runs
+        // while a script-level call is suspended (pending button actions, frame-action
+        // finishes, excall procs), and those overwrite them with their own fm_void
+        // continuation. Reading the caller slots here therefore drops the script's
+        // pending call result -- observed as `caller_ret_form=0 (void)` while the call
+        // site needs FM_INT, leaving the interpreter one value short, and the next
+        // conditional pop dies with `int stack underflow`.
+        // `return_override` is the per-callee copy of that continuation.
+        let (return_pc, ret_form) = match callee.return_override {
+            Some((pc, form)) => (pc, form),
+            None => (caller.return_pc, caller.ret_form),
+        };
         if self.runtime_options.trace_call_return_pc {
             eprintln!(
                 "[SG_CALL_PC] return depth={} pc=0x{:x} ret_form={} override={:?} args={:?}",

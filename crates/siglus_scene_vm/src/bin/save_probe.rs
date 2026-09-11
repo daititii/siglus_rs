@@ -459,6 +459,29 @@ fn run_probe() -> Result<()> {
     let mut last_scene = String::new();
     let mut injected = false;
     let mut advances = 0usize;
+
+    // `SAVE_PROBE_SWEEP="x0,y0,x1,y1,step"`: instead of injecting one fixed
+    // cursor position, walk the cursor over the whole map body and press+release
+    // at every grid point. Which particular location marker triggers the
+    // `int stack underflow` is not known, and the map script only evaluates its
+    // 30 location slots while the cursor is inside the map body
+    // (`sys40_mp20` original line ~1250 / file line 3056), so a single point is
+    // not enough to search the space.
+    let sweep: Option<(i32, i32, i32, i32, i32)> = std::env::var("SAVE_PROBE_SWEEP")
+        .ok()
+        .and_then(|raw| {
+            let v: Vec<i32> = raw
+                .split(',')
+                .filter_map(|t| t.trim().parse().ok())
+                .collect();
+            if v.len() == 5 && v[4] > 0 {
+                Some((v[0], v[1], v[2], v[3], v[4]))
+            } else {
+                None
+            }
+        });
+    let mut sweep_k = 0usize;
+    let mut sweep_notified = false;
     for frame in 0..frames_after {
         // Play through the restored story the way the user does: tap/Enter to
         // clear MESSAGE_KEY_WAIT. Without this the VM blocks on the restored
@@ -483,26 +506,17 @@ fn run_probe() -> Result<()> {
             }
         }
 
-        if !injected && scene == "sys40_mp20" && frame > 60 {
+        if !injected && sweep.is_none() && scene == "sys40_mp20" && frame > 60 {
             injected = true;
             println!();
             println!("=== cursor injection at f{frame} in {scene} ===");
-            println!("before      : {}", input_state(&mut vm));
-            vm.ctx.on_mouse_move(click_x, click_y);
-            println!("after move  : {}", input_state(&mut vm));
-            let _ = step(&mut vm)?;
-            println!("after 1 frame: {}", input_state(&mut vm));
-            vm.ctx.on_mouse_down(VmMouseButton::Left);
-            let _ = step(&mut vm)?;
-            println!("after click : {}", input_state(&mut vm));
-            dump_map_objects(&vm);
-            dump_tr_states(&vm, &[0, 77]);
-            dump_render(&mut vm);
 
-            // Optional proof step (`SAVE_PROBE_TR_SET`): the map UI container carries
-            // tr=0, and `visible = parent_visible && info.disp && local_tr > 0`
-            // suppresses the whole descendant subtree. Forcing tr to 255 should make
-            // the map sprites reach the submitted frame.
+            // `SAVE_PROBE_TR_SET`: a save written while the map container was
+            // mid-fade records `tr_eve = {loop_type: -1, value: 0}`, which makes
+            // the whole 141-child map subtree invisible. Force the container's
+            // `tr` back up *before* clicking so the click can actually reach the
+            // location markers; otherwise hit-testing runs against a container
+            // that reports itself invisible.
             if let Ok(tr) = std::env::var("SAVE_PROBE_TR_SET") {
                 if let Ok(tr) = tr.trim().parse::<i64>() {
                     let form_id = vm.ctx.ids.form_global_stage;
@@ -517,11 +531,52 @@ fn run_probe() -> Result<()> {
                             }
                         }
                     }
+                    let _ = step(&mut vm)?;
                     dump_render(&mut vm);
                 }
             }
+
+            println!("before      : {}", input_state(&mut vm));
+            vm.ctx.on_mouse_move(click_x, click_y);
+            println!("after move  : {}", input_state(&mut vm));
+            let _ = step(&mut vm)?;
+            println!("after 1 frame: {}", input_state(&mut vm));
+            vm.ctx.on_mouse_down(VmMouseButton::Left);
+            let _ = step(&mut vm)?;
+            println!("after click : {}", input_state(&mut vm));
+            dump_map_objects(&vm);
+            dump_tr_states(&vm, &[0, 77]);
+            dump_render(&mut vm);
+
             println!("=== end injection ===");
             println!();
+        }
+
+        if let Some((x0, y0, x1, y1, st)) = sweep {
+            if scene == "sys40_mp20" && frame > 60 {
+                let cols = ((x1 - x0) / st).max(0) + 1;
+                let rows = ((y1 - y0) / st).max(0) + 1;
+                let total = (cols * rows) as usize;
+                if sweep_k >= total {
+                    if !sweep_notified {
+                        sweep_notified = true;
+                        println!("=== sweep finished: {total} points, no vm error ===");
+                    }
+                } else {
+                    let x = x0 + (sweep_k as i32 % cols) * st;
+                    let y = y0 + (sweep_k as i32 / cols) * st;
+                    sweep_k += 1;
+                    vm.ctx.on_mouse_move(x, y);
+                    let _ = step(&mut vm)?;
+                    vm.ctx.on_mouse_down(VmMouseButton::Left);
+                    let _ = step(&mut vm)?;
+                    vm.ctx.on_mouse_up(VmMouseButton::Left);
+                    let _ = step(&mut vm)?;
+                    if sweep_k % 20 == 1 {
+                        println!("sweep {sweep_k}/{total} at ({x},{y}) | {}", state(&mut vm));
+                    }
+                }
+            }
         }
     }
 

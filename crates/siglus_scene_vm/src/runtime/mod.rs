@@ -721,6 +721,15 @@ impl CommandContext {
         // loaded local stream. Wipe before parsing so that snapshot entries that
         // are simply *absent* (the snapshot has no mask list, no editbox, etc.)
         // truly become absent post-load instead of inheriting from the menu.
+        if !self.globals.stage_forms.is_empty() {
+            log::warn!(
+                "[SG_STAGE_FORMS_CLEARED] by=begin_runtime_load_apply scene={:?} scene_no={:?} line={} dropping_forms={:?}",
+                self.current_scene_name,
+                self.current_scene_no,
+                self.current_line_no,
+                self.globals.stage_forms.keys().collect::<Vec<_>>()
+            );
+        }
         self.globals.stage_forms.clear();
         self.globals.screen_forms.clear();
         self.globals.counter_lists.clear();
@@ -2075,6 +2084,22 @@ impl CommandContext {
     /// scene restart and destroyed data that the original engine retains.
     pub fn reset_for_scene_restart(&mut self) {
         use crate::runtime::forms::codes;
+
+        // `reinit_local()` equivalent: this wipes every stage object. The scene
+        // that runs next is expected to rebuild its own stage tree. If a scene
+        // keeps running its per-frame loop across this call, its objects are
+        // gone and subsequent object ops fabricate empty stand-ins (black screen
+        // + unbounded nested-slot growth). Log it so the clearing path can be
+        // attributed from a single reproduction.
+        if !self.globals.stage_forms.is_empty() {
+            log::warn!(
+                "[SG_STAGE_FORMS_CLEARED] by=reset_for_scene_restart scene={:?} scene_no={:?} line={} dropping_forms={:?}",
+                self.current_scene_name,
+                self.current_scene_no,
+                self.current_line_no,
+                self.globals.stage_forms.keys().collect::<Vec<_>>()
+            );
+        }
 
         let append_dir = self.globals.append_dir.clone();
         let append_name = self.globals.append_name.clone();
