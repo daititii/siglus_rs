@@ -306,6 +306,7 @@ fn dump_render(vm: &mut SceneVm<'static>) {
         let info = s
             .sprite
             .image_id
+            .as_ref()
             .and_then(|id| vm.ctx.images.debug_image_info(id));
         let name = info
             .as_ref()
