@@ -29,6 +29,8 @@ use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
 use siglus_scene_vm::image_manager::ImageId;
 use siglus_scene_vm::render::{Renderer, RendererDebugTexture};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+use siglus_scene_vm::desktop_config::{ConfigDialog, DesktopConfigAction, DesktopConfigWindow};
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use siglus_scene_vm::desktop_messagebox::{DesktopMessageBoxBridge, DesktopMessageBoxWindow};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use siglus_scene_vm::desktop_twitter::{DesktopTwitterAction, DesktopTwitterWindow};
@@ -229,6 +231,12 @@ struct App {
     desktop_messagebox_bridge: DesktopMessageBoxBridge,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     desktop_messagebox_window: Option<DesktopMessageBoxWindow>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    desktop_config_window: Option<DesktopConfigWindow>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    desktop_config_request: Option<ConfigDialog>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    desktop_config_open: bool,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     desktop_twitter_window: Option<DesktopTwitterWindow>,
 }
@@ -435,6 +443,12 @@ impl App {
             desktop_messagebox_bridge: DesktopMessageBoxBridge::new(),
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             desktop_messagebox_window: None,
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            desktop_config_window: None,
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            desktop_config_request: None,
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            desktop_config_open: false,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             desktop_twitter_window: None,
         }
@@ -1883,6 +1897,12 @@ impl App {
                     let Some(vm) = self.vm.as_mut() else {
                         return Ok(false);
                     };
+                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                    {
+                        self.desktop_config_request = Some(ConfigDialog::new(&vm.ctx));
+                        self.desktop_config_open = true;
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                     syscom::open_fallback_dialog(&mut vm.ctx, SyscomPendingProcKind::OpenConfig);
                     Ok(true)
                 }
@@ -2151,6 +2171,8 @@ impl App {
         let Some(vm) = self.vm.as_mut() else {
             return Ok(());
         };
+        let (target_scene, target_z) = vm.ctx.pending_menu_scene.take()
+            .unwrap_or((target_scene, target_z));
         let saved_msgbk = if leave_msgbk {
             Some(vm.ctx.globals.msgbk_forms.clone())
         } else {
@@ -2254,6 +2276,7 @@ impl App {
         // stack until the active proc asks to break for this frame. Script
         // execution itself is boundary-driven; there is no instruction quota.
         loop {
+            if self.native_messagebox_pending() { break; }
             let Some(proc) = self.flow.top().cloned() else {
                 self.paused = true;
                 break;
@@ -2781,7 +2804,7 @@ impl App {
             };
             (
                 Self::syscom_int(&vm.ctx, GET_WINDOW_MODE, 0),
-                Self::syscom_int(&vm.ctx, GET_WINDOW_MODE_SIZE, 0),
+                Self::syscom_int(&vm.ctx, GET_WINDOW_MODE_SIZE, 100),
             )
         };
 
@@ -2796,18 +2819,9 @@ impl App {
 
         if self.last_window_size != Some(size_mode) && mode == 0 {
             let (w0, h0) = self.initial_size;
-            let (nw, nh) = match size_mode {
-                0 => (w0, h0),
-                1 => (640, 480),
-                2 => (800, 600),
-                3 => (1024, 768),
-                4 => (1280, 720),
-                5 => (1366, 768),
-                6 => (1600, 900),
-                7 => (1920, 1080),
-                _ => (w0, h0),
-            };
-            let _ = (nw, nh);
+            let scale = size_mode.clamp(25, 400) as u32;
+            let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
+                w0.saturating_mul(scale) / 100, h0.saturating_mul(scale) / 100));
             self.last_window_size = Some(size_mode);
         }
 
@@ -2895,11 +2909,56 @@ impl App {
     }
 
     fn native_messagebox_pending(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        if self.desktop_config_open { return true; }
         self.vm
             .as_ref()
             .and_then(|vm| vm.ctx.globals.system.messagebox_modal.as_ref())
             .map(|modal| modal.native_pending)
             .unwrap_or(false)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn pump_desktop_config_request(&mut self, elwt: &ActiveEventLoop) {
+        let Some(dialog) = self.desktop_config_request.take() else { return; };
+        if let Some(window) = self.desktop_config_window.as_mut() {
+            window.reopen(dialog);
+            return;
+        }
+        match DesktopConfigWindow::new(elwt, dialog) {
+            Ok(window) => self.desktop_config_window = Some(window),
+            Err(err) => {
+                log::error!("configuration window creation failed: {err:#}");
+                self.desktop_config_open = false;
+                if let Some(vm) = self.vm.as_mut() {
+                    siglus_scene_vm::runtime::forms::syscom::open_fallback_dialog(
+                        &mut vm.ctx, SyscomPendingProcKind::OpenConfig);
+                }
+                self.wake_for_input();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn handle_desktop_config_event(&mut self, event: WindowEvent) {
+        use siglus_scene_vm::runtime::forms::syscom;
+        let Some(window) = self.desktop_config_window.as_mut() else { return; };
+        let Some(action) = window.handle_window_event(event) else { return; };
+        if let Some(vm) = self.vm.as_mut() {
+            syscom::apply_config_dialog_state(&mut vm.ctx, window.dialog.state.clone());
+            if matches!(action, DesktopConfigAction::Close) {
+                syscom::write_config_save(&vm.ctx);
+                // The owner window did not receive releases while the dialog was active.
+                vm.ctx.input = Default::default();
+                vm.ctx.script_input = Default::default();
+            }
+        }
+        if matches!(action, DesktopConfigAction::Close) {
+            window.hide();
+            self.desktop_config_open = false;
+            self.wake_for_input();
+        }
+        self.apply_syscom_window_config();
     }
 
     fn needs_continuous_frame(&self) -> bool {
@@ -3198,6 +3257,12 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        if self.desktop_config_open && self.desktop_config_window.as_ref().map(|w| w.window_id()) == Some(id) {
+            self.handle_desktop_config_event(event);
+            return;
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         if self
             .desktop_messagebox_window
             .as_ref()
@@ -3224,7 +3289,9 @@ impl ApplicationHandler for App {
         if !is_main && !is_hud {
             return;
         }
-        if is_main && self.native_messagebox_pending() {
+        if is_main && self.native_messagebox_pending()
+            && !matches!(&event, WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. })
+        {
             // The original owner window is disabled for the duration of the
             // blocking MessageBox call; do not queue input for later VM frames.
             return;
@@ -3281,6 +3348,7 @@ impl ApplicationHandler for App {
                         state: ElementState::Pressed,
                         physical_key: PhysicalKey::Code(code),
                         text,
+                        repeat,
                         ..
                     },
                 ..
@@ -3352,7 +3420,12 @@ impl ApplicationHandler for App {
 
                 if let Some(vm) = self.vm.as_mut() {
                     if let Some(k) = map_keycode(code) {
-                        vm.ctx.on_key_down(k);
+                        // A held key must not become a fresh menu decision after
+                        // RETURNMENU resets the VM input state. Keep text/edit
+                        // repeats, but require a new press for decide/cancel.
+                        if !repeat || !matches!(k, VmKey::Enter | VmKey::Space | VmKey::Escape) {
+                            vm.ctx.on_key_down(k);
+                        }
                     } else if !vm.ctx.editbox_accepts_keyboard_input() {
                         vm.ctx.notify_wait_key();
                     }
@@ -3534,6 +3607,7 @@ impl ApplicationHandler for App {
 
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         {
+            self.pump_desktop_config_request(elwt);
             self.pump_desktop_messagebox_requests(elwt);
             self.pump_desktop_twitter_request(elwt);
         }
@@ -3606,6 +3680,7 @@ impl ApplicationHandler for App {
             self.apply_syscom_window_config();
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             {
+                self.pump_desktop_config_request(elwt);
                 self.pump_desktop_messagebox_requests(elwt);
                 self.pump_desktop_twitter_request(elwt);
             }

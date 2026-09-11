@@ -135,19 +135,54 @@ fn global_stage_alias_to_index(form_id: i32) -> Option<i64> {
     }
 }
 
+fn is_element_array(code: i32) -> bool {
+    code == forms::codes::ELM_ARRAY || code == -1
+}
+
+fn mwnd_ref_from_element(chain: &[i32]) -> Option<(i64, usize)> {
+    if chain.len() >= 4 {
+        if let Some(stage) = chain
+            .first()
+            .and_then(|head| global_stage_alias_to_index(*head))
+        {
+            if chain[1] == forms::codes::ELM_STAGE_MWND
+                && is_element_array(chain[2])
+                && chain[3] >= 0
+            {
+                return Some((stage, chain[3] as usize));
+            }
+        }
+    }
+
+    // GLOBAL.STAGE[stage].MWND[index].  Do not scan for the first ELM_ARRAY:
+    // the stage index and MWND index are independent array dimensions.
+    if chain.len() >= 6
+        && chain[0] == forms::codes::ELM_GLOBAL_STAGE
+        && is_element_array(chain[1])
+        && chain[2] >= 0
+        && chain[3] == forms::codes::ELM_STAGE_MWND
+        && is_element_array(chain[4])
+        && chain[5] >= 0
+    {
+        return Some((chain[2] as i64, chain[5] as usize));
+    }
+
+    None
+}
+
+fn front_mwnd_element(no: usize) -> Vec<i32> {
+    vec![
+        forms::codes::ELM_GLOBAL_FRONT,
+        forms::codes::ELM_STAGE_MWND,
+        forms::codes::ELM_ARRAY,
+        no as i32,
+    ]
+}
+
 fn mwnd_ref_from_value(v: &Value) -> Option<(i64, usize)> {
     match v.unwrap_named() {
         Value::Int(n) if *n >= 0 => Some((1, *n as usize)),
-        Value::Element(chain) => {
-            let stage = chain
-                .first()
-                .and_then(|head| global_stage_alias_to_index(*head))
-                .unwrap_or(1);
-            let no = chain.windows(2).find_map(|w| {
-                (w[0] == forms::codes::ELM_ARRAY && w[1] >= 0).then_some(w[1] as usize)
-            })?;
-            Some((stage, no))
-        }
+        Value::Element(chain) => mwnd_ref_from_element(chain),
         _ => None,
     }
 }
@@ -1974,6 +2009,30 @@ pub fn dispatch_global_form(
 ) -> Result<bool> {
     let form_id = canonical_global_form_id(ctx, form_id);
 
+    if form_id == constants::elm_value::GLOBAL_GET_SCENE_NAME as u32 {
+        ctx.stack.push(Value::Str(ctx.current_scene_name.clone().unwrap_or_default()));
+        return Ok(true);
+    }
+    if form_id == constants::elm_value::GLOBAL_RETURNMENU as u32 {
+        use crate::runtime::globals::{SyscomPendingProc, SyscomPendingProcKind};
+
+        ctx.pending_menu_scene = args.first().and_then(Value::as_str).map(|scene| {
+            (scene.to_string(), args.get(1).and_then(Value::as_i64).unwrap_or(0) as i32)
+        });
+        ctx.globals.syscom.pending_proc = Some(SyscomPendingProc {
+            kind: SyscomPendingProcKind::ReturnToMenu,
+            warning: false,
+            se_play: false,
+            fade_out: false,
+            leave_msgbk: false,
+            save_id: 0,
+        });
+        ctx.globals.syscom.menu_open = false;
+        // Return control to the host before executing another script instruction.
+        ctx.request_proc_boundary(crate::runtime::ProcKind::Script);
+        return Ok(true);
+    }
+
     if dispatch_global_wipe_command(ctx, form_id, args)? {
         return Ok(true);
     }
@@ -2040,17 +2099,30 @@ pub fn dispatch_global_form(
     if form_id == constants::elm_value::GLOBAL_SET_MWND as u32
         || form_id == constants::elm_value::GLOBAL_SET_SEL_MWND as u32
     {
-        let next = args.iter().find_map(mwnd_ref_from_value);
-        if form_id == constants::elm_value::GLOBAL_SET_SEL_MWND as u32 {
-            if let Some((stage, no)) = next {
-                ctx.globals.current_sel_mwnd_stage_idx = stage;
-                ctx.globals.current_sel_mwnd_no = Some(no);
+        // C++ dispatches the two overloads by al_id: al_id=0 copies the full
+        // S_element verbatim, while al_id=1 constructs FRONT.MWND[int].
+        let al_id = ctx.vm_call.as_ref().map(|m| m.al_id);
+        let arg = args.first().map(Value::unwrap_named);
+        let element = match (al_id, arg) {
+            (Some(0), Some(Value::Element(chain))) => Some(chain.clone()),
+            (Some(1), Some(Value::Int(no))) if *no >= 0 => {
+                Some(front_mwnd_element(*no as usize))
             }
-        } else if let Some((stage, no)) = next {
-            ctx.globals.current_mwnd_stage_idx = stage;
-            ctx.globals.current_mwnd_no = Some(no);
-            ctx.globals.last_mwnd_stage_idx = stage;
-            ctx.globals.last_mwnd_no = Some(no);
+            _ => None,
+        };
+
+        if let Some(element) = element {
+            if let Some((stage, no)) = mwnd_ref_from_element(&element) {
+                if form_id == constants::elm_value::GLOBAL_SET_SEL_MWND as u32 {
+                    ctx.globals.current_sel_mwnd_element = element;
+                    ctx.globals.current_sel_mwnd_stage_idx = stage;
+                    ctx.globals.current_sel_mwnd_no = Some(no);
+                } else {
+                    ctx.globals.current_mwnd_element = element;
+                    ctx.globals.current_mwnd_stage_idx = stage;
+                    ctx.globals.current_mwnd_no = Some(no);
+                }
+            }
         }
         return Ok(true);
     }
@@ -2239,6 +2311,87 @@ mod koe_wait_return_tests {
             id,
             value: Box::new(Value::Int(value)),
         }
+    }
+
+
+    #[test]
+    fn mwnd_element_decoder_distinguishes_stage_index_from_mwnd_index() {
+        let canonical = vec![
+            forms::codes::ELM_GLOBAL_STAGE,
+            forms::codes::ELM_ARRAY,
+            2,
+            forms::codes::ELM_STAGE_MWND,
+            forms::codes::ELM_ARRAY,
+            7,
+        ];
+        assert_eq!(mwnd_ref_from_element(&canonical), Some((2, 7)));
+
+        let alias = vec![
+            forms::codes::ELM_GLOBAL_FRONT,
+            forms::codes::ELM_STAGE_MWND,
+            forms::codes::ELM_ARRAY,
+            7,
+        ];
+        assert_eq!(mwnd_ref_from_element(&alias), Some((1, 7)));
+    }
+
+
+    #[test]
+    fn set_mwnd_element_overload_preserves_complete_element_and_does_not_touch_last() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let element = vec![
+            forms::codes::ELM_GLOBAL_STAGE,
+            forms::codes::ELM_ARRAY,
+            2,
+            forms::codes::ELM_STAGE_MWND,
+            forms::codes::ELM_ARRAY,
+            7,
+        ];
+        ctx.vm_call = Some(VmCallMeta {
+            element: vec![constants::elm_value::GLOBAL_SET_MWND],
+            al_id: 0,
+            ret_form: 0,
+        });
+
+        assert!(dispatch_global_form(
+            &mut ctx,
+            constants::elm_value::GLOBAL_SET_MWND as u32,
+            &[Value::Element(element.clone())],
+        )
+        .unwrap());
+        assert_eq!(ctx.globals.current_mwnd_element, element);
+        assert_eq!(ctx.globals.current_mwnd_stage_idx, 2);
+        assert_eq!(ctx.globals.current_mwnd_no, Some(7));
+        assert!(ctx.globals.last_mwnd_element.is_empty());
+        assert_eq!(ctx.globals.last_mwnd_no, None);
+    }
+
+    #[test]
+    fn set_mwnd_integer_overload_constructs_front_mwnd() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        ctx.vm_call = Some(VmCallMeta {
+            element: vec![constants::elm_value::GLOBAL_SET_MWND],
+            al_id: 1,
+            ret_form: 0,
+        });
+
+        assert!(dispatch_global_form(
+            &mut ctx,
+            constants::elm_value::GLOBAL_SET_MWND as u32,
+            &[Value::Int(6)],
+        )
+        .unwrap());
+        assert_eq!(
+            ctx.globals.current_mwnd_element,
+            vec![
+                forms::codes::ELM_GLOBAL_FRONT,
+                forms::codes::ELM_STAGE_MWND,
+                forms::codes::ELM_ARRAY,
+                6,
+            ]
+        );
+        assert_eq!(ctx.globals.current_mwnd_stage_idx, 1);
+        assert_eq!(ctx.globals.current_mwnd_no, Some(6));
     }
 
     #[test]

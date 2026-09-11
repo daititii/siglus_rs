@@ -143,7 +143,8 @@ enum WmvStreamEvent {
     },
     Video {
         frame_idx: usize,
-        pts_ms: u64,
+        source_pts_ms: u64,
+        timeline_ms: u64,
         frame: Arc<RgbaImage>,
     },
     Done,
@@ -152,7 +153,7 @@ enum WmvStreamEvent {
 #[derive(Clone)]
 struct WmvDecodedFrame {
     frame_idx: usize,
-    pts_ms: u64,
+    timeline_ms: u64,
     frame: Arc<RgbaImage>,
 }
 
@@ -163,6 +164,7 @@ struct WmvStreamState {
     height: Option<u32>,
     fps: Option<f32>,
     decoded_frames: usize,
+    timeline_origin_ms: Option<u64>,
     last_video_timeline_ms: Option<u64>,
     last_frame_delta_ms: Option<u64>,
     total_ms_hint: Option<u64>,
@@ -1847,6 +1849,7 @@ fn spawn_wmv_stream_state(
         height: info.height,
         fps: None,
         decoded_frames: 0,
+        timeline_origin_ms: None,
         last_video_timeline_ms: None,
         last_frame_delta_ms: None,
         total_ms_hint: info.duration_ms(),
@@ -1879,6 +1882,7 @@ fn stream_wmv_video_worker(
     }
 
     let mut frame_idx = 0usize;
+    let mut timeline_origin_ms = None::<u64>;
     loop {
         if request_ms.load(Ordering::Acquire) == usize::MAX {
             return Ok(());
@@ -1889,21 +1893,30 @@ fn stream_wmv_video_worker(
         let Some(decoded) = decoded else {
             break;
         };
-        let pts_ms = decoded.pts_ms as u64;
+        let source_pts_ms = decoded.pts_ms as u64;
+        let origin_ms = *timeline_origin_ms.get_or_insert(source_pts_ms);
+        let timeline_ms = source_pts_ms.saturating_sub(origin_ms);
 
+        // AsfWmv2Decoder exposes ASF presentation timestamps after container
+        // preroll removal, but the first video PTS is not required to be zero.
+        // Siglus playback time starts at zero when the movie starts.  Gate the
+        // streaming worker on the movie-relative timeline, exactly as the
+        // standalone WMV player does with (frame.pts_ms - pts0).  Gating on the
+        // absolute ASF PTS can deadlock bootstrap: the first frame waits for a
+        // clock that cannot advance until that first frame is delivered.
         loop {
             let requested = request_ms.load(Ordering::Acquire);
             if requested == usize::MAX {
                 return Ok(());
             }
-            if pts_ms <= requested as u64 {
+            if timeline_ms <= requested as u64 {
                 break;
             }
             thread::sleep(Duration::from_millis(1));
         }
 
         let requested = request_ms.load(Ordering::Acquire) as u64;
-        if pts_ms.saturating_add(WMV_STREAM_DISCARD_BEHIND_MS) < requested {
+        if timeline_ms.saturating_add(WMV_STREAM_DISCARD_BEHIND_MS) < requested {
             frame_idx = frame_idx.saturating_add(1);
             continue;
         }
@@ -1912,7 +1925,8 @@ fn stream_wmv_video_worker(
         if tx
             .send(Ok(WmvStreamEvent::Video {
                 frame_idx,
-                pts_ms,
+                source_pts_ms,
+                timeline_ms,
                 frame,
             }))
             .is_err()
@@ -1940,11 +1954,18 @@ fn drain_wmv_stream_state(
             }
             Ok(Ok(WmvStreamEvent::Video {
                 frame_idx,
-                pts_ms,
+                source_pts_ms,
+                timeline_ms,
                 frame,
             })) => {
+                if state.timeline_origin_ms.is_none() {
+                    state.timeline_origin_ms = Some(source_pts_ms);
+                    state.total_ms_hint = state
+                        .total_ms_hint
+                        .and_then(|total| wmv_rebase_duration_ms(total, source_pts_ms));
+                }
                 if let Some(last) = state.last_video_timeline_ms {
-                    let delta = pts_ms.saturating_sub(last);
+                    let delta = timeline_ms.saturating_sub(last);
                     if (2..=1_000).contains(&delta) {
                         state.last_frame_delta_ms = Some(delta);
                         state.fps = Some(1000.0 / delta as f32);
@@ -1953,13 +1974,13 @@ fn drain_wmv_stream_state(
                 state.last_video_timeline_ms = Some(
                     state
                         .last_video_timeline_ms
-                        .map(|last| last.max(pts_ms))
-                        .unwrap_or(pts_ms),
+                        .map(|last| last.max(timeline_ms))
+                        .unwrap_or(timeline_ms),
                 );
                 state.decoded_frames = state.decoded_frames.max(frame_idx.saturating_add(1));
                 state.frames.push_back(WmvDecodedFrame {
                     frame_idx,
-                    pts_ms,
+                    timeline_ms,
                     frame,
                 });
                 state.decoded_any_this_poll = true;
@@ -1987,7 +2008,7 @@ fn drain_wmv_stream_state(
         let discard = state
             .frames
             .get(1)
-            .map(|frame| frame.pts_ms.saturating_add(100) < target_timer_ms)
+            .map(|frame| frame.timeline_ms.saturating_add(100) < target_timer_ms)
             .unwrap_or(false);
         if !discard {
             break;
@@ -2006,7 +2027,7 @@ fn select_wmv_stream_frame<'a>(
 ) -> Option<&'a WmvDecodedFrame> {
     let mut before = None;
     for frame in frames {
-        if frame.pts_ms <= target_ms {
+        if frame.timeline_ms <= target_ms {
             before = Some(frame);
         } else {
             return before.or(Some(frame));
@@ -2577,6 +2598,7 @@ pub struct WmvStreamAudio {
     pub path: Arc<PathBuf>,
     pub num_frames: usize,
     pub initial_silence_frames: usize,
+    pub source_skip_frames: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2714,6 +2736,7 @@ struct WmvMovieAudioDecoder {
     decoder: wmv_decoder::AsfWmaDecoder<BufReader<fs::File>>,
     pending: VecDeque<Frame>,
     initial_silence_remaining: usize,
+    source_skip_remaining: usize,
     produced_frames: usize,
     eof: bool,
 }
@@ -2726,12 +2749,14 @@ impl WmvMovieAudioDecoder {
         }
         let decoder = Self::open_decoder(info.path.as_ref())?;
         let initial_silence_remaining = info.initial_silence_frames;
+        let source_skip_remaining = info.source_skip_frames;
         Ok(Self {
             info,
             sample_rate,
             decoder,
             pending: VecDeque::new(),
             initial_silence_remaining,
+            source_skip_remaining,
             produced_frames: 0,
             eof: false,
         })
@@ -2748,6 +2773,7 @@ impl WmvMovieAudioDecoder {
         self.decoder = Self::open_decoder(self.info.path.as_ref())?;
         self.pending.clear();
         self.initial_silence_remaining = self.info.initial_silence_frames;
+        self.source_skip_remaining = self.info.source_skip_frames;
         self.produced_frames = 0;
         self.eof = false;
         Ok(())
@@ -2765,7 +2791,9 @@ impl WmvMovieAudioDecoder {
                     decoded.frame.sample_rate,
                     self.sample_rate,
                 );
-                self.pending.extend(frames);
+                let skip = self.source_skip_remaining.min(frames.len());
+                self.source_skip_remaining -= skip;
+                self.pending.extend(frames.into_iter().skip(skip));
             }
             None => self.eof = true,
         }
@@ -3376,8 +3404,16 @@ fn decode_wmv_asset_from_bytes(path: &Path, bytes: Vec<u8>) -> Result<MovieAsset
         bail!("wmv decoder produced no frames: {}", path.display());
     }
 
+    let timeline_origin_ms = pts.first().copied().unwrap_or(0);
+    for pts_ms in &mut pts {
+        *pts_ms = pts_ms.saturating_sub(timeline_origin_ms);
+    }
     let cancel = AtomicBool::new(false);
-    let audio = decode_wmv_audio_full_from_reader(Cursor::new(bytes), &cancel)?;
+    let audio = decode_wmv_audio_full_from_reader(
+        Cursor::new(bytes),
+        &cancel,
+        timeline_origin_ms,
+    )?;
     let fps = wmv_fps_from_pts(&pts);
     let video_duration_ms = pts.last().copied().map(|last| {
         last.saturating_add(wmv_frame_duration_ms(&pts).unwrap_or(0))
@@ -3566,6 +3602,50 @@ fn wmv_fps_from_pts(pts: &[u64]) -> Option<f32> {
         .map(|delta| 1000.0 / delta as f32)
 }
 
+fn wmv_rebase_duration_ms(source_duration_ms: u64, timeline_origin_ms: u64) -> Option<u64> {
+    let rebased = source_duration_ms.saturating_sub(timeline_origin_ms);
+    (rebased > 0).then_some(rebased)
+}
+
+fn wmv_audio_alignment_frames(
+    first_audio_pts_ms: u64,
+    timeline_origin_ms: u64,
+    sample_rate: u32,
+) -> (usize, usize) {
+    if sample_rate == 0 {
+        return (0, 0);
+    }
+    let silence_ms = first_audio_pts_ms.saturating_sub(timeline_origin_ms);
+    let skip_ms = timeline_origin_ms.saturating_sub(first_audio_pts_ms);
+    let initial_silence_frames =
+        (((silence_ms as u128) * sample_rate as u128 + 999) / 1000)
+            .min(usize::MAX as u128) as usize;
+    let source_skip_frames = ((skip_ms as u128) * sample_rate as u128 / 1000)
+        .min(usize::MAX as u128) as usize;
+    (initial_silence_frames, source_skip_frames)
+}
+
+fn probe_wmv_first_video_pts_ms(path: &Path) -> Result<Option<u64>> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let mut decoder = {
+        let bytes = read_movie_bytes(path)?;
+        wmv_decoder::AsfWmv2Decoder::open(Cursor::new(bytes))
+            .with_context(|| format!("open ASF/WMV timeline probe: {}", path.display()))?
+    };
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let mut decoder = {
+        let file = fs::File::open(path)
+            .with_context(|| format!("open WMV timeline probe: {}", path.display()))?;
+        wmv_decoder::AsfWmv2Decoder::open(BufReader::new(file))
+            .with_context(|| format!("open WMV timeline probe decoder: {}", path.display()))?
+    };
+
+    Ok(decoder
+        .next_frame()
+        .with_context(|| format!("decode WMV timeline probe: {}", path.display()))?
+        .map(|frame| frame.pts_ms as u64))
+}
+
 fn decode_wmv_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     let mut decoder = {
@@ -3713,7 +3793,7 @@ fn open_wmv_wma_decoder<R: Read + Seek>(
     if !asf
         .audio_streams
         .iter()
-        .any(|stream| matches!(stream.format_tag, 0x0160 | 0x0161))
+        .any(|stream| matches!(stream.format_tag, 0x0160 | 0x0161 | 0x0162))
     {
         let tags = asf
             .audio_streams
@@ -3732,6 +3812,7 @@ fn open_wmv_wma_decoder<R: Read + Seek>(
 fn decode_wmv_audio_full_from_reader<R: Read + Seek>(
     reader: R,
     cancel: &AtomicBool,
+    timeline_origin_ms: u64,
 ) -> Result<Option<MovieAudio>> {
     let Some(mut decoder) = open_wmv_wma_decoder(reader)? else {
         return Ok(None);
@@ -3755,9 +3836,19 @@ fn decode_wmv_audio_full_from_reader<R: Read + Seek>(
     if cancel.load(Ordering::Acquire) || samples.is_empty() {
         return Ok(None);
     }
-    let start_ms = first_pts_ms.unwrap_or(0);
-    let initial_silence_frames = (((start_ms as u128) * sample_rate as u128 + 999) / 1000)
-        .min(usize::MAX as u128) as usize;
+    let first_audio_pts_ms = first_pts_ms.unwrap_or(timeline_origin_ms);
+    let (initial_silence_frames, source_skip_frames) = wmv_audio_alignment_frames(
+        first_audio_pts_ms,
+        timeline_origin_ms,
+        sample_rate,
+    );
+    let source_skip_samples = source_skip_frames.saturating_mul(channels as usize);
+    if source_skip_samples >= samples.len() {
+        return Ok(None);
+    }
+    if source_skip_samples > 0 {
+        samples.drain(..source_skip_samples);
+    }
     if initial_silence_frames > 0 {
         let mut timeline_samples = Vec::with_capacity(
             initial_silence_frames
@@ -3812,10 +3903,17 @@ fn decode_wmv_audio_for_path(
     let Some(first) = first else {
         return Ok(None);
     };
-    let start_ms = first.pts_ms as u64;
+    let first_audio_pts_ms = first.pts_ms as u64;
     let first_frames = first.frame.samples.len() / channels as usize;
     let first_duration_ms = ((first_frames as u128) * 1000 / sample_rate as u128)
         .min(u64::MAX as u128) as u64;
+    let timeline_origin_ms = probe_wmv_first_video_pts_ms(path)?
+        .unwrap_or(first_audio_pts_ms);
+    let (initial_silence_frames, source_skip_frames) = wmv_audio_alignment_frames(
+        first_audio_pts_ms,
+        timeline_origin_ms,
+        sample_rate,
+    );
 
     let Some(total_ms) = total_ms else {
         // Rare malformed ASF files do not carry a usable play duration. Keep
@@ -3823,19 +3921,20 @@ fn decode_wmv_audio_for_path(
         // rather than inventing a finite Kira stream length.
         let file = fs::File::open(path)
             .with_context(|| format!("reopen WMV audio source: {}", path.display()))?;
-        return decode_wmv_audio_full_from_reader(BufReader::new(file), cancel)
-            .with_context(|| format!("decode WMA audio: {}", path.display()));
+        return decode_wmv_audio_full_from_reader(
+            BufReader::new(file),
+            cancel,
+            timeline_origin_ms,
+        )
+        .with_context(|| format!("decode WMA audio: {}", path.display()));
     };
-    let initial_silence_frames = (((start_ms as u128) * sample_rate as u128 + 999) / 1000)
-        .min(usize::MAX as u128) as usize;
-    let duration_ms = total_ms
-        .max(start_ms.saturating_add(first_duration_ms))
+    let audio_start_ms = first_audio_pts_ms.saturating_sub(timeline_origin_ms);
+    let duration_ms = wmv_rebase_duration_ms(total_ms, timeline_origin_ms)
+        .unwrap_or(0)
+        .max(audio_start_ms.saturating_add(first_duration_ms))
         .max(1);
     let num_frames = (((duration_ms as u128) * sample_rate as u128 + 999) / 1000)
-        .clamp(
-            initial_silence_frames.saturating_add(first_frames) as u128,
-            usize::MAX as u128,
-        ) as usize;
+        .clamp(1, usize::MAX as u128) as usize;
 
     Ok(Some(MovieAudio {
         samples: Arc::new(Vec::new()),
@@ -3844,6 +3943,7 @@ fn decode_wmv_audio_for_path(
             path: Arc::new(path.to_path_buf()),
             num_frames,
             initial_silence_frames,
+            source_skip_frames,
         }),
         channels,
         sample_rate,
@@ -4928,14 +5028,15 @@ mod wmv_movie_adapter_tests {
     use std::sync::Arc;
 
     use super::{
-        is_wmv_extension, select_wmv_stream_frame, wmv_frame_duration_ms,
-        wmv_yuv_frame_to_rgba, RgbaImage, WmvDecodedFrame,
+        is_wmv_extension, select_wmv_stream_frame, wmv_audio_alignment_frames,
+        wmv_frame_duration_ms, wmv_rebase_duration_ms, wmv_yuv_frame_to_rgba,
+        RgbaImage, WmvDecodedFrame,
     };
 
     fn frame(index: usize, pts_ms: u64) -> WmvDecodedFrame {
         WmvDecodedFrame {
             frame_idx: index,
-            pts_ms,
+            timeline_ms: pts_ms,
             frame: Arc::new(RgbaImage {
                 width: 1,
                 height: 1,
@@ -4944,6 +5045,21 @@ mod wmv_movie_adapter_tests {
                 rgba: vec![0, 0, 0, 255],
             }),
         }
+    }
+
+    #[test]
+    fn source_pts_are_rebased_to_movie_time_zero() {
+        let origin = 3_000u64;
+        assert_eq!(3_000u64.saturating_sub(origin), 0);
+        assert_eq!(3_040u64.saturating_sub(origin), 40);
+        assert_eq!(wmv_rebase_duration_ms(63_000, origin), Some(60_000));
+    }
+
+    #[test]
+    fn audio_alignment_uses_video_origin() {
+        assert_eq!(wmv_audio_alignment_frames(3_000, 3_000, 48_000), (0, 0));
+        assert_eq!(wmv_audio_alignment_frames(3_100, 3_000, 48_000), (4_800, 0));
+        assert_eq!(wmv_audio_alignment_frames(2_900, 3_000, 48_000), (0, 4_800));
     }
 
     #[test]

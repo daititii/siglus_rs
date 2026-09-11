@@ -1143,6 +1143,8 @@ impl SiglusHost {
         } else {
             self.boot.start_z
         };
+        let (target_scene, target_z) = self.vm.ctx.pending_menu_scene.take()
+            .unwrap_or((target_scene, target_z));
         let saved_msgbk = if leave_msgbk {
             Some(self.vm.ctx.globals.msgbk_forms.clone())
         } else {

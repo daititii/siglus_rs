@@ -487,6 +487,9 @@ pub struct CommandContext {
     pending_runtime_save: Option<RuntimeSaveRequest>,
     /// Deferred VM-owned load request, consumed by SceneVm after the command returns.
     pending_runtime_load: Option<RuntimeLoadRequest>,
+    /// Optional scene and Z label supplied by GLOBAL.RETURNMENU. The host consumes
+    /// this when it performs the pending return-to-menu restart.
+    pub pending_menu_scene: Option<(String, i32)>,
     runtime_load_completed: bool,
 
     /// Engine-equivalent of `Gp_eng->m_local_save`. Built at GLOBAL_SAVEPOINT and
@@ -1439,6 +1442,7 @@ impl CommandContext {
             frame_main_proc_started_at: None,
             pending_runtime_save: None,
             pending_runtime_load: None,
+            pending_menu_scene: None,
             runtime_load_completed: false,
             local_save_snapshot: None,
             pending_auto_savepoint: false,
@@ -2139,11 +2143,24 @@ impl CommandContext {
         self.globals.stage_forms.clear();
         self.globals.focused_stage_group = None;
         self.globals.focused_stage_mwnd = None;
+        self.globals.current_mwnd_element = vec![
+            forms::codes::ELM_GLOBAL_FRONT,
+            forms::codes::ELM_STAGE_MWND,
+            forms::codes::ELM_ARRAY,
+            0,
+        ];
+        self.globals.current_sel_mwnd_element = vec![
+            forms::codes::ELM_GLOBAL_FRONT,
+            forms::codes::ELM_STAGE_MWND,
+            forms::codes::ELM_ARRAY,
+            1,
+        ];
+        self.globals.last_mwnd_element.clear();
         self.globals.current_mwnd_no = Some(0);
         self.globals.current_mwnd_stage_idx = 1;
         self.globals.current_sel_mwnd_no = Some(1);
         self.globals.current_sel_mwnd_stage_idx = 1;
-        self.globals.last_mwnd_no = Some(0);
+        self.globals.last_mwnd_no = None;
         self.globals.last_mwnd_stage_idx = 1;
         self.globals.local_real_time = 0;
         self.globals.local_game_time = 0;
@@ -2212,6 +2229,7 @@ impl CommandContext {
         self.frame_main_proc_started_at = None;
         self.pending_runtime_save = None;
         self.pending_runtime_load = None;
+        self.pending_menu_scene = None;
         self.runtime_load_completed = false;
         self.local_save_snapshot = None;
         self.pending_auto_savepoint = false;
@@ -16167,5 +16185,86 @@ mod scene_metadata_cache_tests {
 
         ctx.set_active_append("append_b".to_string(), "B".to_string());
         assert!(ctx.scene_metadata.get_mut().is_none());
+    }
+}
+
+#[cfg(test)]
+mod movie_menu_wait_tests {
+    use super::*;
+    use input::{VmKey, VmMouseButton};
+
+    #[test]
+    fn menu_group_ignores_background_clicks_and_skip_until_a_decision() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let form = ctx.ids.form_global_stage;
+        let stage = ctx.globals.stage_forms.entry(form).or_default();
+        stage.ensure_group_list(1, 1);
+        let group = &mut stage.group_lists.get_mut(&1).unwrap()[0];
+        group.start();
+        group.wait_flag = true;
+        ctx.globals.focused_stage_group = Some((form, 1, 0));
+        ctx.wait.wait_group_selection(form, 1, 0);
+        assert!(ctx.wait_poll());
+
+        ctx.on_mouse_move(900, 100);
+        ctx.on_mouse_down(VmMouseButton::Left);
+        ctx.input.next_frame();
+        ctx.on_mouse_up(VmMouseButton::Left);
+        assert!(ctx.wait_poll(), "a background click must not choose New Game");
+        assert!(ctx.stack.is_empty());
+        ctx.on_key_down(VmKey::Control);
+        assert!(ctx.wait_poll(), "Ctrl skip must not accept a menu choice");
+        ctx.on_key_up(VmKey::Control);
+        ctx.globals.syscom.read_skip.onoff = true;
+        ctx.globals.syscom.auto_mode.onoff = true;
+        assert!(ctx.wait_poll());
+        ctx.globals.syscom.read_skip.onoff = false;
+
+        ctx.globals.stage_forms.get_mut(&form).unwrap()
+            .group_lists.get_mut(&1).unwrap()[0].hit_button_no = 5;
+        ctx.on_key_down(VmKey::Enter);
+        assert!(!ctx.wait_poll(), "a real decision must release the selection wait");
+        assert_eq!(ctx.stack.pop().and_then(|v| v.as_i64()), Some(5));
+    }
+
+    #[test]
+    fn movie_natural_finish_returns_zero_without_an_extra_click() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        ctx.globals.mov.playing = true;
+        ctx.wait.wait_global_movie(true, true);
+        assert!(ctx.wait_poll());
+        ctx.globals.mov.playing = false;
+        assert!(!ctx.wait_poll());
+        assert_eq!(ctx.stack.pop().and_then(|v| v.as_i64()), Some(0));
+        assert!(!ctx.wait_poll());
+        assert!(ctx.stack.is_empty(), "completion must return exactly once");
+    }
+
+    #[test]
+    fn movie_click_skip_obeys_script_flag_and_requires_down_up() {
+        for key_skip in [false, true] {
+            let mut ctx = CommandContext::new(PathBuf::from("."));
+            ctx.globals.mov.playing = true;
+            ctx.wait.wait_global_movie(key_skip, key_skip);
+            ctx.on_mouse_up(VmMouseButton::Left);
+            assert!(ctx.wait_poll(), "a release alone must not skip the OP");
+            ctx.on_mouse_down(VmMouseButton::Left);
+            ctx.input.next_frame();
+            assert!(ctx.wait_poll());
+            ctx.on_mouse_up(VmMouseButton::Left);
+            assert_eq!(ctx.wait_poll(), !key_skip);
+            assert_eq!(ctx.globals.mov.playing, !key_skip);
+            assert_eq!(ctx.stack.pop().and_then(|v| v.as_i64()), key_skip.then_some(1));
+        }
+    }
+
+    #[test]
+    fn object_movie_natural_finish_does_not_leave_an_input_wait() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let form = ctx.ids.form_global_stage;
+        // Missing/closed movie objects complete the wait in the reference engine.
+        ctx.wait.wait_object_movie(form, 1, 0, true, true);
+        assert!(!ctx.wait_poll());
+        assert_eq!(ctx.stack.pop().and_then(|v| v.as_i64()), Some(0));
     }
 }

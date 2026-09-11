@@ -21,6 +21,20 @@ impl<'a> GetBitContext<'a> {
         }
     }
 
+    pub fn new_bits(buf: &'a [u8], size_in_bits: usize) -> Result<Self> {
+        if size_in_bits > buf.len() * 8 {
+            return Err(DecoderError::InvalidData("bitstream size exceeds buffer".into()));
+        }
+        Ok(Self { buf, size_in_bits, bit_pos: 0 })
+    }
+
+    pub fn new_window(buf: &'a [u8], bit_pos: usize, size_in_bits: usize) -> Result<Self> {
+        if bit_pos > size_in_bits || size_in_bits > buf.len() * 8 {
+            return Err(DecoderError::InvalidData("invalid bitstream window".into()));
+        }
+        Ok(Self { buf, size_in_bits, bit_pos })
+    }
+
     #[inline]
     pub fn bits_left(&self) -> isize {
         self.size_in_bits as isize - self.bit_pos as isize
@@ -93,5 +107,15 @@ impl<'a> GetBitContext<'a> {
     #[inline]
     pub fn get_bits_long(&mut self, n: usize) -> Result<u32> {
         self.get_bits(n)
+    }
+
+    #[inline]
+    pub fn get_sbits(&mut self, n: usize) -> Result<i32> {
+        if n == 0 || n > 32 {
+            return Err(DecoderError::InvalidData("invalid signed bit width".into()));
+        }
+        let raw = self.get_bits(n)?;
+        let shift = 32 - n;
+        Ok(((raw << shift) as i32) >> shift)
     }
 }

@@ -152,6 +152,29 @@ fn config_default_chrkoe(ctx: &CommandContext, index: usize) -> crate::runtime::
     crate::runtime::globals::ConfigChrKoeState { onoff, volume }
 }
 
+/// C_tnm_chrkoe masks names until their first named dialogue, unless always visible.
+pub fn config_chrkoe_name_visible(ctx: &CommandContext, index: usize) -> bool {
+    let Some(entry) = ctx.tables.gameexe.as_ref().and_then(|cfg| cfg.get_indexed_entry("CHRKOE", index)) else {
+        return true;
+    };
+    let name = entry.item_unquoted(0).unwrap_or("");
+    ctx.globals.syscom.chrkoe_look_flags.get(name).copied().unwrap_or_else(|| {
+        !matches!(entry.item_unquoted(1), Some("0" | "2"))
+    })
+}
+
+pub fn reveal_config_voice_name(ctx: &mut CommandContext, spoken_name: &str) {
+    let Some(cfg) = ctx.tables.gameexe.as_ref() else { return; };
+    for i in 0..configured_chrkoe_count(ctx) {
+        let Some(entry) = cfg.get_indexed_entry("CHRKOE", i) else { continue; };
+        if entry.item_unquoted(1) == Some("2")
+            && (entry.item_unquoted(0) == Some(spoken_name) || entry.item_unquoted(2) == Some(spoken_name)) {
+            let name = entry.item_unquoted(0).unwrap_or("").to_owned();
+            ctx.globals.syscom.chrkoe_look_flags.insert(name, true);
+        }
+    }
+}
+
 fn config_default_indexed_bool(
     ctx: &CommandContext,
     prefix: &str,
@@ -198,7 +221,7 @@ fn config_default_font_name(ctx: &CommandContext) -> String {
     }
 }
 
-fn original_config_defaults(ctx: &CommandContext) -> crate::runtime::globals::OriginalConfigRuntimeState {
+pub fn original_config_defaults(ctx: &CommandContext) -> crate::runtime::globals::OriginalConfigRuntimeState {
     let mut cfg = crate::runtime::globals::OriginalConfigRuntimeState::default();
     cfg.screen_size_mode = gameexe_i64_or(ctx, "CONFIG.WINDOW_MODE", 0).clamp(0, 1);
     let screen_size = (ctx.screen_w.max(1) as i64, ctx.screen_h.max(1) as i64);
@@ -1043,7 +1066,7 @@ fn resize_original_config_arrays(
     cfg.global_extra_mode_flag.truncate(4);
 }
 
-fn config_state_for_save(
+pub fn config_state_for_save(
     ctx: &CommandContext,
 ) -> crate::runtime::globals::OriginalConfigRuntimeState {
     let mut cfg = ctx.globals.syscom.original_config.clone();
@@ -1421,7 +1444,17 @@ fn apply_original_config_to_runtime(ctx: &mut CommandContext) {
     apply_audio_config(ctx);
 }
 
-fn write_config_save(ctx: &CommandContext) {
+/// Apply dialog edits through the same state and audio routing used by scripts.
+pub fn apply_config_dialog_state(
+    ctx: &mut CommandContext,
+    mut config: crate::runtime::globals::OriginalConfigRuntimeState,
+) {
+    resize_original_config_arrays(ctx, &mut config);
+    ctx.globals.syscom.original_config = config;
+    apply_original_config_to_runtime(ctx);
+}
+
+pub fn write_config_save(ctx: &CommandContext) {
     let cfg = config_state_for_save(ctx);
     let mut stream = original_save::OriginalStreamWriter::new();
     stream.push_i32(cfg.screen_size_mode as i32);
@@ -1791,9 +1824,14 @@ pub fn write_global_save(ctx: &CommandContext) {
         eprintln!("[SG_SAVE] failed to write Twitter state: {err:#}");
     }
 
-    // First field after twitter_save_state() in the original is chrkoe.size().
-    // This port does not persist a chrkoe array here, so its count remains 0.
-    stream.push_i32(0);
+    let chrkoe_count = configured_chrkoe_count(ctx);
+    stream.push_i32(chrkoe_count as i32);
+    for index in 0..chrkoe_count {
+        let name = ctx.tables.gameexe.as_ref()
+            .and_then(|cfg| cfg.get_indexed_item_unquoted("CHRKOE", index, 0)).unwrap_or("");
+        stream.push_str(name);
+        stream.push_bool(config_chrkoe_name_visible(ctx, index));
+    }
 
     let payload = stream.into_inner();
     if let Err(err) = original_save::write_global_save_file(&ctx.project_dir, &payload) {
@@ -1841,13 +1879,17 @@ pub fn load_global_save(ctx: &mut CommandContext) -> Result<()> {
         let cg = rd.fixed_i32_list()?;
         let bgm = rd.fixed_i32_list()?;
         let chrkoe_cnt = rd.i32()?;
-        for _ in 0..chrkoe_cnt.max(0) {
-            let _name = rd.string()?;
+        anyhow::ensure!((0..=256).contains(&chrkoe_cnt), "invalid global.sav CHRKOE count: {chrkoe_cnt}");
+        let mut chrkoe_look_flags = std::collections::HashMap::new();
+        for _ in 0..chrkoe_cnt {
+            let name = rd.string()?;
             // C_tnm_chrkoe::look_flag is bool, and C_tnm_save_stream::load<T>
             // pops sizeof(T) bytes. Reading an i32 here consumes three bytes
             // from the following field and corrupts the remainder of global.sav.
-            let _look_flag = rd.bool()?;
+            let look_flag = rd.bool()?;
+            chrkoe_look_flags.insert(name, look_flag);
         }
+        ctx.globals.syscom.chrkoe_look_flags = chrkoe_look_flags;
 
         ctx.globals.syscom.total_play_time = total_play_time;
         ctx.globals
@@ -6258,6 +6300,39 @@ mod global_save_init_tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn config_dialog_edits_update_script_state_and_survive_reopening() {
+        let project_dir = test_project_dir();
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut ctx = CommandContext::new(project_dir.clone());
+        let gameexe = crate::formats::gameexe::GameexeConfig::from_text(
+            "#CONFIG.VOLUME.BGM=165\n#CHRKOE.000=\"Hidden\",2,\"Alias\",1,235,(0)\n");
+        ctx.tables.gameexe = Some(gameexe.clone());
+        load_global_save(&mut ctx).unwrap();
+        let mut config = config_state_for_save(&ctx);
+        config.sound_user_volume[0] = 87;
+        config.play_sound_check[3] = false;
+        config.message_speed = 31;
+        config.auto_mode_moji_wait = 90;
+        config.chrkoe[0].volume = 170;
+        config.global_extra_switch_flag[0] = false;
+        config.skip_unread_message_flag = true;
+        apply_config_dialog_state(&mut ctx, config.clone());
+        assert_eq!(cfg_get_int(&ctx.globals.syscom, GET_BGM_VOLUME, -1), 87);
+        assert_eq!(ctx.globals.script.auto_mode_moji_wait, 90);
+        assert_eq!(config_state_for_save(&ctx), config);
+        write_config_save(&ctx);
+        reveal_config_voice_name(&mut ctx, "Alias");
+        write_global_save(&ctx);
+
+        let mut reopened = CommandContext::new(project_dir.clone());
+        reopened.tables.gameexe = Some(gameexe);
+        load_global_save(&mut reopened).unwrap();
+        assert_eq!(config_state_for_save(&reopened), config);
+        assert!(config_chrkoe_name_visible(&reopened, 0));
+        fs::remove_dir_all(project_dir).unwrap();
     }
 
     #[test]

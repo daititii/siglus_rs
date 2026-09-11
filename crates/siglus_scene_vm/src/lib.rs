@@ -50,3 +50,6 @@ pub mod desktop_messagebox;
 pub mod desktop_twitter;
 
 pub mod display_ffi;
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub mod desktop_config;

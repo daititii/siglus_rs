@@ -9,9 +9,10 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::asf::{AsfFile, AsfPayload, VideoStreamInfo};
 use crate::decoder::{MacroblockDecoder, YuvFrame};
+use crate::vc1::{PictureHeader, SequenceHeader};
 use crate::error::{DecoderError, Result};
 #[cfg(feature = "audio")]
-use crate::wma::{PcmFrameF32, WmaDecoder};
+use crate::wma::{PcmFrameF32, WmaDecoder, WmaProDecoder};
 use crate::wmv2::{Wmv2FrameHeader, Wmv2FrameType, Wmv2Params};
 
 /// A decoded video frame with timing metadata.
@@ -165,6 +166,63 @@ impl Wmv2Decoder {
     }
 }
 
+
+/// Native WMV3 (VC-1 Simple/Main profile) decoder.
+pub struct Wmv3Decoder {
+    seq: SequenceHeader,
+    mb_dec: MacroblockDecoder,
+    cur: YuvFrame,
+}
+
+impl Wmv3Decoder {
+    pub fn new(width: u32, height: u32, extradata: &[u8]) -> Result<Self> {
+        let mut seq = SequenceHeader::parse(extradata)?;
+        seq.width = width;
+        seq.height = height;
+        seq.display_width = width;
+        seq.display_height = height;
+        Ok(Self {
+            seq,
+            mb_dec: MacroblockDecoder::new(width, height),
+            cur: YuvFrame::new(width, height),
+        })
+    }
+
+    pub fn width(&self) -> u32 { self.seq.width }
+    pub fn height(&self) -> u32 { self.seq.height }
+
+    pub fn decode_frame_owned(
+        &mut self,
+        payload: &[u8],
+        is_key_frame: bool,
+        pts_ms: u32,
+    ) -> Result<Option<YuvFrame>> {
+        if payload.is_empty() { return Ok(None); }
+        let mb_w = ((self.seq.width + 15) / 16) as usize;
+        let mb_h = ((self.seq.height + 15) / 16) as usize;
+        let hdr = PictureHeader::parse(payload, &self.seq, pts_ms, mb_w, mb_h)?;
+        if is_key_frame && !matches!(hdr.frame_type, crate::vc1::FrameType::I | crate::vc1::FrameType::BI) {
+            log::debug!("ASF key-frame flag disagrees with WMV3 PTYPE: {:?}", hdr.frame_type);
+        }
+        self.mb_dec.decode_frame(payload, &hdr, &self.seq, &mut self.cur)?;
+        Ok(Some(self.cur.clone()))
+    }
+}
+
+enum VideoCodecDecoder {
+    Wmv12(Wmv2Decoder),
+    Wmv3(Wmv3Decoder),
+}
+
+impl VideoCodecDecoder {
+    fn decode_frame_owned(&mut self, payload: &[u8], is_key: bool, pts_ms: u32) -> Result<Option<YuvFrame>> {
+        match self {
+            Self::Wmv12(d) => d.decode_frame_owned(payload, is_key),
+            Self::Wmv3(d) => d.decode_frame_owned(payload, is_key, pts_ms),
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ASF media-object reassembly (frame reassembly)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -298,19 +356,49 @@ pub struct AsfWmv2Decoder<R: Read + Seek> {
     asf: AsfFile,
     video_info: VideoStreamInfo,
     assembler: FrameAssembler,
-    decoder: Wmv2Decoder,
+    decoder: VideoCodecDecoder,
 }
 
-/// ASF + WMA (v1/v2) decoding pipeline.
+/// ASF + WMA decoding pipeline (WMA v1/v2 and WMA Professional).
 ///
 /// This type owns the `Read+Seek` source, parses ASF headers, reassembles media objects
 /// and decodes WMA packets into PCM.
+#[cfg(feature = "audio")]
+enum AudioCodecDecoder {
+    Wma12(WmaDecoder),
+    WmaPro(WmaProDecoder),
+}
+
+#[cfg(feature = "audio")]
+impl AudioCodecDecoder {
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Wma12(d) => d.sample_rate(),
+            Self::WmaPro(d) => d.sample_rate(),
+        }
+    }
+
+    fn channels(&self) -> u16 {
+        match self {
+            Self::Wma12(d) => d.channels(),
+            Self::WmaPro(d) => d.channels(),
+        }
+    }
+
+    fn decode_packet(&mut self, packet: &[u8], pts_ms: u32) -> Result<Option<PcmFrameF32>> {
+        match self {
+            Self::Wma12(d) => d.decode_packet(packet, pts_ms),
+            Self::WmaPro(d) => d.decode_packet(packet, pts_ms),
+        }
+    }
+}
+
 #[cfg(feature = "audio")]
 pub struct AsfWmaDecoder<R: Read + Seek> {
     reader: R,
     asf: AsfFile,
     audio_stream_number: u8,
-    decoder: WmaDecoder,
+    decoder: AudioCodecDecoder,
     assembler: FrameAssembler,
     last_pts_ms: u32,
     flushed_eof: bool,
@@ -320,25 +408,28 @@ pub struct AsfWmaDecoder<R: Read + Seek> {
 impl<R: Read + Seek> AsfWmaDecoder<R> {
     /// Open an ASF/WMV stream and initialize the WMA decoder.
     ///
-    /// The decoder selects the first audio stream with format tag 0x0160 (WMAv1)
-    /// or 0x0161 (WMAv2).
+    /// The decoder selects the first audio stream with format tag 0x0160 (WMAv1),
+    /// 0x0161 (WMAv2), or 0x0162 (WMA Professional).
     pub fn open(mut reader: R) -> Result<Self> {
         let asf = AsfFile::open(&mut reader)?;
         let mut chosen = None;
         for a in asf.audio_streams.iter() {
-            if matches!(a.format_tag, 0x0160 | 0x0161) {
+            if matches!(a.format_tag, 0x0160 | 0x0161 | 0x0162) {
                 chosen = Some(a.clone());
                 break;
             }
         }
         let Some(audio_info) = chosen else {
             return Err(DecoderError::Unsupported(
-                "No supported WMA (0x0160/0x0161) audio stream found".into(),
+                "No supported WMA (0x0160/0x0161/0x0162) audio stream found".into(),
             ));
         };
 
         reader.seek(SeekFrom::Start(asf.data_offset))?;
-        let decoder = WmaDecoder::new(&audio_info)?;
+        let decoder = match audio_info.format_tag {
+            0x0162 => AudioCodecDecoder::WmaPro(WmaProDecoder::new(&audio_info)?),
+            _ => AudioCodecDecoder::Wma12(WmaDecoder::new(&audio_info)?),
+        };
 
         Ok(Self {
             reader,
@@ -405,7 +496,7 @@ impl<R: Read + Seek> AsfWmaDecoder<R> {
 impl<R: Read + Seek> AsfWmv2Decoder<R> {
     /// Open an ASF/WMV stream and initialize the WMV2 decoder.
     ///
-    /// The decoder selects the first video stream whose FourCC is WMV2 or WMV1.
+    /// The decoder selects the first video stream whose FourCC is WMV1, WMV2, or WMV3.
     pub fn open(mut reader: R) -> Result<Self> {
         let asf = AsfFile::open(&mut reader)?;
         let mut video_info: Option<VideoStreamInfo> = None;
@@ -413,20 +504,35 @@ impl<R: Read + Seek> AsfWmv2Decoder<R> {
             let four_cc = std::str::from_utf8(&v.codec_four_cc)
                 .unwrap_or("")
                 .to_uppercase();
-            if matches!(four_cc.as_str(), "WMV2" | "WMV1") {
+            if matches!(four_cc.as_str(), "WMV3" | "WMV2" | "WMV1") {
                 video_info = Some(v.clone());
                 break;
             }
         }
         let Some(video_info) = video_info else {
             return Err(DecoderError::Unsupported(
-                "No WMV2/WMV1 video stream found".into(),
+                "No supported WMV1/WMV2/WMV3 video stream found".into(),
             ));
         };
 
         reader.seek(SeekFrom::Start(asf.data_offset))?;
 
-        let decoder = Wmv2Decoder::new(video_info.width, video_info.height, &video_info.extra_data);
+        let four_cc = std::str::from_utf8(&video_info.codec_four_cc)
+            .unwrap_or("")
+            .to_uppercase();
+        let decoder = if four_cc == "WMV3" {
+            VideoCodecDecoder::Wmv3(Wmv3Decoder::new(
+                video_info.width,
+                video_info.height,
+                &video_info.extra_data,
+            )?)
+        } else {
+            VideoCodecDecoder::Wmv12(Wmv2Decoder::new(
+                video_info.width,
+                video_info.height,
+                &video_info.extra_data,
+            ))
+        };
 
         Ok(Self {
             reader,
@@ -465,7 +571,7 @@ impl<R: Read + Seek> AsfWmv2Decoder<R> {
                     continue;
                 };
 
-                if let Some(frame) = self.decoder.decode_frame_owned(&data, is_key)? {
+                if let Some(frame) = self.decoder.decode_frame_owned(&data, is_key, pts_ms)? {
                     return Ok(Some(DecodedFrame {
                         pts_ms,
                         is_key_frame: is_key,

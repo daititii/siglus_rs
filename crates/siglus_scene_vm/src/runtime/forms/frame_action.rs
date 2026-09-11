@@ -25,6 +25,7 @@ fn queue_finish(
     ctx: &mut CommandContext,
     fa: &ObjectFrameActionState,
     frame_action_chain: Vec<i32>,
+    reinit_after_finish: bool,
 ) {
     if fa.cmd_name.is_empty() {
         return;
@@ -34,6 +35,8 @@ fn queue_finish(
         .push(PendingFrameActionFinish {
             frame_action_chain,
             object_chain: None,
+            snapshot: fa.clone(),
+            reinit_after_finish,
             scn_name: fa.scn_name.clone(),
             cmd_name: fa.cmd_name.clone(),
             end_time: fa.end_time,
@@ -237,7 +240,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                     .entry(form_id)
                     .or_default()
                     .clone();
-                queue_finish(ctx, &fa_snapshot, chain.clone());
+                queue_finish(ctx, &fa_snapshot, chain.clone(), false);
                 let fa = ctx.globals.frame_actions.entry(form_id).or_default();
                 apply_set_from_parts(fa, &scene_name, end_time, cmd_name, fa_args, false);
             }
@@ -251,9 +254,9 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                 .entry(form_id)
                 .or_default()
                 .clone();
-            queue_finish(ctx, &fa_snapshot, chain.clone());
+            queue_finish(ctx, &fa_snapshot, chain.clone(), true);
             let fa = ctx.globals.frame_actions.entry(form_id).or_default();
-            *fa = ObjectFrameActionState::default();
+            fa.reinit_without_finish();
             push_ok(ctx, ret_form);
             Ok(true)
         }
@@ -272,7 +275,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                     .entry(form_id)
                     .or_default()
                     .clone();
-                queue_finish(ctx, &fa_snapshot, chain.clone());
+                queue_finish(ctx, &fa_snapshot, chain.clone(), false);
                 let fa = ctx.globals.frame_actions.entry(form_id).or_default();
                 apply_set_from_parts(fa, &scene_name, end_time, cmd_name, fa_args, true);
             }
@@ -290,5 +293,91 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::runtime::VmCallMeta;
+    use std::path::PathBuf;
+
+    fn setup_call(ctx: &mut CommandContext, form_id: u32, op: i32) {
+        ctx.vm_call = Some(VmCallMeta {
+            element: vec![form_id as i32, op],
+            al_id: 0,
+            ret_form: 0,
+        });
+    }
+
+    #[test]
+    fn start_queues_full_old_snapshot_and_installs_replacement() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let form_id = crate::runtime::constants::global_form::FRAME_ACTION;
+        let mut old = ObjectFrameActionState::default();
+        old.scn_name = "old_scene".into();
+        old.cmd_name = "old_cmd".into();
+        old.end_time = 77;
+        old.counter.set_count(31);
+        old.args = vec![Value::Int(9)];
+        ctx.globals.frame_actions.insert(form_id, old.clone());
+        ctx.current_scene_name = Some("new_scene".into());
+        setup_call(
+            &mut ctx,
+            form_id,
+            crate::runtime::constants::elm_value::FRAMEACTION_START,
+        );
+
+        dispatch(
+            &mut ctx,
+            form_id,
+            &[Value::Int(100), Value::Str("new_cmd".into()), Value::Int(5)],
+        )
+        .unwrap();
+
+        let pending = ctx.globals.pending_frame_action_finishes.first().unwrap();
+        assert!(!pending.reinit_after_finish);
+        assert_eq!(pending.snapshot.scn_name, old.scn_name);
+        assert_eq!(pending.snapshot.cmd_name, old.cmd_name);
+        assert_eq!(pending.snapshot.end_time, 77);
+        assert_eq!(pending.snapshot.counter.get_count(), 31);
+        assert_eq!(pending.snapshot.args.len(), 1);
+        assert_eq!(pending.snapshot.args[0].as_i64(), Some(9));
+
+        let live = ctx.globals.frame_actions.get(&form_id).unwrap();
+        assert_eq!(live.scn_name, "new_scene");
+        assert_eq!(live.cmd_name, "new_cmd");
+        assert_eq!(live.end_time, 100);
+        assert_eq!(live.args.len(), 1);
+        assert_eq!(live.args[0].as_i64(), Some(5));
+    }
+
+    #[test]
+    fn end_reinit_preserves_end_time_but_clears_active_action() {
+        let mut ctx = CommandContext::new(PathBuf::from("."));
+        let form_id = crate::runtime::constants::global_form::FRAME_ACTION;
+        let mut old = ObjectFrameActionState::default();
+        old.scn_name = "scene".into();
+        old.cmd_name = "finish".into();
+        old.end_time = 55;
+        old.counter.start();
+        old.args = vec![Value::Int(1)];
+        ctx.globals.frame_actions.insert(form_id, old);
+        setup_call(
+            &mut ctx,
+            form_id,
+            crate::runtime::constants::elm_value::FRAMEACTION_END,
+        );
+
+        dispatch(&mut ctx, form_id, &[]).unwrap();
+
+        let live = ctx.globals.frame_actions.get(&form_id).unwrap();
+        assert!(live.scn_name.is_empty());
+        assert!(live.cmd_name.is_empty());
+        assert!(live.args.is_empty());
+        assert_eq!(live.end_time, 55);
+        assert!(!live.counter.is_running());
+        assert_eq!(ctx.globals.pending_frame_action_finishes.len(), 1);
+        assert!(ctx.globals.pending_frame_action_finishes[0].reinit_after_finish);
     }
 }

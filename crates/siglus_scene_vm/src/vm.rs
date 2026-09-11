@@ -535,6 +535,209 @@ struct FrameActionWork {
     end_time: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameActionObjectRoot {
+    StageObject {
+        obj_idx: usize,
+        child_pos: usize,
+    },
+    MwndObject {
+        mwnd_idx: usize,
+        selector: i32,
+        obj_idx: usize,
+        child_pos: usize,
+    },
+    BtnSelItemObject {
+        item_idx: usize,
+        obj_idx: usize,
+        child_pos: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameActionObjectLocator {
+    raw_form_id: i32,
+    stage_idx: i64,
+    root: FrameActionObjectRoot,
+}
+
+fn frame_action_stage_alias_to_index(code: i32) -> Option<i64> {
+    if code == crate::runtime::forms::codes::ELM_GLOBAL_BACK {
+        Some(0)
+    } else if code == crate::runtime::forms::codes::ELM_GLOBAL_FRONT {
+        Some(1)
+    } else if code == crate::runtime::forms::codes::ELM_GLOBAL_NEXT {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn frame_action_array_marker(code: i32, elm_array: i32) -> bool {
+    code == elm_array || code == crate::runtime::forms::codes::ELM_ARRAY || code == -1
+}
+
+fn parse_frame_action_object_locator(
+    chain: &[i32],
+    elm_array: i32,
+) -> Option<FrameActionObjectLocator> {
+    let raw_form_id = *chain.first()?;
+    let (stage_idx, pos) = if let Some(stage_idx) = frame_action_stage_alias_to_index(raw_form_id) {
+        (stage_idx, 1usize)
+    } else {
+        if chain.len() < 4 || !frame_action_array_marker(chain[1], elm_array) {
+            return None;
+        }
+        (chain[2] as i64, 3usize)
+    };
+
+    let list_op = *chain.get(pos)?;
+    if !frame_action_array_marker(*chain.get(pos + 1)?, elm_array) {
+        return None;
+    }
+    let first_idx = (*chain.get(pos + 2)?).max(0) as usize;
+
+    let root = if list_op == crate::runtime::forms::codes::elm_value::STAGE_OBJECT {
+        FrameActionObjectRoot::StageObject {
+            obj_idx: first_idx,
+            child_pos: pos + 3,
+        }
+    } else if list_op == crate::runtime::forms::codes::elm_value::STAGE_MWND {
+        let selector = *chain.get(pos + 3)?;
+        if !matches!(
+            selector,
+            crate::runtime::forms::codes::elm_value::MWND_OBJECT
+                | crate::runtime::forms::codes::elm_value::MWND_BUTTON
+                | crate::runtime::forms::codes::elm_value::MWND_FACE
+        ) || !frame_action_array_marker(*chain.get(pos + 4)?, elm_array)
+        {
+            return None;
+        }
+        FrameActionObjectRoot::MwndObject {
+            mwnd_idx: first_idx,
+            selector,
+            obj_idx: (*chain.get(pos + 5)?).max(0) as usize,
+            child_pos: pos + 6,
+        }
+    } else if list_op == crate::runtime::forms::codes::elm_value::STAGE_BTNSELITEM {
+        if *chain.get(pos + 3)?
+            != crate::runtime::forms::codes::elm_value::BTNSELITEM_OBJECT
+            || !frame_action_array_marker(*chain.get(pos + 4)?, elm_array)
+        {
+            return None;
+        }
+        FrameActionObjectRoot::BtnSelItemObject {
+            item_idx: first_idx,
+            obj_idx: (*chain.get(pos + 5)?).max(0) as usize,
+            child_pos: pos + 6,
+        }
+    } else {
+        return None;
+    };
+
+    Some(FrameActionObjectLocator {
+        raw_form_id,
+        stage_idx,
+        root,
+    })
+}
+
+fn frame_action_locator_object_idx(locator: FrameActionObjectLocator) -> usize {
+    match locator.root {
+        FrameActionObjectRoot::StageObject { obj_idx, .. }
+        | FrameActionObjectRoot::MwndObject { obj_idx, .. }
+        | FrameActionObjectRoot::BtnSelItemObject { obj_idx, .. } => obj_idx,
+    }
+}
+
+#[cfg(test)]
+mod frame_action_locator_tests {
+    use super::*;
+
+    #[test]
+    fn front_object_alias_and_canonical_stage_locate_the_same_object() {
+        let alias = [
+            crate::runtime::forms::codes::ELM_GLOBAL_FRONT,
+            crate::runtime::forms::codes::elm_value::STAGE_OBJECT,
+            -1,
+            115,
+        ];
+        let canonical = [
+            crate::runtime::forms::codes::ELM_GLOBAL_STAGE,
+            -1,
+            1,
+            crate::runtime::forms::codes::elm_value::STAGE_OBJECT,
+            -1,
+            115,
+        ];
+        let a = parse_frame_action_object_locator(&alias, -1).unwrap();
+        let b = parse_frame_action_object_locator(&canonical, -1).unwrap();
+        assert_eq!(a.stage_idx, b.stage_idx);
+        assert_eq!(frame_action_locator_object_idx(a), 115);
+        assert_eq!(frame_action_locator_object_idx(b), 115);
+    }
+
+    #[test]
+    fn front_mwnd_button_alias_keeps_both_array_indices() {
+        let alias = [
+            crate::runtime::forms::codes::ELM_GLOBAL_FRONT,
+            crate::runtime::forms::codes::elm_value::STAGE_MWND,
+            -1,
+            0,
+            crate::runtime::forms::codes::elm_value::MWND_BUTTON,
+            -1,
+            9,
+        ];
+        let canonical = [
+            crate::runtime::forms::codes::ELM_GLOBAL_STAGE,
+            -1,
+            1,
+            crate::runtime::forms::codes::elm_value::STAGE_MWND,
+            -1,
+            0,
+            crate::runtime::forms::codes::elm_value::MWND_BUTTON,
+            -1,
+            9,
+        ];
+        let a = parse_frame_action_object_locator(&alias, -1).unwrap();
+        let b = parse_frame_action_object_locator(&canonical, -1).unwrap();
+        assert_eq!(a.stage_idx, 1);
+        assert_eq!(b.stage_idx, 1);
+        assert_eq!(frame_action_locator_object_idx(a), 9);
+        assert_eq!(frame_action_locator_object_idx(b), 9);
+        assert!(matches!(
+            a.root,
+            FrameActionObjectRoot::MwndObject { mwnd_idx: 0, selector, obj_idx: 9, .. }
+                if selector == crate::runtime::forms::codes::elm_value::MWND_BUTTON
+        ));
+    }
+
+    #[test]
+    fn btnselitem_object_child_locator_starts_children_after_object_index() {
+        let chain = [
+            crate::runtime::forms::codes::ELM_GLOBAL_FRONT,
+            crate::runtime::forms::codes::elm_value::STAGE_BTNSELITEM,
+            -1,
+            2,
+            crate::runtime::forms::codes::elm_value::BTNSELITEM_OBJECT,
+            -1,
+            3,
+            crate::runtime::forms::codes::elm_value::OBJECT_CHILD,
+            -1,
+            4,
+        ];
+        let locator = parse_frame_action_object_locator(&chain, -1).unwrap();
+        assert!(matches!(
+            locator.root,
+            FrameActionObjectRoot::BtnSelItemObject {
+                item_idx: 2,
+                obj_idx: 3,
+                child_pos: 7
+            }
+        ));
+    }
+}
+
 impl<'a> SceneVm<'a> {
     fn trace_unknown_form(&mut self, form_code: i32, site: &str) {
         *self.unknown_forms.entry(form_code).or_insert(0) += 1;
@@ -2726,78 +2929,12 @@ impl<'a> SceneVm<'a> {
         Some(obj)
     }
 
-    fn object_from_frame_action_chain_mut<'b>(
-        objects: &'b mut [crate::runtime::globals::ObjectState],
-        object_chain: &[i32],
-        elm_array: i32,
-    ) -> Option<&'b mut crate::runtime::globals::ObjectState> {
-        if object_chain.len() < 6 || object_chain[1] != elm_array || object_chain[4] != elm_array {
-            return None;
-        }
-        let obj = objects.get_mut(object_chain[5].max(0) as usize)?;
-        Self::object_child_from_chain_mut(obj, object_chain, 6, elm_array)
-    }
-
-    fn object_from_mwnd_frame_action_chain_mut<'b>(
-        mwnds: &'b mut [crate::runtime::globals::MwndState],
-        object_chain: &[i32],
-        elm_array: i32,
-    ) -> Option<&'b mut crate::runtime::globals::ObjectState> {
-        if object_chain.len() < 9
-            || object_chain[1] != elm_array
-            || object_chain[4] != elm_array
-            || object_chain[7] != elm_array
-        {
-            return None;
-        }
-        if object_chain[3] != crate::runtime::forms::codes::elm_value::STAGE_MWND {
-            return None;
-        }
-        let mwnd_idx = object_chain[5].max(0) as usize;
-        let selector = object_chain[6];
-        let obj_idx = object_chain[8].max(0) as usize;
-        let mwnd = mwnds.get_mut(mwnd_idx)?;
-        if selector == crate::runtime::forms::codes::elm_value::MWND_BUTTON {
-            let obj = mwnd.button_list.get_mut(obj_idx)?;
-            return Self::object_child_from_chain_mut(obj, object_chain, 9, elm_array);
-        }
-        if selector == crate::runtime::forms::codes::elm_value::MWND_FACE {
-            let obj = mwnd.face_list.get_mut(obj_idx)?;
-            return Self::object_child_from_chain_mut(obj, object_chain, 9, elm_array);
-        }
-        if selector == crate::runtime::forms::codes::elm_value::MWND_OBJECT {
-            let obj = mwnd.object_list.get_mut(obj_idx)?;
-            return Self::object_child_from_chain_mut(obj, object_chain, 9, elm_array);
-        }
-        None
-    }
-
-    fn object_from_btnselitem_frame_action_chain_mut<'b>(
-        items: &'b mut [crate::runtime::globals::BtnSelItemState],
-        object_chain: &[i32],
-        elm_array: i32,
-    ) -> Option<&'b mut crate::runtime::globals::ObjectState> {
-        if object_chain.len() < 9
-            || object_chain[1] != elm_array
-            || object_chain[4] != elm_array
-            || object_chain[7] != elm_array
-            || object_chain[3] != crate::runtime::forms::codes::elm_value::STAGE_BTNSELITEM
-            || object_chain[6] != crate::runtime::forms::codes::elm_value::BTNSELITEM_OBJECT
-        {
-            return None;
-        }
-        let item_idx = object_chain[5].max(0) as usize;
-        let obj_idx = object_chain[8].max(0) as usize;
-        let obj = items.get_mut(item_idx)?.object_list.get_mut(obj_idx)?;
-        Self::object_child_from_chain_mut(obj, object_chain, 9, elm_array)
-    }
-
     fn with_frame_action_mut<R>(
         &mut self,
         item: &FrameActionWork,
         f: impl FnOnce(&mut crate::runtime::globals::ObjectFrameActionState) -> R,
     ) -> Option<R> {
-        if item.stage_idx < 0 {
+        if item.object_chain.is_none() {
             let form_id = item.global_form_id?;
             if let Some(idx) = item.ch_idx {
                 let list = self.ctx.globals.frame_action_lists.get_mut(&form_id)?;
@@ -2806,56 +2943,56 @@ impl<'a> SceneVm<'a> {
             return self.ctx.globals.frame_actions.get_mut(&form_id).map(f);
         }
 
-        let chain = item.object_chain.as_ref()?;
-        if chain.len() < 6 {
-            return None;
-        }
-        let stage_idx = chain[2] as i64;
-        let elm_array = self.ctx.ids.elm_array;
-        // A frame-action element chain is owned by exactly one stage form.
-        // EXCALL uses the synthetic stage form (normal ^ 0x4000); walking every
-        // stage form can silently bind an EXCALL callback to the normal stage
-        // when both happen to contain the same object index.
-        let form_id = chain.first().copied()? as u32;
-        let Some(st) = self.ctx.globals.stage_forms.get_mut(&form_id) else {
-            return None;
+        let chain = item.object_chain.as_deref()?;
+        let elm_array = if self.ctx.ids.elm_array != 0 {
+            self.ctx.ids.elm_array
+        } else {
+            crate::runtime::forms::codes::ELM_ARRAY
         };
-        {
-            let obj = if chain.get(3).copied()
-                == Some(crate::runtime::forms::codes::elm_value::STAGE_MWND)
-            {
-                let Some(mwnds) = st.mwnd_lists.get_mut(&stage_idx) else {
-                    return None;
-                };
-                let Some(obj) = Self::object_from_mwnd_frame_action_chain_mut(mwnds, chain, elm_array)
-                else {
-                    return None;
-                };
-                obj
-            } else if chain.get(3).copied()
-                == Some(crate::runtime::forms::codes::elm_value::STAGE_BTNSELITEM)
-            {
-                let Some(items) = st.btnselitem_lists.get_mut(&stage_idx) else {
-                    return None;
-                };
-                let Some(obj) = Self::object_from_btnselitem_frame_action_chain_mut(items, chain, elm_array)
-                else {
-                    return None;
-                };
-                obj
-            } else {
-                let Some(objects) = st.object_lists.get_mut(&stage_idx) else {
-                    return None;
-                };
-                let Some(obj) = Self::object_from_frame_action_chain_mut(objects, chain, elm_array)
-                else {
-                    return None;
-                };
-                obj
-            };
-            if let Some(idx) = item.ch_idx {
-                return obj.frame_action_ch.get_mut(idx).map(f);
+        let locator = parse_frame_action_object_locator(chain, elm_array)?;
+        let form_id = crate::runtime::forms::stage::stage_storage_form_id(
+            &self.ctx,
+            locator.raw_form_id,
+        );
+        let st = self.ctx.globals.stage_forms.get_mut(&form_id)?;
+        let obj = match locator.root {
+            FrameActionObjectRoot::StageObject { obj_idx, child_pos } => {
+                let objects = st.object_lists.get_mut(&locator.stage_idx)?;
+                let obj = objects.get_mut(obj_idx)?;
+                Self::object_child_from_chain_mut(obj, chain, child_pos, elm_array)?
             }
+            FrameActionObjectRoot::MwndObject {
+                mwnd_idx,
+                selector,
+                obj_idx,
+                child_pos,
+            } => {
+                let mwnds = st.mwnd_lists.get_mut(&locator.stage_idx)?;
+                let mwnd = mwnds.get_mut(mwnd_idx)?;
+                let obj = if selector == crate::runtime::forms::codes::elm_value::MWND_BUTTON {
+                    mwnd.button_list.get_mut(obj_idx)?
+                } else if selector == crate::runtime::forms::codes::elm_value::MWND_FACE {
+                    mwnd.face_list.get_mut(obj_idx)?
+                } else {
+                    mwnd.object_list.get_mut(obj_idx)?
+                };
+                Self::object_child_from_chain_mut(obj, chain, child_pos, elm_array)?
+            }
+            FrameActionObjectRoot::BtnSelItemObject {
+                item_idx,
+                obj_idx,
+                child_pos,
+            } => {
+                let items = st.btnselitem_lists.get_mut(&locator.stage_idx)?;
+                let item = items.get_mut(item_idx)?;
+                let obj = item.object_list.get_mut(obj_idx)?;
+                Self::object_child_from_chain_mut(obj, chain, child_pos, elm_array)?
+            }
+        };
+
+        if let Some(idx) = item.ch_idx {
+            obj.frame_action_ch.get_mut(idx).map(f)
+        } else {
             Some(f(&mut obj.frame_action))
         }
     }
@@ -2863,7 +3000,7 @@ impl<'a> SceneVm<'a> {
     fn begin_frame_action_finish(
         &mut self,
         item: &FrameActionWork,
-    ) -> Option<(String, Vec<Value>)> {
+    ) -> Option<(String, String, Vec<Value>)> {
         self.with_frame_action_mut(item, |fa| {
             if fa.cmd_name.is_empty() || fa.end_time < 0 {
                 return None;
@@ -2872,23 +3009,26 @@ impl<'a> SceneVm<'a> {
                 return None;
             }
 
+            // C_elm_frame_action::frame() checks the live action after the per-frame
+            // do_action() callback. If that callback replaced itself, finish the
+            // replacement that is now installed, not the snapshot collected earlier.
+            let scn_name = fa.scn_name.clone();
             let cmd_name = fa.cmd_name.clone();
             let args = fa.args.clone();
-            let final_count = if fa.end_time == -1 { 0 } else { fa.end_time };
-            fa.counter.set_count(final_count);
+            fa.counter.set_count(fa.end_time);
             fa.scn_name.clear();
             fa.cmd_name.clear();
             fa.end_flag = true;
-            Some((cmd_name, args))
+            Some((scn_name, cmd_name, args))
         })?
     }
 
     fn end_frame_action_finish(&mut self, item: &FrameActionWork) {
         let _ = self.with_frame_action_mut(item, |fa| {
-            // Original C_elm_frame_action::finish only drops the end-action flag
-            // after the callback. It must not wipe a new frame action that may
-            // have been started by that callback.
-            fa.end_flag = false;
+            // frame() calls reinit(true), so after finish() returns it performs
+            // reinit(false). Any action started by the finish callback is cleared;
+            // m_end_time is the one field reinit intentionally preserves.
+            fa.reinit_without_finish();
         });
     }
 
@@ -2942,111 +3082,87 @@ impl<'a> SceneVm<'a> {
 
     fn runtime_slot_from_object_chain(
         &mut self,
-        stage_idx: i64,
         fallback_obj_idx: usize,
         chain: &[i32],
     ) -> usize {
-        let stage_form = chain
-            .first()
-            .copied()
-            .filter(|v| *v >= 0)
-            .map(|v| v as u32)
-            .unwrap_or(self.ctx.ids.form_global_stage);
         let elm_array = if self.ctx.ids.elm_array != 0 {
             self.ctx.ids.elm_array
         } else {
             crate::runtime::forms::codes::ELM_ARRAY
         };
-
+        let Some(locator) = parse_frame_action_object_locator(chain, elm_array) else {
+            return fallback_obj_idx;
+        };
+        let stage_form = crate::runtime::forms::stage::stage_storage_form_id(
+            &self.ctx,
+            locator.raw_form_id,
+        );
         let Some(st) = self.ctx.globals.stage_forms.get_mut(&stage_form) else {
             return fallback_obj_idx;
         };
         let nested_slot_base = st.backend_slot_base + 100_000;
         let next_slot = st
             .next_nested_object_slot
-            .entry(stage_idx)
+            .entry(locator.stage_idx)
             .or_insert(nested_slot_base);
 
-        if chain.get(3).copied() == Some(crate::runtime::forms::codes::elm_value::STAGE_MWND)
-            && chain.len() >= 9
-        {
-            let mwnd_idx = chain.get(5).copied().unwrap_or(0).max(0) as usize;
-            let selector = chain.get(6).copied().unwrap_or(0);
-            let obj_idx = chain
-                .get(8)
-                .copied()
-                .unwrap_or(fallback_obj_idx as i32)
-                .max(0) as usize;
-            let Some(mwnds) = st.mwnd_lists.get_mut(&stage_idx) else {
-                return obj_idx;
-            };
-            let Some(mwnd) = mwnds.get_mut(mwnd_idx) else {
-                return obj_idx;
-            };
-            if selector == crate::runtime::forms::codes::elm_value::MWND_BUTTON {
-                let Some(obj) = mwnd.button_list.get_mut(obj_idx) else {
+        match locator.root {
+            FrameActionObjectRoot::StageObject { obj_idx, child_pos } => {
+                let Some(list) = st.object_lists.get_mut(&locator.stage_idx) else {
                     return obj_idx;
                 };
-                return Self::runtime_slot_from_object_children(
-                    obj, obj_idx, chain, 9, elm_array, next_slot,
-                );
-            }
-            if selector == crate::runtime::forms::codes::elm_value::MWND_FACE {
-                let Some(obj) = mwnd.face_list.get_mut(obj_idx) else {
+                let Some(obj) = list.get_mut(obj_idx) else {
                     return obj_idx;
                 };
-                return Self::runtime_slot_from_object_children(
-                    obj, obj_idx, chain, 9, elm_array, next_slot,
-                );
+                Self::runtime_slot_from_object_children(
+                    obj, obj_idx, chain, child_pos, elm_array, next_slot,
+                )
             }
-            if selector == crate::runtime::forms::codes::elm_value::MWND_OBJECT {
-                let Some(obj) = mwnd.object_list.get_mut(obj_idx) else {
+            FrameActionObjectRoot::MwndObject {
+                mwnd_idx,
+                selector,
+                obj_idx,
+                child_pos,
+            } => {
+                let Some(mwnds) = st.mwnd_lists.get_mut(&locator.stage_idx) else {
                     return obj_idx;
                 };
-                return Self::runtime_slot_from_object_children(
-                    obj, obj_idx, chain, 9, elm_array, next_slot,
-                );
+                let Some(mwnd) = mwnds.get_mut(mwnd_idx) else {
+                    return obj_idx;
+                };
+                let obj = if selector == crate::runtime::forms::codes::elm_value::MWND_BUTTON {
+                    mwnd.button_list.get_mut(obj_idx)
+                } else if selector == crate::runtime::forms::codes::elm_value::MWND_FACE {
+                    mwnd.face_list.get_mut(obj_idx)
+                } else {
+                    mwnd.object_list.get_mut(obj_idx)
+                };
+                let Some(obj) = obj else {
+                    return obj_idx;
+                };
+                Self::runtime_slot_from_object_children(
+                    obj, obj_idx, chain, child_pos, elm_array, next_slot,
+                )
             }
-            return obj_idx;
+            FrameActionObjectRoot::BtnSelItemObject {
+                item_idx,
+                obj_idx,
+                child_pos,
+            } => {
+                let Some(items) = st.btnselitem_lists.get_mut(&locator.stage_idx) else {
+                    return obj_idx;
+                };
+                let Some(item) = items.get_mut(item_idx) else {
+                    return obj_idx;
+                };
+                let Some(obj) = item.object_list.get_mut(obj_idx) else {
+                    return obj_idx;
+                };
+                Self::runtime_slot_from_object_children(
+                    obj, obj_idx, chain, child_pos, elm_array, next_slot,
+                )
+            }
         }
-
-        if chain.get(3).copied() == Some(crate::runtime::forms::codes::STAGE_ELM_BTNSELITEM)
-            && chain.len() >= 9
-            && chain.get(6).copied() == Some(crate::runtime::forms::codes::ELM_BTNSELITEM_OBJECT)
-        {
-            let item_idx = chain.get(5).copied().unwrap_or(0).max(0) as usize;
-            let obj_idx = chain
-                .get(8)
-                .copied()
-                .unwrap_or(fallback_obj_idx as i32)
-                .max(0) as usize;
-            let Some(items) = st.btnselitem_lists.get_mut(&stage_idx) else {
-                return obj_idx;
-            };
-            let Some(item) = items.get_mut(item_idx) else {
-                return obj_idx;
-            };
-            let Some(obj) = item.object_list.get_mut(obj_idx) else {
-                return obj_idx;
-            };
-            return Self::runtime_slot_from_object_children(
-                obj, obj_idx, chain, 9, elm_array, next_slot,
-            );
-        }
-
-        let top_idx = chain
-            .get(5)
-            .copied()
-            .unwrap_or(fallback_obj_idx as i32)
-            .max(0) as usize;
-        let Some(list) = st.object_lists.get_mut(&stage_idx) else {
-            return top_idx;
-        };
-        if top_idx >= list.len() {
-            return top_idx;
-        }
-        let obj = &mut list[top_idx];
-        Self::runtime_slot_from_object_children(obj, top_idx, chain, 6, elm_array, next_slot)
     }
 
     fn set_frame_action_current_object(
@@ -3056,10 +3172,20 @@ impl<'a> SceneVm<'a> {
         let prev_target = self.ctx.globals.current_stage_object;
         let prev_chain = self.ctx.globals.current_object_chain.clone();
         if let Some(chain) = item.object_chain.clone() {
-            let top_idx = chain.get(5).copied().unwrap_or(item.obj_idx as i32).max(0) as usize;
-            let runtime_slot = self.runtime_slot_from_object_chain(item.stage_idx, top_idx, &chain);
-            self.ctx.globals.current_stage_object = Some((item.stage_idx, runtime_slot));
-            self.ctx.globals.current_object_chain = Some(chain);
+            let elm_array = if self.ctx.ids.elm_array != 0 {
+                self.ctx.ids.elm_array
+            } else {
+                crate::runtime::forms::codes::ELM_ARRAY
+            };
+            if let Some(locator) = parse_frame_action_object_locator(&chain, elm_array) {
+                let top_idx = frame_action_locator_object_idx(locator);
+                let runtime_slot = self.runtime_slot_from_object_chain(top_idx, &chain);
+                self.ctx.globals.current_stage_object = Some((locator.stage_idx, runtime_slot));
+                self.ctx.globals.current_object_chain = Some(chain);
+            } else {
+                self.ctx.globals.current_stage_object = None;
+                self.ctx.globals.current_object_chain = None;
+            }
         } else {
             self.ctx.globals.current_stage_object = None;
             self.ctx.globals.current_object_chain = None;
@@ -3081,15 +3207,15 @@ impl<'a> SceneVm<'a> {
         pending: &PendingFrameActionFinish,
     ) -> FrameActionWork {
         let object_chain = pending.object_chain.clone();
+        let elm_array = if self.ctx.ids.elm_array != 0 {
+            self.ctx.ids.elm_array
+        } else {
+            crate::runtime::forms::codes::ELM_ARRAY
+        };
         let (stage_idx, obj_idx) = object_chain
-            .as_ref()
-            .and_then(|chain| {
-                if chain.len() >= 6 {
-                    Some((chain[2] as i64, chain[5].max(0) as usize))
-                } else {
-                    None
-                }
-            })
+            .as_deref()
+            .and_then(|chain| parse_frame_action_object_locator(chain, elm_array))
+            .map(|locator| (locator.stage_idx, frame_action_locator_object_idx(locator)))
             .unwrap_or((-1, usize::MAX));
 
         let ch_idx = if let Some(chain) = object_chain.as_ref() {
@@ -3146,16 +3272,21 @@ impl<'a> SceneVm<'a> {
         } else {
             pending.end_time
         };
-        let _ = self.with_frame_action_mut(&item, |fa| {
-            // C_elm_frame_action::finish clears the active command before invoking
-            // the end action, sets the end-action flag, and leaves any new
-            // frame-action state created by that callback intact.
-            fa.scn_name.clear();
-            fa.cmd_name.clear();
-            fa.args = pending.args.clone();
-            fa.end_time = pending.end_time;
-            fa.counter.set_count(final_count);
-            fa.end_flag = true;
+
+        // START/START_REAL/END have already modified the live slot by the time the
+        // deferred callback is drained. Temporarily restore the complete old state
+        // and put it into C_elm_frame_action::finish()'s callback-visible shape.
+        // After the callback, restore the outer state: this reproduces the C++
+        // reinit(true) ordering without letting the old finish overwrite a new START.
+        let outer_state = self.with_frame_action_mut(&item, |fa| {
+            let outer_state = fa.clone();
+            let mut finishing = pending.snapshot.clone();
+            finishing.scn_name.clear();
+            finishing.cmd_name.clear();
+            finishing.counter.set_count(final_count);
+            finishing.end_flag = true;
+            *fa = finishing;
+            outer_state
         });
 
         let call_args = Self::make_frame_action_call_args(
@@ -3173,9 +3304,15 @@ impl<'a> SceneVm<'a> {
         );
         self.restore_frame_action_current_object(prev_target, prev_chain);
 
-        let _ = self.with_frame_action_mut(&item, |fa| {
-            fa.end_flag = false;
-        });
+        if pending.reinit_after_finish {
+            let _ = self.with_frame_action_mut(&item, |fa| {
+                fa.reinit_without_finish();
+            });
+        } else if let Some(outer_state) = outer_state {
+            let _ = self.with_frame_action_mut(&item, |fa| {
+                *fa = outer_state;
+            });
+        }
         if let Err(e) = result {
             self.ctx.unknown.record_note(&format!(
                 "frame_action.finish.failed:{}:{}:{e}",
@@ -3704,7 +3841,9 @@ impl<'a> SceneVm<'a> {
             }
             self.restore_frame_action_current_object(prev_target, prev_chain);
 
-            if let Some((finish_cmd_name, finish_args)) = self.begin_frame_action_finish(&item) {
+            if let Some((finish_scn_name, finish_cmd_name, finish_args)) =
+                self.begin_frame_action_finish(&item)
+            {
                 if trace {
                     eprintln!(
                         "[SG_TICK_TRACE] finish stage={} obj={} ch={:?} global={:?} cmd={} args={:?}",
@@ -3723,7 +3862,7 @@ impl<'a> SceneVm<'a> {
                 );
                 let (prev_target, prev_chain) = self.set_frame_action_current_object(&item);
                 if let Err(e) = self.run_scene_user_cmd_inline(
-                    Some(&item.scn_name),
+                    Some(&finish_scn_name),
                     &finish_cmd_name,
                     &finish_call_args,
                     self.cfg.fm_void,
@@ -3731,7 +3870,7 @@ impl<'a> SceneVm<'a> {
                 ) {
                     self.ctx.unknown.record_note(&format!(
                         "frame_action.finish_call.failed:{}:{}:{e}",
-                        item.scn_name, finish_cmd_name
+                        finish_scn_name, finish_cmd_name
                     ));
                 }
                 self.restore_frame_action_current_object(prev_target, prev_chain);
@@ -5242,8 +5381,8 @@ impl<'a> SceneVm<'a> {
         full_elm: &[i32],
     ) -> Result<()> {
         use crate::runtime::forms::codes::{
-            ELM_ARRAY, ELM_STRLIST_GET_SIZE, FM_INT, FM_INTLIST, FM_INTLISTREF, FM_INTREF, FM_STR,
-            FM_STRLIST, FM_STRLISTREF, FM_STRREF,
+            ELM_STRLIST_GET_SIZE, FM_INT, FM_INTLIST, FM_INTLISTREF, FM_INTREF, FM_STR, FM_STRLIST,
+            FM_STRLISTREF, FM_STRREF,
         };
 
         let sub = if sub.len() == 1 && self.call_array_marker(sub[0]) {
@@ -6226,7 +6365,7 @@ impl<'a> SceneVm<'a> {
         args: &[Value],
     ) -> Result<bool> {
         use crate::runtime::forms::codes::{
-            ELM_ARRAY, ELM_CALL_K, ELM_CALL_L, ELM_GLOBAL_CUR_CALL, ELM_INTLIST_CLEAR, ELM_INTLIST_GET_SIZE,
+            ELM_CALL_K, ELM_CALL_L, ELM_GLOBAL_CUR_CALL, ELM_INTLIST_CLEAR, ELM_INTLIST_GET_SIZE,
             ELM_INTLIST_INIT, ELM_INTLIST_RESIZE, ELM_INTLIST_SETS, ELM_STRLIST_GET_SIZE,
             ELM_STRLIST_INIT, ELM_STRLIST_RESIZE, FM_CALL, FM_CALLLIST,
         };
@@ -6930,7 +7069,12 @@ impl<'a> SceneVm<'a> {
     }
 
     fn global_indexed_list_must_dispatch_direct(&self, elm: &[i32]) -> bool {
-        self.is_global_indexed_list_chain(elm) && !self.is_current_object_child_tail(elm)
+        // A small flag index can also look like a compact object property.
+        // Only prefer that shorthand when its parent object actually has the
+        // requested child; otherwise G/Z accesses must reach the saved lists.
+        self.is_global_indexed_list_chain(elm)
+            && !(self.is_current_object_child_tail(elm)
+                && self.current_object_has_child_index(elm[0]))
     }
 
     fn dispatch_global_indexed_list_property_direct(&mut self, elm: &[i32]) -> Result<bool> {
@@ -7744,18 +7888,6 @@ impl<'a> SceneVm<'a> {
 
         match owner {
             o if o == elm_code::ELM_OWNER_FORM => {
-                // Suppress only the exact residual bare [GLOBAL.WIPE] command shape
-                // observed at sys20_adv01 loop-increment sites. Real WIPE calls with
-                // arguments still go through global.rs.
-                if elm.len() == 1
-                    && elm[0] == crate::runtime::forms::codes::elm_value::GLOBAL_WIPE
-                    && args.is_empty()
-                    && ret_form == self.cfg.fm_void
-                {
-                    vm_trace!(self, None, "suppress bare residual GLOBAL.WIPE command".to_string());
-                    return Ok(());
-                }
-
                 if self.dispatch_global_indexed_list_command_direct(&elm, al_id, ret_form, args)? {
                     return Ok(());
                 }
@@ -10877,46 +11009,40 @@ impl<'a> SceneVm<'a> {
         Ok(proc_type)
     }
 
-    fn cpp_mwnd_element(stage_idx: i64, mwnd_no: Option<usize>) -> Vec<i32> {
-        let Some(no) = mwnd_no else {
-            return Vec::new();
-        };
-        let stage_head = match stage_idx {
-            0 => crate::runtime::forms::codes::ELM_GLOBAL_BACK,
-            2 => crate::runtime::forms::codes::ELM_GLOBAL_NEXT,
-            _ => crate::runtime::forms::codes::ELM_GLOBAL_FRONT,
-        };
-        vec![
-            stage_head,
-            crate::runtime::forms::codes::ELM_STAGE_MWND,
-            crate::runtime::forms::codes::ELM_ARRAY,
-            no as i32,
-        ]
-    }
-
     fn decode_cpp_mwnd_element(elm: &[i32]) -> Option<(i64, usize)> {
-        if elm.len() < 4 {
-            return None;
-        }
-        let stage_idx = if elm[0] == crate::runtime::forms::codes::ELM_GLOBAL_BACK {
-            0
-        } else if elm[0] == crate::runtime::forms::codes::ELM_GLOBAL_FRONT {
-            1
-        } else if elm[0] == crate::runtime::forms::codes::ELM_GLOBAL_NEXT {
-            2
-        } else {
-            return None;
+        let is_array = |v: i32| {
+            v == crate::runtime::forms::codes::ELM_ARRAY || v == -1
         };
-        if elm[1] != crate::runtime::forms::codes::ELM_STAGE_MWND {
-            return None;
+        if elm.len() >= 4 {
+            let stage_idx = if elm[0] == crate::runtime::forms::codes::ELM_GLOBAL_BACK {
+                Some(0)
+            } else if elm[0] == crate::runtime::forms::codes::ELM_GLOBAL_FRONT {
+                Some(1)
+            } else if elm[0] == crate::runtime::forms::codes::ELM_GLOBAL_NEXT {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(stage_idx) = stage_idx {
+                if elm[1] == crate::runtime::forms::codes::ELM_STAGE_MWND
+                    && is_array(elm[2])
+                    && elm[3] >= 0
+                {
+                    return Some((stage_idx, elm[3] as usize));
+                }
+            }
         }
-        if elm[2] != crate::runtime::forms::codes::ELM_ARRAY {
-            return None;
+        if elm.len() >= 6
+            && elm[0] == crate::runtime::forms::codes::ELM_GLOBAL_STAGE
+            && is_array(elm[1])
+            && elm[2] >= 0
+            && elm[3] == crate::runtime::forms::codes::ELM_STAGE_MWND
+            && is_array(elm[4])
+            && elm[5] >= 0
+        {
+            return Some((elm[2] as i64, elm[5] as usize));
         }
-        if elm[3] < 0 {
-            return None;
-        }
-        Some((stage_idx, elm[3] as usize))
+        None
     }
 
     fn apply_saved_current_mwnd_elements(
@@ -10925,6 +11051,9 @@ impl<'a> SceneVm<'a> {
         cur_sel_mwnd: &[i32],
         last_mwnd: &[i32],
     ) {
+        self.ctx.globals.current_mwnd_element = cur_mwnd.to_vec();
+        self.ctx.globals.current_sel_mwnd_element = cur_sel_mwnd.to_vec();
+        self.ctx.globals.last_mwnd_element = last_mwnd.to_vec();
         self.ctx.globals.current_mwnd_no = None;
         self.ctx.globals.current_sel_mwnd_no = None;
         self.ctx.globals.last_mwnd_no = None;
@@ -10993,21 +11122,9 @@ impl<'a> SceneVm<'a> {
         w.push_i32(self.stream.get_prg_cntr() as i32);
 
         self.write_cpp_runtime_proc_stack(&mut w);
-        let cur_mwnd = Self::cpp_mwnd_element(
-            self.ctx.globals.current_mwnd_stage_idx,
-            self.ctx.globals.current_mwnd_no,
-        );
-        let cur_sel_mwnd = Self::cpp_mwnd_element(
-            self.ctx.globals.current_sel_mwnd_stage_idx,
-            self.ctx.globals.current_sel_mwnd_no,
-        );
-        let last_mwnd = Self::cpp_mwnd_element(
-            self.ctx.globals.last_mwnd_stage_idx,
-            self.ctx.globals.last_mwnd_no,
-        );
-        w.push_element(&cur_mwnd);
-        w.push_element(&cur_sel_mwnd);
-        w.push_element(&last_mwnd);
+        w.push_element(&self.ctx.globals.current_mwnd_element);
+        w.push_element(&self.ctx.globals.current_sel_mwnd_element);
+        w.push_element(&self.ctx.globals.last_mwnd_element);
         w.push_str(&self.ctx.globals.syscom.current_save_scene_title);
         let current_full_message = if self.ctx.globals.syscom.current_save_full_message.is_empty() {
             self.ctx.globals.syscom.current_save_message.as_str()
@@ -12508,7 +12625,7 @@ impl<'a> SceneVm<'a> {
         let Some((stage_idx, fallback_obj_idx)) = resolved else {
             return;
         };
-        let runtime_slot = self.runtime_slot_from_object_chain(stage_idx, fallback_obj_idx, elm);
+        let runtime_slot = self.runtime_slot_from_object_chain(fallback_obj_idx, elm);
         let prev_chain = self.ctx.globals.current_object_chain.clone();
         let prev_stage_object = self.ctx.globals.current_stage_object;
         self.ctx.globals.current_object_chain = Some(elm.to_vec());
@@ -12965,7 +13082,7 @@ mod call_property_reference_tests {
 }
 
 #[cfg(test)]
-mod user_prop_command_tests {
+mod command_dispatch_tests {
     use super::*;
     use crate::runtime::forms::codes::{
         ELM_ARRAY, ELM_INTLIST_GET_SIZE, ELM_INTLIST_RESIZE, ELM_STRLIST_GET_SIZE,
@@ -12994,6 +13111,84 @@ mod user_prop_command_tests {
         let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
         let stream = SceneStream::new(chunk).expect("empty scene stream");
         SceneVm::new(stream, CommandContext::new(PathBuf::from(".")))
+    }
+
+    #[test]
+    fn op_seen_flag_reads_and_writes_the_persistent_global_list() {
+        use crate::runtime::forms::codes::ELM_GLOBAL_G;
+        let mut vm = test_vm();
+        let elm = vec![ELM_GLOBAL_G, ELM_ARRAY, 153];
+        vm.ctx.globals.int_lists.entry(ELM_GLOBAL_G as u32).or_default().resize(1000, 0);
+        vm.ctx.globals.int_lists.get_mut(&(ELM_GLOBAL_G as u32)).unwrap()[153] = 1;
+        vm.exec_property(elm.clone()).unwrap();
+        assert_eq!(vm.pop_int().unwrap(), 1, "read the OP flag restored from global.sav");
+        vm.exec_assign(elm.clone(), 1, Value::Int(2)).unwrap();
+        assert_eq!(vm.ctx.globals.int_lists[&(ELM_GLOBAL_G as u32)][153], 2);
+        vm.ctx.reset_for_scene_restart();
+        vm.exec_property(elm).unwrap();
+        assert_eq!(vm.pop_int().unwrap(), 2);
+    }
+
+    #[test]
+    fn wipe_without_arguments_starts_the_default_transition() {
+        let mut vm = test_vm();
+        vm.exec_command(
+            vec![constants::elm_value::GLOBAL_WIPE],
+            0,
+            vm.cfg.fm_void,
+            &mut vec![],
+        ).unwrap();
+        assert!(vm.ctx.globals.wipe.is_some(), "WIPE() is a real script command");
+        assert!(vm.ctx.wait.wipe);
+        assert!(vm.is_blocked());
+    }
+
+    #[test]
+    fn global_get_scene_name_returns_active_scene_on_string_stack() {
+        let mut vm = test_vm();
+        for scene in ["_start", "menu", "frame_action_scene"] {
+            vm.current_scene_name = Some(scene.into());
+            vm.ctx.current_scene_name = Some(scene.into());
+            vm.exec_command(
+                vec![constants::elm_value::GLOBAL_GET_SCENE_NAME],
+                0,
+                vm.cfg.fm_str,
+                &mut vec![],
+            ).unwrap();
+            assert_eq!(vm.pop_str().unwrap(), scene);
+            assert!(vm.ctx.stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn global_returnmenu_yields_to_host_with_optional_scene_and_label() {
+        use crate::runtime::globals::SyscomPendingProcKind;
+
+        let mut vm = test_vm();
+        for (al_id, mut args, expected) in [
+            (2, vec![Value::Str("menu".into()), Value::Int(7)], Some(("menu".into(), 7))),
+            (1, vec![Value::Str("title".into())], Some(("title".into(), 0))),
+            (0, vec![], None),
+        ] {
+            let generation = vm.ctx.proc_generation();
+            vm.exec_command(
+                vec![constants::elm_value::GLOBAL_RETURNMENU],
+                al_id,
+                vm.cfg.fm_void,
+                &mut args,
+            ).unwrap();
+            assert_ne!(vm.ctx.proc_generation(), generation);
+            assert_eq!(vm.ctx.pending_menu_scene, expected);
+            let pending = vm.ctx.globals.syscom.pending_proc.as_ref().unwrap();
+            assert_eq!(pending.kind, SyscomPendingProcKind::ReturnToMenu);
+            assert!(!pending.warning && !pending.se_play && !pending.fade_out);
+            assert!(vm.ctx.stack.is_empty());
+            assert!(!vm.halted);
+        }
+        vm.ctx.pending_menu_scene = Some(("stale".into(), 7));
+        vm.ctx.reset_for_scene_restart();
+        assert!(vm.ctx.pending_menu_scene.is_none());
+        assert!(vm.ctx.globals.syscom.pending_proc.is_none());
     }
 
     #[test]

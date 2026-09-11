@@ -20,7 +20,7 @@ use crate::na_rl_tables::{
 use crate::na_simple_idct as ffidct;
 use crate::na_wmv2_tables::{FF_MSMP4_DC_TABLES, FF_MSMP4_MB_I_TABLE};
 use crate::na_wmv2dsp as wmv2dsp;
-use crate::vc1::{FrameType, PictureHeader, SequenceHeader};
+use crate::vc1::{FrameType, MvMode, PictureHeader, SequenceHeader};
 use crate::vlc::{
     cbpcy_i_vlc, cbpcy_p_vlc, dc_chroma_vlc, dc_luma_vlc, inter_tcoef_vlc, intra_tcoef_vlc,
     mv_diff_vlc, ttblk_vlc, ttmb_vlc, unpack_rl, wmv2_cbpc_p_vlc, wmv2_cbpy_vlc,
@@ -28,6 +28,11 @@ use crate::vlc::{
     ZIGZAG,
 };
 use crate::vlc_tree::VlcTree;
+use crate::vc1_tables::{
+    ac_tables, cbpcy_vlcs, mvdata_vlcs, subblkpat_vlcs, ttblk_vlcs, ttmb_vlcs,
+    Vc1AcTable, TTBLK_TO_TT, TT_4X4, TT_4X8, TT_4X8_LEFT, TT_4X8_RIGHT, TT_8X4,
+    TT_8X4_BOTTOM, TT_8X4_TOP, TT_8X8, VC1_ZZ_4X4, VC1_ZZ_4X8, VC1_ZZ_8X4,
+};
 use crate::wmv2::{Wmv2FrameHeader, Wmv2FrameType, Wmv2Params};
 
 // ─── Frame buffer ────────────────────────────────────────────────────────────
@@ -69,176 +74,143 @@ impl YuvFrame {
     }
 }
 
-// ─── VC-1 IDCT ───────────────────────────────────────────────────────────────
-// SMPTE 421M §4.4.1 — Simple/Main profile integer IDCT.
-//
-// Exact butterfly constants: 12, 6, 16, 15, 9, 4  (no floating point).
-// Row pass produces values × 8; column pass divides by 128 (>>7).
-// Total normalization: ×8 / 128 = 1/16  per spatial pixel per coefficient.
-//
+// ─── VC-1 inverse transforms ─────────────────────────────────────────────────
+// These are integer-for-integer translations of FFmpeg libavcodec/vc1dsp.c.
+// VC-1 uses distinct 8x8, 8x4, 4x8 and 4x4 transforms; they are not scaled
+// variants of a generic IDCT.
 
-/// One-dimensional 8-point VC-1 inverse DCT row kernel.
-/// Input/output in-place.  Output is NOT yet shifted (caller does >>7 in col pass).
-#[inline(always)]
-fn idct_row8(b: &mut [i32; 8]) {
-    // Even part
-    let t1 = 12 * b[2] + 6 * b[6];
-    let t2 = 6 * b[2] - 12 * b[6];
-    let mut s0 = b[0] + b[4];
-    let mut s1 = b[0] - b[4];
-    let s2 = s1 + (t2 >> 3);
-    let s3 = s0 - (t1 >> 3);
-    s0 += t1 >> 3;
-    s1 -= t2 >> 3;
-
-    // Odd part
-    let t0 = 16 * b[1] + 15 * b[3] + 9 * b[5] + 4 * b[7];
-    let t1 = 15 * b[1] - 4 * b[3] - 16 * b[5] - 9 * b[7];
-    let t2 = 9 * b[1] - 16 * b[3] + 4 * b[5] + 15 * b[7];
-    let t3 = 4 * b[1] - 9 * b[3] + 15 * b[5] - 16 * b[7];
-
-    b[0] = s0 + (t0 >> 3);
-    b[1] = s2 + (t2 >> 3);
-    b[2] = s1 + (t3 >> 3);
-    b[3] = s3 + (t1 >> 3);
-    b[4] = s3 - (t1 >> 3);
-    b[5] = s1 - (t3 >> 3);
-    b[6] = s2 - (t2 >> 3);
-    b[7] = s0 - (t0 >> 3);
-}
-
-/// One-dimensional 4-point VC-1 inverse DCT row kernel (SMPTE 421M §4.4.2).
-#[inline(always)]
-fn idct_row4(b: &[i32; 4]) -> [i32; 4] {
-    let t0 = 17 * b[0] + 17 * b[2];
-    let t1 = 17 * b[0] - 17 * b[2];
-    let t2 = 22 * b[1] + 10 * b[3];
-    let t3 = 10 * b[1] - 22 * b[3];
-    [t0 + t2, t1 + t3, t1 - t3, t0 - t2]
-}
-
-pub fn idct8x8(blk: &mut [i32; 64]) {
-    // Row pass (no shift — values grow by ×8 nominal)
-    for r in 0..8 {
-        let o = r * 8;
-        let mut row = [
-            blk[o],
-            blk[o + 1],
-            blk[o + 2],
-            blk[o + 3],
-            blk[o + 4],
-            blk[o + 5],
-            blk[o + 6],
-            blk[o + 7],
-        ];
-        idct_row8(&mut row);
-        blk[o..o + 8].copy_from_slice(&row);
+pub fn idct8x8(block: &mut [i32; 64]) {
+    let src = *block;
+    let mut temp = [0i32; 64];
+    for i in 0..8 {
+        let t1 = 12 * (src[i] + src[i + 32]) + 4;
+        let t2 = 12 * (src[i] - src[i + 32]) + 4;
+        let t3 = 16 * src[i + 16] + 6 * src[i + 48];
+        let t4 = 6 * src[i + 16] - 16 * src[i + 48];
+        let t5 = t1 + t3;
+        let t6 = t2 + t4;
+        let t7 = t2 - t4;
+        let t8 = t1 - t3;
+        let o1 = 16 * src[i + 8] + 15 * src[i + 24] + 9 * src[i + 40] + 4 * src[i + 56];
+        let o2 = 15 * src[i + 8] - 4 * src[i + 24] - 16 * src[i + 40] - 9 * src[i + 56];
+        let o3 = 9 * src[i + 8] - 16 * src[i + 24] + 4 * src[i + 40] + 15 * src[i + 56];
+        let o4 = 4 * src[i + 8] - 9 * src[i + 24] + 15 * src[i + 40] - 16 * src[i + 56];
+        let d = i * 8;
+        temp[d] = (t5 + o1) >> 3;
+        temp[d + 1] = (t6 + o2) >> 3;
+        temp[d + 2] = (t7 + o3) >> 3;
+        temp[d + 3] = (t8 + o4) >> 3;
+        temp[d + 4] = (t8 - o4) >> 3;
+        temp[d + 5] = (t7 - o3) >> 3;
+        temp[d + 6] = (t6 - o2) >> 3;
+        temp[d + 7] = (t5 - o1) >> 3;
     }
-    // Column pass + final >>7 rounding shift
-    for c in 0..8 {
-        let mut col = [
-            blk[c],
-            blk[c + 8],
-            blk[c + 16],
-            blk[c + 24],
-            blk[c + 32],
-            blk[c + 40],
-            blk[c + 48],
-            blk[c + 56],
-        ];
-        idct_row8(&mut col);
-        for r in 0..8 {
-            blk[c + r * 8] = (col[r] + 64) >> 7;
-        }
+    for i in 0..8 {
+        let t1 = 12 * (temp[i] + temp[i + 32]) + 64;
+        let t2 = 12 * (temp[i] - temp[i + 32]) + 64;
+        let t3 = 16 * temp[i + 16] + 6 * temp[i + 48];
+        let t4 = 6 * temp[i + 16] - 16 * temp[i + 48];
+        let t5 = t1 + t3;
+        let t6 = t2 + t4;
+        let t7 = t2 - t4;
+        let t8 = t1 - t3;
+        let o1 = 16 * temp[i + 8] + 15 * temp[i + 24] + 9 * temp[i + 40] + 4 * temp[i + 56];
+        let o2 = 15 * temp[i + 8] - 4 * temp[i + 24] - 16 * temp[i + 40] - 9 * temp[i + 56];
+        let o3 = 9 * temp[i + 8] - 16 * temp[i + 24] + 4 * temp[i + 40] + 15 * temp[i + 56];
+        let o4 = 4 * temp[i + 8] - 9 * temp[i + 24] + 15 * temp[i + 40] - 16 * temp[i + 56];
+        block[i] = (t5 + o1) >> 7;
+        block[i + 8] = (t6 + o2) >> 7;
+        block[i + 16] = (t7 + o3) >> 7;
+        block[i + 24] = (t8 + o4) >> 7;
+        block[i + 32] = (t8 - o4 + 1) >> 7;
+        block[i + 40] = (t7 - o3 + 1) >> 7;
+        block[i + 48] = (t6 - o2 + 1) >> 7;
+        block[i + 56] = (t5 - o1 + 1) >> 7;
     }
 }
 
-fn idct8x4(blk: &mut [i32; 64]) {
-    // Row pass (8 wide, 4 high)
+fn inv_trans_8x4_part(block: &mut [i32; 64], row0: usize) {
+    let mut src = [0i32; 32];
+    for r in 0..4 { for c in 0..8 { src[r*8+c] = block[(row0+r)*8+c]; } }
     for r in 0..4 {
-        let o = r * 8;
-        let mut row = [
-            blk[o],
-            blk[o + 1],
-            blk[o + 2],
-            blk[o + 3],
-            blk[o + 4],
-            blk[o + 5],
-            blk[o + 6],
-            blk[o + 7],
-        ];
-        idct_row8(&mut row);
-        blk[o..o + 8].copy_from_slice(&row);
+        let o=r*8;
+        let t1=12*(src[o]+src[o+4])+4; let t2=12*(src[o]-src[o+4])+4;
+        let t3=16*src[o+2]+6*src[o+6]; let t4=6*src[o+2]-16*src[o+6];
+        let t5=t1+t3; let t6=t2+t4; let t7=t2-t4; let t8=t1-t3;
+        let a=16*src[o+1]+15*src[o+3]+9*src[o+5]+4*src[o+7];
+        let b=15*src[o+1]-4*src[o+3]-16*src[o+5]-9*src[o+7];
+        let c=9*src[o+1]-16*src[o+3]+4*src[o+5]+15*src[o+7];
+        let d=4*src[o+1]-9*src[o+3]+15*src[o+5]-16*src[o+7];
+        src[o]=(t5+a)>>3; src[o+1]=(t6+b)>>3; src[o+2]=(t7+c)>>3; src[o+3]=(t8+d)>>3;
+        src[o+4]=(t8-d)>>3; src[o+5]=(t7-c)>>3; src[o+6]=(t6-b)>>3; src[o+7]=(t5-a)>>3;
     }
-    // Column pass (only 4 rows), with >>7
     for c in 0..8 {
-        let col4 = [blk[c], blk[c + 8], blk[c + 16], blk[c + 24]];
-        let out = idct_row4(&col4);
-        for r in 0..4 {
-            blk[c + r * 8] = (out[r] + 64) >> 7;
-        }
-        let _ = col4[0]; // suppress unused warning
+        let t1=17*(src[c]+src[c+16])+64; let t2=17*(src[c]-src[c+16])+64;
+        let t3=22*src[c+8]+10*src[c+24]; let t4=22*src[c+24]-10*src[c+8];
+        block[row0*8+c]=(t1+t3)>>7;
+        block[(row0+1)*8+c]=(t2-t4)>>7;
+        block[(row0+2)*8+c]=(t2+t4)>>7;
+        block[(row0+3)*8+c]=(t1-t3)>>7;
     }
 }
 
-fn idct4x8(blk: &mut [i32; 64]) {
-    // Row pass (only 4 wide)
+fn inv_trans_4x8_part(block: &mut [i32; 64], col0: usize) {
+    let mut src=[0i32;32];
+    for r in 0..8 { for c in 0..4 { src[r*4+c]=block[r*8+col0+c]; } }
     for r in 0..8 {
-        let o = r * 8;
-        let col4 = [blk[o], blk[o + 1], blk[o + 2], blk[o + 3]];
-        let out = idct_row4(&col4);
-        for c in 0..4 {
-            blk[o + c] = out[c];
-        }
+        let o=r*4;
+        let t1=17*(src[o]+src[o+2])+4; let t2=17*(src[o]-src[o+2])+4;
+        let t3=22*src[o+1]+10*src[o+3]; let t4=22*src[o+3]-10*src[o+1];
+        src[o]=(t1+t3)>>3; src[o+1]=(t2-t4)>>3; src[o+2]=(t2+t4)>>3; src[o+3]=(t1-t3)>>3;
     }
-    // Column pass (8 rows), with >>7
     for c in 0..4 {
-        let mut col = [
-            blk[c],
-            blk[c + 8],
-            blk[c + 16],
-            blk[c + 24],
-            blk[c + 32],
-            blk[c + 40],
-            blk[c + 48],
-            blk[c + 56],
-        ];
-        idct_row8(&mut col);
-        for r in 0..8 {
-            blk[c + r * 8] = (col[r] + 64) >> 7;
-        }
+        let t1=12*(src[c]+src[c+16])+64; let t2=12*(src[c]-src[c+16])+64;
+        let t3=16*src[c+8]+6*src[c+24]; let t4=6*src[c+8]-16*src[c+24];
+        let t5=t1+t3; let t6=t2+t4; let t7=t2-t4; let t8=t1-t3;
+        let a=16*src[c+4]+15*src[c+12]+9*src[c+20]+4*src[c+28];
+        let b=15*src[c+4]-4*src[c+12]-16*src[c+20]-9*src[c+28];
+        let d=9*src[c+4]-16*src[c+12]+4*src[c+20]+15*src[c+28];
+        let e=4*src[c+4]-9*src[c+12]+15*src[c+20]-16*src[c+28];
+        block[col0+c]=(t5+a)>>7; block[8+col0+c]=(t6+b)>>7; block[16+col0+c]=(t7+d)>>7;
+        block[24+col0+c]=(t8+e)>>7; block[32+col0+c]=(t8-e+1)>>7; block[40+col0+c]=(t7-d+1)>>7;
+        block[48+col0+c]=(t6-b+1)>>7; block[56+col0+c]=(t5-a+1)>>7;
     }
 }
 
-fn idct4x4(blk: &mut [i32; 64]) {
-    // Row pass (4 wide)
+fn inv_trans_4x4_part(block: &mut [i32; 64], row0: usize, col0: usize) {
+    let mut src=[0i32;16];
+    for r in 0..4 { for c in 0..4 { src[r*4+c]=block[(row0+r)*8+col0+c]; } }
     for r in 0..4 {
-        let o = r * 8;
-        let col4 = [blk[o], blk[o + 1], blk[o + 2], blk[o + 3]];
-        let out = idct_row4(&col4);
-        for c in 0..4 {
-            blk[o + c] = out[c];
-        }
+        let o=r*4;
+        let t1=17*(src[o]+src[o+2])+4; let t2=17*(src[o]-src[o+2])+4;
+        let t3=22*src[o+1]+10*src[o+3]; let t4=22*src[o+3]-10*src[o+1];
+        src[o]=(t1+t3)>>3; src[o+1]=(t2-t4)>>3; src[o+2]=(t2+t4)>>3; src[o+3]=(t1-t3)>>3;
     }
-    // Column pass (4 rows), with >>7
     for c in 0..4 {
-        let col4 = [blk[c], blk[c + 8], blk[c + 16], blk[c + 24]];
-        let out = idct_row4(&col4);
-        for r in 0..4 {
-            blk[c + r * 8] = (out[r] + 64) >> 7;
-        }
+        let t1=17*(src[c]+src[c+8])+64; let t2=17*(src[c]-src[c+8])+64;
+        let t3=22*src[c+4]+10*src[c+12]; let t4=22*src[c+12]-10*src[c+4];
+        block[row0*8+col0+c]=(t1+t3)>>7; block[(row0+1)*8+col0+c]=(t2-t4)>>7;
+        block[(row0+2)*8+col0+c]=(t2+t4)>>7; block[(row0+3)*8+col0+c]=(t1-t3)>>7;
     }
 }
 
-/// Apply IDCT according to transform type.
-/// tt: 0=8x8, 1=8x4_top, 2=8x4_bot, 3=4x8_left, 4=4x8_right, 5=4x4, 6=per_block
-pub fn apply_idct(blk: &mut [i32; 64], tt: u8) {
+pub fn apply_idct(block: &mut [i32; 64], tt: u8) {
+    use crate::vc1_tables::*;
     match tt {
-        0 => idct8x8(blk),
-        1 | 2 => idct8x4(blk),
-        3 | 4 => idct4x8(blk),
-        5 | 6 => idct4x4(blk),
-        _ => idct8x8(blk),
+        TT_8X8 => idct8x8(block),
+        TT_8X4 | TT_8X4_TOP | TT_8X4_BOTTOM => {
+            if tt != TT_8X4_BOTTOM { inv_trans_8x4_part(block, 0); }
+            if tt != TT_8X4_TOP { inv_trans_8x4_part(block, 4); }
+        }
+        TT_4X8 | TT_4X8_LEFT | TT_4X8_RIGHT => {
+            if tt != TT_4X8_RIGHT { inv_trans_4x8_part(block, 0); }
+            if tt != TT_4X8_LEFT { inv_trans_4x8_part(block, 4); }
+        }
+        TT_4X4 => {
+            inv_trans_4x4_part(block,0,0); inv_trans_4x4_part(block,0,4);
+            inv_trans_4x4_part(block,4,0); inv_trans_4x4_part(block,4,4);
+        }
+        _ => idct8x8(block),
     }
 }
 
@@ -861,6 +833,20 @@ impl AcPredBuffer {
         [0i32; 7]
     }
 
+    /// VC-1 AC prediction from the left uses the neighbour's first coefficient column.
+    pub fn pred_left_col(&self, mb_row: usize, mb_col: usize, blk: usize) -> [i32; 7] {
+        let (r, c, b) = Self::left_neighbour(mb_row, mb_col, blk);
+        let idx = r.wrapping_mul(self.mb_w).wrapping_add(c);
+        if c < self.mb_w && idx < self.col.len() { self.col[idx][b] } else { [0; 7] }
+    }
+
+    /// VC-1 AC prediction from the top uses the neighbour's first coefficient row.
+    pub fn pred_top_row(&self, mb_row: usize, mb_col: usize, blk: usize) -> [i32; 7] {
+        let (r, c, b) = Self::top_neighbour(mb_row, mb_col, blk);
+        let idx = r.wrapping_mul(self.mb_w).wrapping_add(c);
+        if r < self.row.len().div_ceil(self.mb_w.max(1)) && c < self.mb_w && idx < self.row.len() { self.row[idx][b] } else { [0; 7] }
+    }
+
     pub fn store_row(&mut self, mb_row: usize, mb_col: usize, blk: usize, row: [i32; 7]) {
         let idx = mb_row * self.mb_w + mb_col;
         if idx < self.row.len() {
@@ -1120,40 +1106,64 @@ fn mc_luma(
 // ─── DQUANT: macroblock-level differential quantizer ────────────────────────
 // SMPTE 421M §8.1.4.10 / §8.3.7.
 //
-// When seq.dquant != 0, each macroblock may override the frame-level PQUANT.
-// dquant=1: 1-bit flag; if set, read 2-bit MQUANT (absolute value).
-// dquant=2: always present 2-bit MQDIFF; if == 7, read 5-bit MQUANT absolute.
+// This follows FFmpeg's GET_MQUANT() semantics.  A negative mquant is an
+// internal marker meaning that HALFQP must not be applied to residual scaling;
+// the absolute value is still the macroblock quantizer.
+fn read_mquant(
+    br: &mut BitReader<'_>,
+    dquant: &crate::vc1::DQuantInfo,
+    pquant: i32,
+    mb_x: u32,
+    mb_y: u32,
+    mb_width: u32,
+    mb_height: u32,
+) -> i32 {
+    if !dquant.enabled {
+        return pquant;
+    }
 
-fn read_mquant(br: &mut BitReader<'_>, dquant: u8, pquant: i32) -> i32 {
-    match dquant {
-        0 => pquant, // no per-MB quant
-        1 => {
-            // 1-bit DQUANT flag; if 1, read 2-bit delta
-            if br.read_bit().unwrap_or(false) {
-                let mqdiff = br.read_bits(2).unwrap_or(0) as i32;
-                // mqdiff: 0=+2, 1=-2, 2=+4, 3=-4 relative to pquant
-                let delta = match mqdiff {
-                    0 => 2,
-                    1 => -2,
-                    2 => 4,
-                    _ => -4,
+    let mut mquant = pquant;
+    let mut edges = 0u8;
+    match dquant.profile {
+        3 => { // DQPROFILE_ALL_MBS
+            if dquant.bi_level {
+                mquant = if br.read_bit().unwrap_or(false) {
+                    -(dquant.alt_pquant as i32)
+                } else {
+                    pquant
                 };
-                (pquant + delta).clamp(1, 31)
             } else {
-                pquant
+                let mqdiff = br.read_bits(3).unwrap_or(0) as i32;
+                mquant = if mqdiff != 7 {
+                    -pquant - mqdiff
+                } else {
+                    -(br.read_bits(5).unwrap_or(1) as i32)
+                };
             }
         }
-        _ => {
-            // dquant==2: always read 3-bit MQDIFF
-            let mqdiff = br.read_bits(3).unwrap_or(0);
-            if mqdiff == 7 {
-                // escape: read 5-bit absolute MQUANT
-                br.read_bits(5).unwrap_or(pquant as u32) as i32
-            } else {
-                // relative to pquant: +1..+6
-                (pquant + mqdiff as i32).clamp(1, 31)
-            }
-        }
+        0 => edges = 1u8 << dquant.edge.min(3), // DQPROFILE_SINGLE_EDGE
+        1 => edges = ((3u16 << dquant.edge.min(3)) % 15) as u8, // DOUBLE_EDGES
+        2 => edges = 15, // DQPROFILE_FOUR_EDGES
+        _ => {}
+    }
+
+    if (edges & 1) != 0 && mb_x == 0 {
+        mquant = -(dquant.alt_pquant as i32);
+    }
+    if (edges & 2) != 0 && mb_y == 0 {
+        mquant = -(dquant.alt_pquant as i32);
+    }
+    if (edges & 4) != 0 && mb_x + 1 == mb_width {
+        mquant = -(dquant.alt_pquant as i32);
+    }
+    if (edges & 8) != 0 && mb_y + 1 == mb_height {
+        mquant = -(dquant.alt_pquant as i32);
+    }
+
+    if mquant == 0 || !(-31..=31).contains(&mquant) {
+        1
+    } else {
+        mquant
     }
 }
 
@@ -2229,6 +2239,95 @@ impl Wmv2Rl {
     }
 }
 
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Vc1MvData {
+    dx: i32,
+    dy: i32,
+    intra: bool,
+    has_coeffs: bool,
+}
+
+#[inline(always)]
+fn vc1_dc_scale(q: i32) -> i32 {
+    const T: [i32; 32] = [
+        0, 2, 4, 8, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+        14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21,
+    ];
+    T[q.abs().clamp(1, 31) as usize]
+}
+
+#[inline(always)]
+fn vc1_decode012_bits(br: &mut BitReader<'_>) -> Result<u8> {
+    let first = br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated VC-1 decode012".into()))?;
+    if !first {
+        Ok(0)
+    } else {
+        Ok(if br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated VC-1 decode012".into()))? { 2 } else { 1 })
+    }
+}
+
+#[inline(always)]
+fn vc1_decode210_bits(br: &mut BitReader<'_>) -> Result<u8> {
+    // FFmpeg decode210(): 1 -> 0, 01 -> 1, 00 -> 2.
+    let first = br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated VC-1 escape selector".into()))?;
+    if first {
+        Ok(0)
+    } else {
+        Ok(if br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated VC-1 escape selector".into()))? { 1 } else { 2 })
+    }
+}
+
+#[inline(always)]
+fn vc1_read_unary_stop_one(br: &mut BitReader<'_>, max: u8) -> Result<u8> {
+    let mut n = 0u8;
+    while n < max {
+        if br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated VC-1 unary".into()))? {
+            break;
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+#[inline(always)]
+fn vc1_scale_level(level: i32, mquant: i32, halfqp: bool, pquantizer: bool) -> i32 {
+    if level == 0 {
+        return 0;
+    }
+    let quant = mquant.abs().clamp(1, 31);
+    let scale = quant * 2 + if mquant < 0 { 0 } else if halfqp { 1 } else { 0 };
+    let mut out = level * scale;
+    if !pquantizer {
+        out += if out < 0 { -quant } else { quant };
+    }
+    out
+}
+
+#[inline(always)]
+fn vc1_rescale_ac_pred(v: i32, from_q: i32, to_q: i32, halfqp: bool) -> i32 {
+    if v == 0 || from_q == 0 || to_q == 0 || from_q == to_q {
+        return v;
+    }
+    let fq = from_q.abs() * 2 + if from_q < 0 { 0 } else if halfqp { 1 } else { 0 } - 1;
+    let tq = to_q.abs() * 2 + if to_q < 0 { 0 } else if halfqp { 1 } else { 0 } - 1;
+    if fq <= 0 || tq <= 0 {
+        return v;
+    }
+    if v >= 0 {
+        (v * fq + tq / 2) / tq
+    } else {
+        -(((-v) * fq + tq / 2) / tq)
+    }
+}
+
+#[inline(always)]
+fn vc1_direct_scale(mv: i32, num: i32, den: i32) -> i32 {
+    if den == 0 { return 0; }
+    let prod = mv.saturating_mul(num);
+    if prod >= 0 { (prod + den / 2) / den } else { -(((-prod) + den / 2) / den) }
+}
+
 pub struct MacroblockDecoder {
     pub width: u32,
     pub height: u32,
@@ -2236,18 +2335,35 @@ pub struct MacroblockDecoder {
     pub height_mb: u32,
     /// Reference frame for P/B decoding
     pub ref_frame: Option<YuvFrame>,
-    // Lazily-built VLC tables
+    // Legacy WMV3 decode-path tables retained until the VC-1 macroblock rewrite is fully switched over.
     dc_luma: VlcTable,
     dc_chroma: VlcTable,
     ac_inter: [VlcTable; 4],
     ac_intra: [VlcTable; 4],
     cbpcy_i: VlcTable,
-    cbpcy_p: [VlcTable; 2], // CBPTAB 0-1
+    cbpcy_p: [VlcTable; 2],
     ttmb: VlcTable,
     ttblk: VlcTable,
-    mv_vlc: [VlcTable; 4], // MVTAB 0-3
+    mv_vlc: [VlcTable; 4],
     dc_pred: DcPredBuffer,
+    // Exact VC-1 Simple/Main tables and per-picture predictor state.
+    vc1_ac: [Vc1AcTable; 8],
+    vc1_cbpcy: [VlcTable; 4],
+    vc1_mvdata: [VlcTable; 4],
+    vc1_ttmb: [VlcTable; 3],
+    vc1_ttblk: [VlcTable; 3],
+    vc1_subblkpat: [VlcTable; 3],
+    vc1_esc3_level_length: u8,
+    vc1_esc3_run_length: u8,
+    vc1_coded_block: Vec<u8>,
+    vc1_dc: Vec<[i32; 6]>,
+    vc1_intra_blocks: Vec<[bool; 6]>,
+    vc1_qscale: Vec<i32>,
+    vc1_current_mvs: Vec<(i32, i32)>,
+    vc1_mv4: Vec<[(i32, i32); 4]>,
     mv_pred: MvPredictor,
+    vc1_bwd_anchor_mvs: Option<Vec<(i32, i32)>>,
+    vc1_fwd_anchor_mvs: Option<Vec<(i32, i32)>>,
     // ── WMV2 VLC tables (built lazily; shared with VC-1 decode machinery) ─────
     wmv2_inter: [VlcTable; 2], // ttcoef 0-1
     wmv2_intra: [VlcTable; 2],
@@ -2400,7 +2516,23 @@ impl MacroblockDecoder {
                 mv_diff_vlc(3),
             ],
             dc_pred: DcPredBuffer::new(mb_w, mb_h),
+            vc1_ac: ac_tables(),
+            vc1_cbpcy: cbpcy_vlcs(),
+            vc1_mvdata: mvdata_vlcs(),
+            vc1_ttmb: ttmb_vlcs(),
+            vc1_ttblk: ttblk_vlcs(),
+            vc1_subblkpat: subblkpat_vlcs(),
+            vc1_esc3_level_length: 0,
+            vc1_esc3_run_length: 0,
+            vc1_coded_block: vec![0u8; (2 * mb_w) * (2 * mb_h)],
+            vc1_dc: vec![[0i32; 6]; mb_w * mb_h],
+            vc1_intra_blocks: vec![[false; 6]; mb_w * mb_h],
+            vc1_qscale: vec![0i32; mb_w * mb_h],
+            vc1_current_mvs: vec![(0, 0); mb_w * mb_h],
+            vc1_mv4: vec![[ (0, 0); 4 ]; mb_w * mb_h],
             mv_pred: MvPredictor::new(mb_w, mb_h),
+            vc1_bwd_anchor_mvs: None,
+            vc1_fwd_anchor_mvs: None,
             ref_rangeredfrm: false,
             ac_pred: AcPredBuffer::new(mb_w, mb_h),
             fwd_ref: None,
@@ -2536,7 +2668,7 @@ impl MacroblockDecoder {
         let mut br = BitReader::new_at(payload, pic_hdr.header_bits);
         let pquant = pic_hdr.pquant as i32;
         let halfqp = pic_hdr.halfqp;
-        let uniform = seq.quantizer_mode != crate::vc1::QuantizerMode::NonUniform;
+        let uniform = pic_hdr.pqual_mode != 0;
 
         // Reset DC and AC prediction buffers for this frame
         let mb_w = self.width_mb as usize;
@@ -2554,7 +2686,17 @@ impl MacroblockDecoder {
                 let cbp = self.cbpcy_i.decode(&mut br).unwrap_or(0) as u8;
 
                 // Per-MB quantizer override (DQUANT)
-                let mb_pquant = read_mquant(&mut br, seq.dquant, pquant);
+                let mb_mquant = read_mquant(
+                    &mut br,
+                    &pic_hdr.dquant,
+                    pquant,
+                    mb_col,
+                    mb_row,
+                    self.width_mb,
+                    self.height_mb,
+                );
+                let mb_pquant = mb_mquant.abs();
+                let mb_halfqp = halfqp && mb_mquant >= 0;
 
                 // Transform type for this MB
                 let mb_tt = if seq.vstransform {
@@ -2595,10 +2737,10 @@ impl MacroblockDecoder {
                             &mut br,
                             is_luma,
                             mb_pquant,
-                            halfqp,
+                            mb_halfqp,
                             uniform,
                             blk_tt,
-                            &self.ac_intra[seq.transacfrm2 as usize],
+                            &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
                         )
                     } else {
                         [0i32; 64]
@@ -2664,8 +2806,8 @@ impl MacroblockDecoder {
         let mut br = BitReader::new_at(payload, pic_hdr.header_bits);
         let pquant = pic_hdr.pquant as i32;
         let halfqp = pic_hdr.halfqp;
-        let uniform = seq.quantizer_mode != crate::vc1::QuantizerMode::NonUniform;
-        let mv_vlc = &self.mv_vlc[seq.mvtab as usize];
+        let uniform = pic_hdr.pqual_mode != 0;
+        let mv_vlc = &self.mv_vlc[(pic_hdr.mvtab as usize).min(3)];
 
         // MV range (quarter-pel)
         let mv_scale = 1i32 << (pic_hdr.mvrange as i32 + 1);
@@ -2789,11 +2931,21 @@ impl MacroblockDecoder {
                 }
 
                 // Residual (CBPCY + coefficients)
-                let cbp = self.cbpcy_p[(seq.cbptab as usize).min(1)]
+                let cbp = self.cbpcy_p[(pic_hdr.cbptab as usize).min(1)]
                     .decode(&mut br)
                     .unwrap_or(0) as u8;
                 // Per-MB quantizer (DQUANT)
-                let mb_pquant = read_mquant(&mut br, seq.dquant, pquant);
+                let mb_mquant = read_mquant(
+                    &mut br,
+                    &pic_hdr.dquant,
+                    pquant,
+                    mb_col,
+                    mb_row,
+                    self.width_mb,
+                    self.height_mb,
+                );
+                let mb_pquant = mb_mquant.abs();
+                let mb_halfqp = halfqp && mb_mquant >= 0;
                 let mb_tt = if seq.vstransform {
                     self.ttmb.decode(&mut br).unwrap_or(0) as u8
                 } else {
@@ -2816,13 +2968,13 @@ impl MacroblockDecoder {
                         false,
                         is_luma,
                         mb_pquant,
-                        halfqp,
+                        mb_halfqp,
                         uniform,
                         blk_tt,
                         &self.dc_luma,
                         &self.dc_chroma,
-                        &self.ac_intra[seq.transacfrm2 as usize],
-                        &self.ac_inter[seq.transacfrm as usize],
+                        &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
+                        &self.ac_inter[(pic_hdr.transacfrm as usize).min(3)],
                     );
                     apply_idct(&mut coeff, blk_tt);
                     add_residual_block(frame, mb_row as u32, mb_col as u32, blk, &coeff);
@@ -2854,11 +3006,11 @@ impl MacroblockDecoder {
             None => return Ok(()), // no backward anchor
         };
 
-        let mut br = BitReader::new(payload);
+        let mut br = BitReader::new_at(payload, pic_hdr.header_bits);
         let pquant = pic_hdr.pquant as i32;
         let halfqp = pic_hdr.halfqp;
-        let uniform = seq.quantizer_mode != crate::vc1::QuantizerMode::NonUniform;
-        let mv_vlc = &self.mv_vlc[seq.mvtab as usize];
+        let uniform = pic_hdr.pqual_mode != 0;
+        let mv_vlc = &self.mv_vlc[(pic_hdr.mvtab as usize).min(3)];
         let mv_scale = 1i32 << (pic_hdr.mvrange as i32 + 1);
 
         let fw = self.width as usize;
@@ -2882,8 +3034,16 @@ impl MacroblockDecoder {
                 }
 
                 let mb_idx = mb_row as usize * mb_w + mb_col as usize;
-                let is_direct = direct_plane.get(mb_idx).copied().unwrap_or(0) != 0;
-                let is_skip = skip_plane.get(mb_idx).copied().unwrap_or(0) != 0;
+                let is_direct = if pic_hdr.directmb_raw {
+                    br.read_bit().unwrap_or(false)
+                } else {
+                    direct_plane.get(mb_idx).copied().unwrap_or(0) != 0
+                };
+                let is_skip = if pic_hdr.skipmb_raw {
+                    br.read_bit().unwrap_or(false)
+                } else {
+                    skip_plane.get(mb_idx).copied().unwrap_or(0) != 0
+                };
 
                 if is_skip || is_direct {
                     // Direct / skip: interpolate fwd + bwd with equal weight
@@ -2909,7 +3069,17 @@ impl MacroblockDecoder {
                 if mb_type == 0 {
                     // Intra MB in B-frame (rare)
                     let cbp = self.cbpcy_i.decode(&mut br).unwrap_or(0) as u8;
-                    let mb_pquant = read_mquant(&mut br, seq.dquant, pquant);
+                    let mb_mquant = read_mquant(
+                    &mut br,
+                    &pic_hdr.dquant,
+                    pquant,
+                    mb_col,
+                    mb_row,
+                    self.width_mb,
+                    self.height_mb,
+                );
+                let mb_pquant = mb_mquant.abs();
+                let mb_halfqp = halfqp && mb_mquant >= 0;
                     let mb_tt = if seq.vstransform {
                         self.ttmb.decode(&mut br).unwrap_or(0) as u8
                     } else {
@@ -2928,13 +3098,13 @@ impl MacroblockDecoder {
                                 true,
                                 blk < 4,
                                 mb_pquant,
-                                halfqp,
+                                mb_halfqp,
                                 uniform,
                                 blk_tt,
                                 &self.dc_luma,
                                 &self.dc_chroma,
-                                &self.ac_intra[seq.transacfrm2 as usize],
-                                &self.ac_inter[seq.transacfrm as usize],
+                                &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
+                                &self.ac_inter[(pic_hdr.transacfrm as usize).min(3)],
                             );
                             apply_idct(&mut coeff, blk_tt);
                             write_intra_block(frame, mb_row, mb_col, blk, &coeff);
@@ -2985,10 +3155,20 @@ impl MacroblockDecoder {
                 }
 
                 // Residual
-                let cbp = self.cbpcy_p[(seq.cbptab as usize).min(1)]
+                let cbp = self.cbpcy_p[(pic_hdr.cbptab as usize).min(1)]
                     .decode(&mut br)
                     .unwrap_or(0) as u8;
-                let mb_pquant = read_mquant(&mut br, seq.dquant, pquant);
+                let mb_mquant = read_mquant(
+                    &mut br,
+                    &pic_hdr.dquant,
+                    pquant,
+                    mb_col,
+                    mb_row,
+                    self.width_mb,
+                    self.height_mb,
+                );
+                let mb_pquant = mb_mquant.abs();
+                let mb_halfqp = halfqp && mb_mquant >= 0;
                 let mb_tt = if seq.vstransform {
                     self.ttmb.decode(&mut br).unwrap_or(0) as u8
                 } else {
@@ -3008,13 +3188,13 @@ impl MacroblockDecoder {
                         false,
                         blk < 4,
                         mb_pquant,
-                        halfqp,
+                        mb_halfqp,
                         uniform,
                         blk_tt,
                         &self.dc_luma,
                         &self.dc_chroma,
-                        &self.ac_intra[seq.transacfrm2 as usize],
-                        &self.ac_inter[seq.transacfrm as usize],
+                        &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
+                        &self.ac_inter[(pic_hdr.transacfrm as usize).min(3)],
                     );
                     apply_idct(&mut coeff, blk_tt);
                     add_residual_block(frame, mb_row as u32, mb_col as u32, blk, &coeff);

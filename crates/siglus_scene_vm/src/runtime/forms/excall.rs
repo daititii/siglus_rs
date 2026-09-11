@@ -136,6 +136,8 @@ fn queue_frame_action_finish(
         .push(PendingFrameActionFinish {
             frame_action_chain,
             object_chain: None,
+            snapshot: fa.clone(),
+            reinit_after_finish: false,
             scn_name: fa.scn_name.clone(),
             cmd_name: fa.cmd_name.clone(),
             end_time: fa.end_time,

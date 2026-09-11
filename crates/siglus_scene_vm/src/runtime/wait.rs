@@ -761,6 +761,9 @@ pub struct VmWait {
     /// True only when `until` represents MWND OPEN/CLOSE animation wait.
     mwnd_animation_wait: bool,
     pub waiting_for_key: bool,
+    /// OBJBTNGROUP.SEL completes only when its button group decides or cancels.
+    /// An unrelated click must not supply a default selection result.
+    group_selection: Option<(u32, i64, usize)>,
     /// TNM_PROC_TYPE_KEY_WAIT created by KEYLIST.WAIT/WAIT_FORCE. Selection
     /// waits also use `waiting_for_key`, so this separate bit prevents skip
     /// from accidentally accepting a selection.
@@ -1182,7 +1185,19 @@ impl VmWait {
             }
         }
 
-        self.waiting_for_key
+        if let Some((form_id, stage_idx, group_idx)) = self.group_selection {
+            let waiting = globals.stage_forms.get(&form_id)
+                .and_then(|st| st.group_lists.get(&stage_idx))
+                .and_then(|groups| groups.get(group_idx))
+                .map(|group| group.wait_flag && group.started)
+                .unwrap_or(false);
+            if !waiting {
+                self.group_selection = None;
+            }
+        }
+
+        self.group_selection.is_some()
+            || self.waiting_for_key
             || self.message_reveal
             || self.until.is_some()
             || self.until_frame.is_some()
@@ -1265,6 +1280,11 @@ impl VmWait {
     pub fn wait_key(&mut self) {
         self.mark_block_request();
         self.waiting_for_key = true;
+    }
+
+    pub fn wait_group_selection(&mut self, form_id: u32, stage_idx: i64, group_idx: usize) {
+        self.mark_block_request();
+        self.group_selection = Some((form_id, stage_idx, group_idx));
     }
 
     pub fn wait_input_key(&mut self, skip_disabled: bool) {
@@ -1423,9 +1443,6 @@ impl VmWait {
         self.global_movie = true;
         self.global_movie_key_skip = key_skip;
         self.global_movie_return_value = return_value_flag;
-        if key_skip {
-            self.waiting_for_key = true;
-        }
     }
 
     pub fn wait_object_movie(
@@ -1444,9 +1461,6 @@ impl VmWait {
             return_value_flag,
         });
         self.movie_key_skip = key_skip;
-        if key_skip {
-            self.waiting_for_key = true;
-        }
     }
 
     pub fn wait_object_emote(
@@ -1746,6 +1760,7 @@ impl VmWait {
     }
 
     pub fn clear(&mut self) {
+        self.group_selection = None;
         self.until = None;
         self.mwnd_animation_wait = false;
         self.waiting_for_key = false;
