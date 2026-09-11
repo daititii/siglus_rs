@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::image_manager::ImageId;
+use crate::image_manager::ImageHandle;
 use crate::layer::{LayerId, SpriteFit, SpriteId, SpriteSizeMode};
 use crate::mesh3d::load_mesh_asset;
 use crate::runtime::constants;
@@ -288,7 +288,7 @@ enum StageTarget {
     },
 }
 
-fn load_thumb_image_id(ctx: &mut CommandContext, idx: i64) -> Option<ImageId> {
+fn load_thumb_image_id(ctx: &mut CommandContext, idx: i64) -> Option<ImageHandle> {
     let dir = ctx.project_dir.join("savedata");
     for path in super::syscom::thumb_candidate_paths(&dir, idx) {
         if let Some(path) = crate::resource::resolve_game_file(&path).ok().flatten() {
@@ -300,7 +300,7 @@ fn load_thumb_image_id(ctx: &mut CommandContext, idx: i64) -> Option<ImageId> {
     None
 }
 
-fn insert_capture_image_id(ctx: &mut CommandContext, prefer_object_capture: bool) -> anyhow::Result<ImageId> {
+fn insert_capture_image_id(ctx: &mut CommandContext, prefer_object_capture: bool) -> anyhow::Result<ImageHandle> {
     if prefer_object_capture {
         if let Some(img) = ctx.globals.capture_for_object_image.clone() {
             return Ok(ctx.images.insert_image(img));
@@ -4783,9 +4783,9 @@ fn bind_capture_backend(
     ctx: &mut CommandContext,
     obj: &mut ObjectState,
     stage_idx: i64,
-    img_id: ImageId,
+    img_id: ImageHandle,
 ) {
-    let Some(img) = ctx.images.get(img_id) else {
+    let Some(img) = ctx.images.get(&img_id) else {
         return;
     };
     let Some(layer_id) = ctx.gfx.ensure_stage_layer_id(&mut ctx.layers, stage_idx) else {
@@ -4994,7 +4994,7 @@ fn digits_most_significant(mut n: u64) -> Vec<i64> {
 
 fn sample_image_component(
     ctx: &CommandContext,
-    image_id: ImageId,
+    image_id: &ImageHandle,
     x: i64,
     y: i64,
     channel: usize,
@@ -5026,7 +5026,7 @@ fn sample_sprite_component(
         .layers
         .layer(layer_id)
         .and_then(|layer| layer.sprite(sprite_id))
-        .and_then(|spr| spr.image_id)
+        .and_then(|spr| spr.image_id.as_ref())
     else {
         return 0;
     };
@@ -5051,7 +5051,7 @@ fn sample_object_pixel_component(
         ObjectBackend::Movie {
             image_id: Some(id), ..
         } if obj.object_type == 9 && cut_no == 0 => {
-            return sample_image_component(ctx, *id, x, y, channel);
+            return sample_image_component(ctx, id, x, y, channel);
         }
         ObjectBackend::Rect {
             layer_id,
@@ -5089,7 +5089,7 @@ fn sample_object_pixel_component(
     let Ok(id) = ctx.images.load_file(&path, cut_no as usize) else {
         return 0;
     };
-    sample_image_component(ctx, id, x, y, channel)
+    sample_image_component(ctx, &id, x, y, channel)
 }
 
 fn update_number_backend(ctx: &mut CommandContext, obj: &mut ObjectState) {
@@ -5204,7 +5204,7 @@ fn update_number_backend(ctx: &mut CommandContext, obj: &mut ObjectState) {
         .images
         .load_g00(file, base_pat.max(0) as u32)
         .ok()
-        .and_then(|id| ctx.images.get(id).map(|img| img.width as i32));
+        .as_ref().and_then(|id| ctx.images.get(id).map(|img| img.width as i32));
 
     let mut offset: i32 = 0;
     obj.runtime.number_sprite_offsets.clear();
@@ -5217,7 +5217,7 @@ fn update_number_backend(ctx: &mut CommandContext, obj: &mut ObjectState) {
             let frame = pat_no[i].max(0) as u32;
             let img_id = ctx.images.load_g00(file, frame).ok();
 
-            let w = img_id
+            let w = img_id.as_ref()
                 .and_then(|id| ctx.images.get(id).map(|img| img.width as i32))
                 .or(default_w)
                 .unwrap_or(0);
@@ -5563,9 +5563,9 @@ fn duplicate_object_backend_for_copy_with_layers(
                             shadow_sprite_id,
                             fuchi_sprite_id,
                             sprite_id,
-                            shadow_image_id: *shadow_image_id,
-                            fuchi_image_id: *fuchi_image_id,
-                            image_id: *image_id,
+                            shadow_image_id: shadow_image_id.clone(),
+                            fuchi_image_id: fuchi_image_id.clone(),
+                            image_id: image_id.clone(),
                             glyphs: Vec::new(),
                             mwnd_layer_reps: *mwnd_layer_reps,
                             width: *width,
@@ -5611,9 +5611,9 @@ fn duplicate_object_backend_for_copy_with_layers(
                         shadow_sprite_id,
                         fuchi_sprite_id,
                         body_sprite_id,
-                        shadow_image_id: glyph.shadow_image_id,
-                        fuchi_image_id: glyph.fuchi_image_id,
-                        body_image_id: glyph.body_image_id,
+                        shadow_image_id: glyph.shadow_image_id.clone(),
+                        fuchi_image_id: glyph.fuchi_image_id.clone(),
+                        body_image_id: glyph.body_image_id.clone(),
                     });
                 }
                 let first = copied.first().expect("non-empty glyph copy");
@@ -5622,9 +5622,9 @@ fn duplicate_object_backend_for_copy_with_layers(
                     shadow_sprite_id: first.shadow_sprite_id,
                     fuchi_sprite_id: first.fuchi_sprite_id,
                     sprite_id: first.body_sprite_id,
-                    shadow_image_id: first.shadow_image_id,
-                    fuchi_image_id: first.fuchi_image_id,
-                    image_id: first.body_image_id,
+                    shadow_image_id: first.shadow_image_id.clone(),
+                    fuchi_image_id: first.fuchi_image_id.clone(),
+                    image_id: first.body_image_id.clone(),
                     glyphs: copied,
                     mwnd_layer_reps: *mwnd_layer_reps,
                     width: *width,
@@ -5644,7 +5644,7 @@ fn duplicate_object_backend_for_copy_with_layers(
                 .map(|sid| ObjectBackend::Movie {
                     layer_id: dst_layer_id,
                     sprite_id: sid,
-                    image_id: *image_id,
+                    image_id: image_id.clone(),
                     width: *width,
                     height: *height,
                 })
@@ -6153,14 +6153,14 @@ fn update_string_backend_with_layers(
         };
 
         let old_shadow_image = old
-            .and_then(|entry| entry.shadow_image_id)
-            .or_else(|| use_legacy.then_some(legacy_shadow_image).flatten());
+            .and_then(|entry| entry.shadow_image_id.clone())
+            .or_else(|| use_legacy.then_some(legacy_shadow_image.clone()).flatten());
         let old_fuchi_image = old
-            .and_then(|entry| entry.fuchi_image_id)
-            .or_else(|| use_legacy.then_some(legacy_fuchi_image).flatten());
+            .and_then(|entry| entry.fuchi_image_id.clone())
+            .or_else(|| use_legacy.then_some(legacy_fuchi_image.clone()).flatten());
         let old_body_image = old
-            .and_then(|entry| entry.body_image_id)
-            .or_else(|| use_legacy.then_some(legacy_body_image).flatten());
+            .and_then(|entry| entry.body_image_id.clone())
+            .or_else(|| use_legacy.then_some(legacy_body_image.clone()).flatten());
 
         let shadow_render = if glyph.style.shadow {
             ctx.font_cache.render_single_glyph_layer_into(
@@ -6189,25 +6189,25 @@ fn update_string_backend_with_layers(
             TextSpriteLayer::Body,
         );
 
-        let local = |render: Option<crate::text_render::PositionedTextRender>| {
+        let local = |render: Option<&crate::text_render::PositionedTextRender>| {
             (
-                glyph.x.saturating_add(render.map(|r| r.offset_x).unwrap_or(0)),
-                glyph.y.saturating_add(render.map(|r| r.offset_y).unwrap_or(0)),
+                glyph.x.saturating_add(render.map_or(0, |r| r.offset_x)),
+                glyph.y.saturating_add(render.map_or(0, |r| r.offset_y)),
             )
         };
-        let (shadow_local_x, shadow_local_y) = local(shadow_render);
-        let (fuchi_local_x, fuchi_local_y) = local(fuchi_render);
-        let (body_local_x, body_local_y) = local(body_render);
+        let (shadow_local_x, shadow_local_y) = local(shadow_render.as_ref());
+        let (fuchi_local_x, fuchi_local_y) = local(fuchi_render.as_ref());
+        let (body_local_x, body_local_y) = local(body_render.as_ref());
 
         for (render, local_x, local_y) in [
-            (shadow_render, shadow_local_x, shadow_local_y),
-            (fuchi_render, fuchi_local_x, fuchi_local_y),
-            (body_render, body_local_x, body_local_y),
+            (shadow_render.as_ref(), shadow_local_x, shadow_local_y),
+            (fuchi_render.as_ref(), fuchi_local_x, fuchi_local_y),
+            (body_render.as_ref(), body_local_x, body_local_y),
         ] {
             let Some(render) = render else {
                 continue;
             };
-            if let Some(image) = ctx.images.get(render.image) {
+            if let Some(image) = ctx.images.get(&render.image) {
                 bounds_min_x = bounds_min_x.min(local_x as i64);
                 bounds_min_y = bounds_min_y.min(local_y as i64);
                 bounds_max_x = bounds_max_x.max(local_x as i64 + image.width as i64);
@@ -6219,17 +6219,17 @@ fn update_string_backend_with_layers(
             for (sid, render, local_x, local_y) in [
                 (
                     shadow_sprite_id,
-                    shadow_render,
+                    shadow_render.as_ref(),
                     shadow_local_x,
                     shadow_local_y,
                 ),
                 (
                     fuchi_sprite_id,
-                    fuchi_render,
+                    fuchi_render.as_ref(),
                     fuchi_local_x,
                     fuchi_local_y,
                 ),
-                (body_sprite_id, body_render, body_local_x, body_local_y),
+                (body_sprite_id, body_render.as_ref(), body_local_x, body_local_y),
             ] {
                 if let Some(sprite) = layer.sprite_mut(sid) {
                     sprite.fit = SpriteFit::PixelRect;
@@ -6241,7 +6241,7 @@ fn update_string_backend_with_layers(
                     sprite.y = (y as i64 + local_y as i64)
                         .clamp(i32::MIN as i64, i32::MAX as i64)
                         as i32;
-                    sprite.image_id = render.map(|r| r.image);
+                    sprite.image_id = render.map(|r| r.image.clone());
                     sync_sprite_visual_from_object_props(&ctx.ids, obj, sprite);
                 }
             }
@@ -6287,9 +6287,9 @@ fn update_string_backend_with_layers(
             entry.shadow_sprite_id,
             entry.fuchi_sprite_id,
             entry.body_sprite_id,
-            entry.shadow_image_id,
-            entry.fuchi_image_id,
-            entry.body_image_id,
+            entry.shadow_image_id.clone(),
+            entry.fuchi_image_id.clone(),
+            entry.body_image_id.clone(),
         )
     });
     let (
@@ -11386,7 +11386,7 @@ fn dispatch_object_state_op(
                         name,
                     ) {
                         if let Ok(id) = ctx.images.load_file(&path, pat) {
-                            if let Some(img) = ctx.images.get(id) {
+                            if let Some(img) = ctx.images.get(&id) {
                                 sx = img.width as i64;
                                 sy = img.height as i64;
                             }

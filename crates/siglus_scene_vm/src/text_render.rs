@@ -6,7 +6,7 @@
 //! small ASCII bitmap fallback is used only to keep debug text visible.
 
 use crate::assets::RgbaImage;
-use crate::image_manager::{ImageId, ImageManager};
+use crate::image_manager::{ImageHandle, ImageManager};
 use ab_glyph::{point, Font, FontArc, FontVec, PxScale, ScaleFont};
 use std::path::{Path, PathBuf};
 
@@ -76,9 +76,9 @@ pub struct PositionedTextGlyph {
     pub style: TextStyle,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PositionedTextRender {
-    pub image: ImageId,
+    pub image: ImageHandle,
     pub offset_x: i32,
     pub offset_y: i32,
 }
@@ -349,7 +349,7 @@ impl FontCache {
         font_px: f32,
         max_w: u32,
         max_h: u32,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         self.render_text_into(images, None, text, font_px, max_w, max_h)
     }
 
@@ -361,7 +361,7 @@ impl FontCache {
         max_w: u32,
         max_h: u32,
         moji_space: Option<(i64, i64)>,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         let img = self.render_mwnd_text_rgba(text, font_px, max_w, max_h, moji_space)?;
         Some(images.insert_image(img))
     }
@@ -375,25 +375,25 @@ impl FontCache {
         max_h: u32,
         moji_space: Option<(i64, i64)>,
         style: TextStyle,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         self.render_mwnd_text_styled_into(images, None, text, font_px, max_w, max_h, moji_space, style)
     }
 
     pub fn render_mwnd_text_styled_into(
         &self,
         images: &mut ImageManager,
-        target: Option<ImageId>,
+        target: Option<ImageHandle>,
         text: &str,
         font_px: f32,
         max_w: u32,
         max_h: u32,
         moji_space: Option<(i64, i64)>,
         style: TextStyle,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         let img = self.render_mwnd_text_rgba_styled(text, font_px, max_w, max_h, moji_space, style)?;
         match target {
             Some(id) => {
-                images.replace_image(id, img).ok()?;
+                images.replace_image(&id, img).ok()?;
                 Some(id)
             }
             None => Some(images.insert_image(img)),
@@ -403,7 +403,7 @@ impl FontCache {
     pub fn render_positioned_glyphs_into(
         &self,
         images: &mut ImageManager,
-        target: Option<ImageId>,
+        target: Option<ImageHandle>,
         glyphs: &[PositionedTextGlyph],
         min_w: u32,
         min_h: u32,
@@ -414,7 +414,7 @@ impl FontCache {
     pub fn render_positioned_glyph_layer_into(
         &self,
         images: &mut ImageManager,
-        target: Option<ImageId>,
+        target: Option<ImageHandle>,
         glyphs: &[PositionedTextGlyph],
         min_w: u32,
         min_h: u32,
@@ -427,7 +427,7 @@ impl FontCache {
             render_positioned_glyphs_rgba(self.font.as_ref(), glyphs, min_w, min_h, layer)?;
         let image = match target {
             Some(id) => {
-                images.replace_image(id, img).ok()?;
+                images.replace_image(&id, img).ok()?;
                 id
             }
             None => images.insert_image(img),
@@ -446,7 +446,7 @@ impl FontCache {
     pub fn render_single_glyph_layer_into(
         &self,
         images: &mut ImageManager,
-        target: Option<ImageId>,
+        target: Option<ImageHandle>,
         glyph: PositionedTextGlyph,
         layer: TextSpriteLayer,
     ) -> Option<PositionedTextRender> {
@@ -459,16 +459,16 @@ impl FontCache {
     pub fn render_text_into(
         &self,
         images: &mut ImageManager,
-        target: Option<ImageId>,
+        target: Option<ImageHandle>,
         text: &str,
         font_px: f32,
         max_w: u32,
         max_h: u32,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         let img = self.render_text_rgba(text, font_px, max_w, max_h)?;
         match target {
             Some(id) => {
-                images.replace_image(id, img).ok()?;
+                images.replace_image(&id, img).ok()?;
                 Some(id)
             }
             None => Some(images.insert_image(img)),
@@ -479,7 +479,7 @@ impl FontCache {
     pub fn render_editbox_into(
         &self,
         images: &mut ImageManager,
-        target: Option<ImageId>,
+        target: Option<ImageHandle>,
         text: &str,
         cursor_pos: usize,
         selection: Option<(usize, usize)>,
@@ -491,7 +491,7 @@ impl FontCache {
         font_px: f32,
         max_w: u32,
         max_h: u32,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         let img = render_editbox_rgba(
             self.font.as_ref(),
             text,
@@ -508,7 +508,7 @@ impl FontCache {
         )?;
         match target {
             Some(id) => {
-                images.replace_image(id, img).ok()?;
+                images.replace_image(&id, img).ok()?;
                 Some(id)
             }
             None => Some(images.insert_image(img)),
@@ -563,7 +563,7 @@ impl FontCache {
     pub fn render_mwnd_text_layer_styled_into(
         &self,
         images: &mut ImageManager,
-        target: Option<ImageId>,
+        target: Option<ImageHandle>,
         text: &str,
         font_px: f32,
         max_w: u32,
@@ -572,7 +572,7 @@ impl FontCache {
         style: TextStyle,
         vertical: bool,
         layer: TextSpriteLayer,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         let img = self.render_mwnd_text_rgba_layer_styled(
             text,
             font_px,
@@ -585,7 +585,7 @@ impl FontCache {
         )?;
         match target {
             Some(id) => {
-                images.replace_image(id, img).ok()?;
+                images.replace_image(&id, img).ok()?;
                 Some(id)
             }
             None => Some(images.insert_image(img)),
@@ -1038,7 +1038,7 @@ pub fn render_text_image_basic(
     font_px: u32,
     max_w: u32,
     max_h: u32,
-) -> Option<ImageId> {
+) -> Option<ImageHandle> {
     let img = render_text_image_basic_rgba(text, font_px, max_w, max_h)?;
     Some(images.insert_image(img))
 }

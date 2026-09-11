@@ -264,7 +264,7 @@ fn load_selbtn_image_id(
     ctx: &mut CommandContext,
     file_name: &str,
     patno: u32,
-) -> Option<crate::image_manager::ImageId> {
+) -> Option<crate::image_manager::ImageHandle> {
     if file_name.is_empty() {
         return None;
     }
@@ -280,7 +280,7 @@ fn selbtn_template_item_size(
     tmpl: &crate::runtime::tables::SelBtnTemplate,
 ) -> (i64, i64) {
     if let Some(img_id) = load_selbtn_image_id(ctx, &tmpl.base_file, 0) {
-        if let Some(img) = ctx.images.get(img_id) {
+        if let Some(img) = ctx.images.get(&img_id) {
             return (img.width as i64, img.height as i64);
         }
     }
@@ -306,7 +306,7 @@ fn selbtn_loaded_item_size(
     fallback: (i64, i64),
 ) -> (i64, i64) {
     if let Some(img_id) = load_selbtn_image_id(ctx, &choice.base_file, 0) {
-        if let Some(img) = ctx.images.get(img_id) {
+        if let Some(img) = ctx.images.get(&img_id) {
             return (img.width as i64, img.height as i64);
         }
     }
@@ -485,7 +485,7 @@ fn make_selbtn_image_object(
     let img_id = load_selbtn_image_id(ctx, file_name, patno)?;
     let (img_w, img_h) = ctx
         .images
-        .get(img_id)
+        .get(&img_id)
         .map(|img| (img.width.max(1), img.height.max(1)))
         .unwrap_or((width.max(1) as u32, height.max(1) as u32));
     let layer_id = ctx.layers.create_layer();
@@ -695,25 +695,25 @@ fn make_selbtn_text_object(
         };
 
         let shadow_local_x = glyph_x
-            .saturating_add(shadow_render.map(|r| r.offset_x as i64).unwrap_or(0));
+            .saturating_add(shadow_render.as_ref().map_or(0, |r| r.offset_x as i64));
         let shadow_local_y = glyph_y
-            .saturating_add(shadow_render.map(|r| r.offset_y as i64).unwrap_or(0));
+            .saturating_add(shadow_render.as_ref().map_or(0, |r| r.offset_y as i64));
         let fuchi_local_x = glyph_x
-            .saturating_add(fuchi_render.map(|r| r.offset_x as i64).unwrap_or(0));
+            .saturating_add(fuchi_render.as_ref().map_or(0, |r| r.offset_x as i64));
         let fuchi_local_y = glyph_y
-            .saturating_add(fuchi_render.map(|r| r.offset_y as i64).unwrap_or(0));
+            .saturating_add(fuchi_render.as_ref().map_or(0, |r| r.offset_y as i64));
         let body_local_x = glyph_x
-            .saturating_add(body_render.map(|r| r.offset_x as i64).unwrap_or(0));
+            .saturating_add(body_render.as_ref().map_or(0, |r| r.offset_x as i64));
         let body_local_y = glyph_y
-            .saturating_add(body_render.map(|r| r.offset_y as i64).unwrap_or(0));
+            .saturating_add(body_render.as_ref().map_or(0, |r| r.offset_y as i64));
 
         for (render, local_x, local_y) in [
-            (shadow_render, shadow_local_x, shadow_local_y),
-            (fuchi_render, fuchi_local_x, fuchi_local_y),
-            (body_render, body_local_x, body_local_y),
+            (shadow_render.as_ref(), shadow_local_x, shadow_local_y),
+            (fuchi_render.as_ref(), fuchi_local_x, fuchi_local_y),
+            (body_render.as_ref(), body_local_x, body_local_y),
         ] {
             if let Some(render) = render {
-                if let Some(image) = ctx.images.get(render.image) {
+                if let Some(image) = ctx.images.get(&render.image) {
                     bounds_min_x = bounds_min_x.min(local_x);
                     bounds_min_y = bounds_min_y.min(local_y);
                     bounds_max_x = bounds_max_x.max(local_x.saturating_add(image.width as i64));
@@ -726,19 +726,19 @@ fn make_selbtn_text_object(
             for (sid, render, local_x, local_y) in [
                 (
                     shadow_sprite_id,
-                    shadow_render,
+                    shadow_render.as_ref(),
                     shadow_local_x,
                     shadow_local_y,
                 ),
                 (
                     fuchi_sprite_id,
-                    fuchi_render,
+                    fuchi_render.as_ref(),
                     fuchi_local_x,
                     fuchi_local_y,
                 ),
                 (
                     body_sprite_id,
-                    body_render,
+                    body_render.as_ref(),
                     body_local_x,
                     body_local_y,
                 ),
@@ -755,7 +755,7 @@ fn make_selbtn_text_object(
                         .saturating_add(local_y)
                         .clamp(i32::MIN as i64, i32::MAX as i64)
                         as i32;
-                    sprite.image_id = render.map(|r| r.image);
+                    sprite.image_id = render.map(|r| r.image.clone());
                     sprite.tr = 255;
                 }
             }
@@ -798,9 +798,9 @@ fn make_selbtn_text_object(
         shadow_sprite_id: first.shadow_sprite_id,
         fuchi_sprite_id: first.fuchi_sprite_id,
         sprite_id: first.body_sprite_id,
-        shadow_image_id: first.shadow_image_id,
-        fuchi_image_id: first.fuchi_image_id,
-        image_id: first.body_image_id,
+        shadow_image_id: first.shadow_image_id.clone(),
+        fuchi_image_id: first.fuchi_image_id.clone(),
+        image_id: first.body_image_id.clone(),
         glyphs,
         mwnd_layer_reps: true,
         width,
@@ -1753,7 +1753,7 @@ fn dispatch_capture_command(
             });
             let img = ctx
                 .images
-                .get(img_id)
+                .get(&img_id)
                 .map(|img| img.as_ref().clone())
                 .unwrap_or_else(|| {
                     panic!(

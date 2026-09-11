@@ -4519,6 +4519,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "env_logger 0.10.2",
+ "kira",
  "log",
  "png 0.17.16",
  "pollster",

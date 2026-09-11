@@ -876,7 +876,7 @@ fn pick_thumb_source_name(ctx: &CommandContext) -> Option<String> {
 fn capture_slot_thumb(ctx: &mut CommandContext, config: SaveThumbConfig) -> anyhow::Result<RgbaImage> {
     if let Some(name) = pick_thumb_source_name(ctx) {
         if let Ok(img_id) = ctx.images.load_g00(&name, 0) {
-            if let Some(img) = ctx.images.get(img_id) {
+            if let Some(img) = ctx.images.get(&img_id) {
                 return Ok(resize_rgba(img.as_ref(), config.width, config.height));
             }
         }
@@ -4144,7 +4144,7 @@ pub fn capture_for_tweet(ctx: &mut CommandContext) -> Result<RgbaImage> {
 
     match ctx.images.load_g00(&overlap_name, 0) {
         Ok(image_id) => {
-            if let Some(overlay) = ctx.images.get(image_id).map(|image| (**image).clone()) {
+            if let Some(overlay) = ctx.images.get(&image_id).map(|image| (*image).clone()) {
                 blend_tweet_overlay_fullscreen(&mut capture, &overlay);
             }
         }

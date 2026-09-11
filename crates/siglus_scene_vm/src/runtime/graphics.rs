@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 
-use crate::image_manager::{ImageId, ImageManager};
+use crate::image_manager::{ImageHandle, ImageManager};
 use crate::layer::{
     ClipRect, LayerId, LayerManager, Sprite, SpriteBlend, SpriteFit, SpriteId, SpriteSizeMode,
 };
@@ -327,7 +327,7 @@ impl GfxRuntime {
         })
     }
 
-    fn load_any_image(images: &mut ImageManager, file: &str, patno: i64) -> Result<ImageId> {
+    fn load_any_image(images: &mut ImageManager, file: &str, patno: i64) -> Result<ImageHandle> {
         // Siglus delegates descriptors containing `|` to Tona3's composed-G00
         // loader. The whole descriptor is not a resource file name and composed
         // textures intentionally do not fall back to bg/png/jpeg resources.
@@ -1625,9 +1625,9 @@ fn is_probable_mesh_path(file: &str) -> bool {
 }
 
 
-fn set_object_sprite_image(sprite: &mut Sprite, images: &ImageManager, image_id: ImageId) {
-    sprite.image_id = Some(image_id);
-    if let Some(img) = images.get(image_id) {
+fn set_object_sprite_image(sprite: &mut Sprite, images: &ImageManager, image_id: ImageHandle) {
+    sprite.image_id = Some(image_id.clone());
+    if let Some(img) = images.get(&image_id) {
         sprite.object_anchor = true;
         sprite.texture_center_x = img.center_x as f32;
         sprite.texture_center_y = img.center_y as f32;

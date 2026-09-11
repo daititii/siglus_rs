@@ -7,7 +7,7 @@ use crate::runtime::gan::GanState;
 use crate::runtime::int_event::IntEvent;
 use crate::platform_time::{Duration, Instant};
 
-use crate::image_manager::ImageId;
+use crate::image_manager::ImageHandle;
 use crate::layer::{LayerId, SpriteId};
 
 /// Screen wipe transition state.
@@ -26,7 +26,7 @@ pub struct WipeState {
     /// target until the wipe is ended.
     pub stage_form_id: u32,
     pub mask_file: Option<String>,
-    pub mask_image_id: Option<ImageId>,
+    pub mask_image_id: Option<ImageHandle>,
     pub wipe_type: i32,
     pub wipe_time_ms: i32,
     pub speed_mode: i32,
@@ -58,7 +58,7 @@ impl WipeState {
     pub fn new(
         stage_form_id: u32,
         mask_file: Option<String>,
-        mask_image_id: Option<ImageId>,
+        mask_image_id: Option<ImageHandle>,
         wipe_type: i32,
         wipe_time_ms: i32,
         start_time_ms: i32,
@@ -839,7 +839,7 @@ pub struct FogGlobalState {
     pub color: [f32; 4],
     pub scroll_x: f32,
     pub x_event: IntEvent,
-    pub texture_image_id: Option<ImageId>,
+    pub texture_image_id: Option<ImageHandle>,
 }
 
 impl Default for FogGlobalState {
@@ -995,8 +995,8 @@ pub struct GlobalState {
     /// DATABASE global disable flag.
     pub database_off: bool,
 
-    /// G00BUF slots. Each slot stores an ImageId loaded from the `g00/` directory.
-    pub g00buf: Vec<Option<ImageId>>,
+    /// G00BUF slots. Each slot stores an ImageHandle loaded from the `g00/` directory.
+    pub g00buf: Vec<Option<ImageHandle>>,
     /// Original C_elm_g00_buf persists file names, not texture handles.
     pub g00buf_names: Vec<Option<String>>,
 
@@ -1391,7 +1391,7 @@ pub struct GlobalMovieState {
     pub height: u32,
     pub layer_id: Option<LayerId>,
     pub sprite_id: Option<SpriteId>,
-    pub image_id: Option<ImageId>,
+    pub image_id: Option<ImageHandle>,
     pub last_frame_idx: Option<usize>,
     pub audio_id: Option<u64>,
     pub audio_start_attempted: bool,
@@ -2978,9 +2978,9 @@ pub struct StringGlyphBackend {
     pub shadow_sprite_id: SpriteId,
     pub fuchi_sprite_id: SpriteId,
     pub body_sprite_id: SpriteId,
-    pub shadow_image_id: Option<ImageId>,
-    pub fuchi_image_id: Option<ImageId>,
-    pub body_image_id: Option<ImageId>,
+    pub shadow_image_id: Option<ImageHandle>,
+    pub fuchi_image_id: Option<ImageHandle>,
+    pub body_image_id: Option<ImageHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3001,9 +3001,9 @@ pub enum ObjectBackend {
         shadow_sprite_id: SpriteId,
         fuchi_sprite_id: SpriteId,
         sprite_id: SpriteId,
-        shadow_image_id: Option<ImageId>,
-        fuchi_image_id: Option<ImageId>,
-        image_id: Option<ImageId>,
+        shadow_image_id: Option<ImageHandle>,
+        fuchi_image_id: Option<ImageHandle>,
+        image_id: Option<ImageHandle>,
         /// Per-glyph shadow/fuchi/body sprites.  The three scalar sprite fields
         /// above alias the first entry for compatibility with older helper paths;
         /// when this list is non-empty it is authoritative.
@@ -3028,7 +3028,7 @@ pub enum ObjectBackend {
     Movie {
         layer_id: LayerId,
         sprite_id: SpriteId,
-        image_id: Option<ImageId>,
+        image_id: Option<ImageHandle>,
         width: u32,
         height: u32,
     },
@@ -3318,10 +3318,10 @@ pub struct ObjectMovieState {
     pub audio_id: Option<u64>,
     pub audio_started_once: bool,
     // OBJECT.OMV mirrors the original single D3DUSAGE_DYNAMIC texture. Slot 0
-    // owns that stable ImageId for the movie lifetime; slot 1 is retained only
+    // owns that stable ImageHandle for the movie lifetime; slot 1 is retained only
     // for snapshot/backward state layout compatibility and is no longer used
     // for per-frame ping-pong.
-    pub frame_image_ids: [Option<ImageId>; 2],
+    pub frame_image_ids: [Option<ImageHandle>; 2],
     pub frame_image_cursor: usize,
     pub just_finished: bool,
     pub just_looped: bool,

@@ -42,7 +42,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::assets::RgbaImage;
 use crate::audio::{AudioHub, BgmEngine, KoeEngine, PcmEngine, SeEngine};
-use crate::image_manager::{ImageId, ImageManager};
+use crate::image_manager::{ImageHandle, ImageManager};
 use crate::layer::{
     ClipRect, LayerId, LayerManager, RenderFrame, RenderSprite, Sprite, SpriteFit, SpriteId,
     SpriteRuntimeLight, SpriteSizeMode, WipeRenderPlan,
@@ -216,7 +216,7 @@ pub struct VmCallMeta {
 
 #[derive(Debug, Clone)]
 pub struct DebugActiveTextureEntry {
-    pub image_id: ImageId,
+    pub image_id: ImageHandle,
     pub width: u32,
     pub height: u32,
     pub source_label: String,
@@ -331,9 +331,9 @@ pub struct LocalSaveSnapshot {
     pub sel_saves: Vec<crate::original_save::OriginalLocalSaveEnvelope>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct MouseCursorFrameRuntime {
-    image_id: ImageId,
+    image_id: ImageHandle,
     hot_x: i32,
     hot_y: i32,
 }
@@ -354,7 +354,7 @@ pub struct CommandContext {
     pub images: ImageManager,
     pub layers: LayerManager,
     /// 1x1 white sprite used for screen-space overlays (filters, etc.).
-    pub solid_white: ImageId,
+    pub solid_white: ImageHandle,
 
     // Keep BGM before AudioHub so streaming handles stop while the mixer still
     // exists; Rust drops struct fields in declaration order.
@@ -780,7 +780,7 @@ impl CommandContext {
                 || obj.runtime.child_objects.iter().any(object_needs_tick)
         }
 
-        if self.wait.needs_runtime_poll() {
+        if self.wait.needs_continuous_frame() {
             return true;
         }
         if self.pcm.needs_tick() {
@@ -1943,11 +1943,11 @@ impl CommandContext {
             } else {
                 ((cur_time / cursor.anime_speed_ms as u64) as usize) % cursor.frames.len()
             };
-            cursor.frames[pat_no]
+            cursor.frames[pat_no].clone()
         };
 
         let mut sprite = Sprite::default();
-        sprite.image_id = Some(frame.image_id);
+        sprite.image_id = Some(frame.image_id.clone());
         sprite.visible = true;
         sprite.fit = SpriteFit::PixelRect;
         sprite.size_mode = SpriteSizeMode::Intrinsic;
@@ -2298,7 +2298,7 @@ impl CommandContext {
         images: &mut ImageManager,
         file: &str,
         patno: i64,
-    ) -> Option<crate::image_manager::ImageId> {
+    ) -> Option<crate::image_manager::ImageHandle> {
         let pat_u32 = if patno < 0 { 0 } else { patno as u32 };
         if let Ok(id) = images.load_g00(file, pat_u32) {
             return Some(id);
@@ -2690,7 +2690,7 @@ impl CommandContext {
                                 mwnd_button_parent_render_state(
                                     mwnd, button_idx, window_x, window_y, window_w, window_h,
                                 ),
-                                anim_parent,
+                                anim_parent.clone(),
                             );
                             let obj = &mut mwnd.button_list[button_idx];
                             if let Some(hit) = hit_test_standalone_action_button_recursive(
@@ -2715,7 +2715,7 @@ impl CommandContext {
                         for face_idx in 0..face_len {
                             let parent = apply_mwnd_window_anim_parent(
                                 mwnd_face_parent_render_state(mwnd, face_idx, window_x, window_y),
-                                anim_parent,
+                                anim_parent.clone(),
                             );
                             let obj = &mut mwnd.face_list[face_idx];
                             if let Some(hit) = hit_test_standalone_action_button_recursive(
@@ -2756,7 +2756,7 @@ impl CommandContext {
                                 my,
                                 object_idx,
                                 obj,
-                                Some(object_parent),
+                                Some(object_parent.clone()),
                             ) {
                                 merge_button_hit(&mut standalone_best, &mut standalone_tied, hit);
                             }
@@ -4854,7 +4854,7 @@ impl CommandContext {
         Some(out)
     }
 
-    fn resolve_mask_image(&mut self, name: &str) -> Option<ImageId> {
+    fn resolve_mask_image(&mut self, name: &str) -> Option<ImageHandle> {
         if name.is_empty() {
             return None;
         }
@@ -5437,7 +5437,7 @@ impl CommandContext {
             })
             .ok()?;
         self.images
-            .get(id)
+            .get(&id)
             .map(|img| (img.width as i32, img.height as i32))
     }
 
@@ -7551,7 +7551,7 @@ impl CommandContext {
                 m.height.max(1),
                 m.timer_ms,
                 m.last_frame_idx,
-                m.image_id,
+                m.image_id.clone(),
                 m.audio_id.is_none() && !m.audio_start_attempted,
             )
         };
@@ -7663,14 +7663,14 @@ impl CommandContext {
         let show_new = frame_idx_changed && !small_rewind;
         let img_id = if image_id.is_some() && show_new {
             let id = image_id.unwrap();
-            let _ = self.images.replace_image_arc(id, frame.clone());
+            let _ = self.images.replace_image_arc(&id, frame);
             id
         } else if let Some(id) = image_id {
             id
         } else {
             self.images.insert_image_arc(frame.clone())
         };
-        self.globals.mov.image_id = Some(img_id);
+        self.globals.mov.image_id = Some(img_id.clone());
         if show_new {
             self.globals.mov.last_frame_idx = Some(frame_idx);
         }
@@ -7865,8 +7865,8 @@ impl CommandContext {
                 Ok(img_id) => {
                     if let Some(layer) = self.layers.layer_mut(layer_id) {
                         if let Some(sprite) = layer.sprite_mut(sprite_id) {
-                            sprite.image_id = Some(img_id);
-                            if let Some(img) = self.images.get(img_id) {
+                            sprite.image_id = Some(img_id.clone());
+                            if let Some(img) = self.images.get(&img_id) {
                                 sprite.object_anchor = true;
                                 sprite.texture_center_x = img.center_x as f32;
                                 sprite.texture_center_y = img.center_y as f32;
@@ -7895,6 +7895,7 @@ impl CommandContext {
     /// use the existing layer-backed sprites only as leaf payloads, but rebuild the final
     /// submission order from stage -> top-level object -> child objects.
     fn build_render_list_pre_wipe(&mut self) -> (Vec<RenderSprite>, Vec<String>) {
+        self.images.organize();
         self.layers.reset_runtime_effects();
         self.repair_missing_gfx_leaf_images();
         self.apply_object_masks();
@@ -8092,17 +8093,17 @@ impl CommandContext {
         submitted: &[RenderSprite],
     ) -> Vec<DebugActiveTextureEntry> {
         let mut submitted_keys: HashSet<(LayerId, SpriteId)> = HashSet::new();
-        let mut submitted_images: HashSet<ImageId> = HashSet::new();
+        let mut submitted_images: HashSet<ImageHandle> = HashSet::new();
         for rs in submitted {
-            if let Some(id) = rs.sprite.image_id {
-                submitted_images.insert(id);
+            if let Some(ref id) = rs.sprite.image_id {
+                submitted_images.insert(id.clone());
             }
             if let (Some(layer_id), Some(sprite_id)) = (rs.layer_id, rs.sprite_id) {
                 submitted_keys.insert((layer_id, sprite_id));
             }
         }
 
-        let mut acc: HashMap<ImageId, DebugActiveTextureAccum> = HashMap::new();
+        let mut acc: HashMap<ImageHandle, DebugActiveTextureAccum> = HashMap::new();
         let mut form_ids: Vec<u32> = self.globals.stage_forms.keys().copied().collect();
         form_ids.sort_unstable();
         for form_id in form_ids {
@@ -8155,7 +8156,7 @@ impl CommandContext {
                 .cmp(&a.submitted_this_frame)
                 .then_with(|| b.visible_refs.cmp(&a.visible_refs))
                 .then_with(|| b.total_refs.cmp(&a.total_refs))
-                .then_with(|| a.image_id.0.cmp(&b.image_id.0))
+                .then_with(|| a.image_id.key().cmp(&b.image_id.key()))
         });
         out
     }
@@ -8222,8 +8223,8 @@ fn collect_debug_active_textures_from_object(
     obj_idx: usize,
     obj: &globals::ObjectState,
     submitted_keys: &HashSet<(LayerId, SpriteId)>,
-    submitted_images: &HashSet<ImageId>,
-    out: &mut HashMap<ImageId, DebugActiveTextureAccum>,
+    submitted_images: &HashSet<ImageHandle>,
+    out: &mut HashMap<ImageHandle, DebugActiveTextureAccum>,
 ) {
     if !object_participates_in_tree(obj) {
         return;
@@ -8241,7 +8242,7 @@ fn collect_debug_active_textures_from_object(
                 .zip(rs.sprite_id)
                 .map(|key| submitted_keys.contains(&key))
                 .unwrap_or(false);
-        let debug_img = ctx.images.debug_image_info(image_id);
+        let debug_img = ctx.images.debug_image_info(&image_id);
         let entry = out
             .entry(image_id)
             .or_insert_with(|| DebugActiveTextureAccum {
@@ -8430,7 +8431,7 @@ fn trace_save_load_render_sprites(ctx: &CommandContext, list: &[RenderSprite]) {
     let scene_match = scene.contains("sys10_sv") || scene.contains("save") || scene.contains("load");
     let mut emitted = 0usize;
     for (idx, rs) in list.iter().enumerate() {
-        let Some(image_id) = rs.sprite.image_id else {
+        let Some(ref image_id) = rs.sprite.image_id else {
             continue;
         };
         let info = ctx.images.debug_image_info(image_id);
@@ -8856,7 +8857,7 @@ struct ObjectRenderInfo {
     mesh_animation: crate::mesh3d::MeshAnimationState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ParentRenderState {
     world_no: i64,
     pos_x: f32,
@@ -8885,10 +8886,10 @@ struct ParentRenderState {
     color_add_b: i32,
     blend: crate::layer::SpriteBlend,
     dst_clip: Option<ClipRect>,
-    mask_image_id: Option<ImageId>,
+    mask_image_id: Option<ImageHandle>,
     mask_offset_x: i32,
     mask_offset_y: i32,
-    tonecurve_image_id: Option<ImageId>,
+    tonecurve_image_id: Option<ImageHandle>,
     tonecurve_row: f32,
     tonecurve_sat: f32,
 }
@@ -9503,10 +9504,10 @@ fn hit_test_render_sprite(
             return false;
         }
     }
-    let img = sprite
-        .image_id
-        .and_then(|img_id| images.get(img_id))
-        .map(|image| image.as_ref());
+    let image = sprite
+        .image_id.as_ref()
+        .and_then(|img_id| images.get(img_id));
+    let img = image.as_deref();
     let emote = sprite.emote_render.as_deref();
     if img.is_none() && emote.is_none() {
         return false;
@@ -9796,8 +9797,8 @@ fn object_button_effective_gfx_hit(
     let img_id = CommandContext::load_any_image_for_hit(images, file_name.as_str(), patno)?;
 
     let mut sprite = Sprite::default();
-    sprite.image_id = Some(img_id);
-    if let Some(img) = images.get(img_id) {
+    sprite.image_id = Some(img_id.clone());
+    if let Some(img) = images.get(&img_id) {
         sprite.object_anchor = true;
         sprite.texture_center_x = img.center_x as f32;
         sprite.texture_center_y = img.center_y as f32;
@@ -10163,7 +10164,7 @@ fn object_button_hit_sort_key_from_render(
     let mut bound = fetch_bound_render_sprites_for_hit(layers, gfx, stage_idx, runtime_slot, obj);
     for rs in &mut bound {
         apply_button_object_render_info_to_sprite(&mut rs.sprite, &info);
-        if let Some(parent) = parent_state {
+        if let Some(parent) = parent_state.clone() {
             let dummy = ObjectRenderInfo::default();
             apply_parent_render_state_to_sprite(&mut rs.sprite, &dummy, &parent);
         }
@@ -10256,10 +10257,10 @@ fn button_parent_render_state(
         color_add_b: 0,
         blend: crate::layer::SpriteBlend::Normal,
         dst_clip: info.dst_clip,
-        mask_image_id: bound.first().and_then(|s| s.sprite.mask_image_id),
+        mask_image_id: bound.first().and_then(|s| s.sprite.mask_image_id.clone()),
         mask_offset_x: bound.first().map(|s| s.sprite.mask_offset_x).unwrap_or(0),
         mask_offset_y: bound.first().map(|s| s.sprite.mask_offset_y).unwrap_or(0),
-        tonecurve_image_id: bound.first().and_then(|s| s.sprite.tonecurve_image_id),
+        tonecurve_image_id: bound.first().and_then(|s| s.sprite.tonecurve_image_id.clone()),
         tonecurve_row: bound.first().map(|s| s.sprite.tonecurve_row).unwrap_or(0.0),
         tonecurve_sat: bound.first().map(|s| s.sprite.tonecurve_sat).unwrap_or(0.0),
     };
@@ -10335,7 +10336,7 @@ fn hit_test_standalone_action_button_recursive(
                     obj,
                     mx,
                     my,
-                    parent_state,
+                    parent_state.clone(),
                 ) {
                     best = Some(ButtonHitCandidate {
                         button_no: owner.button_no,
@@ -10364,7 +10365,7 @@ fn hit_test_standalone_action_button_recursive(
                 my,
                 child_idx,
                 child,
-                Some(cur_parent_state),
+                Some(cur_parent_state.clone()),
                 effective_owner,
             ) {
                 merge_button_hit(&mut best, &mut tied, hit);
@@ -10460,7 +10461,7 @@ fn hit_test_object_button_recursive(
                     obj,
                     mx,
                     my,
-                    parent_state,
+                    parent_state.clone(),
                 ) {
                     best = Some(ButtonHitCandidate {
                         button_no: owner.button_no,
@@ -10489,7 +10490,7 @@ fn hit_test_object_button_recursive(
                 my,
                 child_idx,
                 child,
-                Some(cur_parent_state),
+                Some(cur_parent_state.clone()),
                 effective_owner,
             ) {
                 merge_button_hit(&mut best, &mut tied, hit);
@@ -11139,7 +11140,7 @@ fn set_weather_sprite(
     obj: &globals::ObjectState,
     layer_id: LayerId,
     sprite_id: SpriteId,
-    image_id: Option<ImageId>,
+    image_id: Option<ImageHandle>,
     x: i64,
     y: i64,
     alpha: u8,
@@ -11152,7 +11153,7 @@ fn set_weather_sprite(
     let Some(sprite) = layer.sprite_mut(sprite_id) else {
         return;
     };
-    sprite.image_id = image_id;
+    sprite.image_id = image_id.clone();
     sprite.visible = image_id.is_some() && obj.get_int_prop(ids, ids.obj_disp) != 0 && alpha > 0;
     sprite.fit = SpriteFit::PixelRect;
     sprite.size_mode = SpriteSizeMode::Intrinsic;
@@ -11231,7 +11232,7 @@ fn sync_weather_object_recursive(
                 x = weather_wrap_position(x, screen_w);
                 y = weather_wrap_position(y, screen_h);
 
-                let (over_l, over_r, over_u, over_d) = image_id
+                let (over_l, over_r, over_u, over_d) = image_id.as_ref()
                     .and_then(|id| images.get(id))
                     .map(|img| {
                         let sx = sub.scale_x as f64 / 1000.0;
@@ -11272,7 +11273,7 @@ fn sync_weather_object_recursive(
                             obj,
                             layer_id,
                             sid,
-                            image_id,
+                            image_id.clone(),
                             x + offset.0,
                             y + offset.1,
                             alpha,
@@ -11386,14 +11387,14 @@ fn install_object_movie_preview_if_missing(
     match movie_mgr.ensure_omv_preview_frame(file) {
         Ok(frame) => {
             let img_id = images.insert_image_arc(frame.clone());
-            *image_id = Some(img_id);
+            *image_id = Some(img_id.clone());
             *width = frame.width;
             *height = frame.height;
-            obj.movie.frame_image_ids[0] = Some(img_id);
+            obj.movie.frame_image_ids[0] = Some(img_id.clone());
             obj.movie.frame_image_cursor = 0;
             if let Some(layer) = layers.layer_mut(*layer_id) {
                 if let Some(sprite) = layer.sprite_mut(*sprite_id) {
-                    sprite.image_id = Some(img_id);
+                    sprite.image_id = Some(img_id.clone());
                     sprite.object_anchor = true;
                     sprite.texture_center_x = 0.0;
                     sprite.texture_center_y = 0.0;
@@ -11441,25 +11442,25 @@ fn install_object_movie_stream_frame(
 
     // C_elm_object::restruct_movie() creates one D3DUSAGE_DYNAMIC texture and
     // C_elm_object::movie_frame() updates that same texture with
-    // D3DLOCK_DISCARD. Keep the ImageId stable for the entire OBJECT movie
+    // D3DLOCK_DISCARD. Keep the ImageHandle stable for the entire OBJECT movie
     // lifetime so the renderer can update one GPU texture in place without
     // invalidating/rebuilding the sprite bind group on every decoded frame.
-    let img_id = if let Some(id) = obj.movie.frame_image_ids[0] {
+    let img_id = if let Some(ref id) = obj.movie.frame_image_ids[0] {
         let _ = images.replace_image_arc(id, frame.clone());
-        id
+        id.clone()
     } else {
         let id = images.insert_image_arc(frame.clone());
-        obj.movie.frame_image_ids[0] = Some(id);
+        obj.movie.frame_image_ids[0] = Some(id.clone());
         id
     };
     obj.movie.frame_image_cursor = 0;
 
-    *image_id = Some(img_id);
+    *image_id = Some(img_id.clone());
     *width = frame.width;
     *height = frame.height;
     if let Some(layer) = layers.layer_mut(*layer_id) {
         if let Some(sprite) = layer.sprite_mut(*sprite_id) {
-            sprite.image_id = Some(img_id);
+            sprite.image_id = Some(img_id.clone());
             sprite.object_anchor = true;
             sprite.texture_center_x = 0.0;
             sprite.texture_center_y = 0.0;
@@ -11688,7 +11689,7 @@ fn sync_movie_object_recursive(
                             match movie_mgr.ensure_preview_frame(file) {
                                 Ok(frame) => {
                                     let img_id = images.insert_image_arc(frame.clone());
-                                    *image_id = Some(img_id);
+                                    *image_id = Some(img_id.clone());
                                     *width = frame.width;
                                     *height = frame.height;
                                     if let Some(layer) = layers.layer_mut(*layer_id) {
@@ -11857,7 +11858,7 @@ fn apply_object_masks_recursive(
     obj_i64: i64,
     obj: &mut globals::ObjectState,
     mask_info: &[Option<(String, i32, i32)>],
-    resolved_masks: &HashMap<String, ImageId>,
+    resolved_masks: &HashMap<String, ImageHandle>,
 ) {
     let mask_no = if ids.obj_mask_no != 0 {
         obj.lookup_int_prop(ids, ids.obj_mask_no).unwrap_or(-1)
@@ -11871,7 +11872,7 @@ fn apply_object_masks_recursive(
         .and_then(|(mask_name, mask_x, mask_y)| {
             resolved_masks
                 .get(mask_name)
-                .copied()
+                .cloned()
                 .map(|mask_image_id| (mask_image_id, *mask_x, *mask_y))
         });
 
@@ -11890,7 +11891,7 @@ fn apply_object_masks_recursive(
         else {
             continue;
         };
-        if let Some((mask_image_id, mask_x, mask_y)) = mask_binding {
+        if let Some((mask_image_id, mask_x, mask_y)) = mask_binding.clone() {
             sprite.mask_image_id = Some(mask_image_id);
             sprite.mask_offset_x = mask_x;
             sprite.mask_offset_y = mask_y;
@@ -11946,7 +11947,7 @@ fn apply_object_tonecurves_recursive(
                     .layer_mut(layer_id)
                     .and_then(|l| l.sprite_mut(sprite_id))
                 {
-                    sprite.tonecurve_image_id = Some(tonecurve_image_id);
+                    sprite.tonecurve_image_id = Some(tonecurve_image_id.clone());
                     sprite.tonecurve_row = tonecurve_row;
                     sprite.tonecurve_sat = tonecurve_sat;
                 }
@@ -12010,7 +12011,7 @@ fn apply_gan_effects_recursive(
                     let tr = (sprite.tr as i64 * pat.tr as i64 / 255).clamp(0, 255) as u8;
                     sprite.tr = tr;
                 }
-                if let Some(id) = replacement_image {
+                if let Some(id) = replacement_image.clone() {
                     sprite.image_id = Some(id);
                 }
             }
@@ -12062,10 +12063,10 @@ fn build_parent_render_state(
         color_add_b: info.color_add_b.clamp(0, 255) as i32,
         blend: info.blend,
         dst_clip: info.dst_clip,
-        mask_image_id: first_sprite.and_then(|s| s.mask_image_id),
+        mask_image_id: first_sprite.and_then(|s| s.mask_image_id.clone()),
         mask_offset_x: first_sprite.map(|s| s.mask_offset_x).unwrap_or(0),
         mask_offset_y: first_sprite.map(|s| s.mask_offset_y).unwrap_or(0),
-        tonecurve_image_id: first_sprite.and_then(|s| s.tonecurve_image_id),
+        tonecurve_image_id: first_sprite.and_then(|s| s.tonecurve_image_id.clone()),
         tonecurve_row: first_sprite.map(|s| s.tonecurve_row).unwrap_or(0.0),
         tonecurve_sat: first_sprite.map(|s| s.tonecurve_sat).unwrap_or(0.0),
     }
@@ -12129,12 +12130,12 @@ fn apply_parent_render_state_to_sprite(
         sprite.tr = 0;
     }
     if sprite.mask_image_id.is_none() {
-        sprite.mask_image_id = state.mask_image_id;
+        sprite.mask_image_id = state.mask_image_id.clone();
         sprite.mask_offset_x = state.mask_offset_x;
         sprite.mask_offset_y = state.mask_offset_y;
     }
     if sprite.tonecurve_image_id.is_none() {
-        sprite.tonecurve_image_id = state.tonecurve_image_id;
+        sprite.tonecurve_image_id = state.tonecurve_image_id.clone();
         sprite.tonecurve_row = state.tonecurve_row;
         sprite.tonecurve_sat = state.tonecurve_sat;
     }
@@ -12664,8 +12665,8 @@ fn object_tree_texture_key(
     let slot = object_runtime_slot(obj_idx, obj);
     let image = fetch_bound_render_sprites_any(ctx, stage_idx, slot, obj)
         .first()
-        .and_then(|rs| rs.sprite.image_id);
-    (image.is_some(), image.map(|id| id.0).unwrap_or(0))
+        .and_then(|rs| rs.sprite.image_id.clone());
+    (image.is_some(), image.map(|id| id.key().0).unwrap_or(0))
 }
 
 fn object_tree_stored_axis(obj: &globals::ObjectState, axis: u8) -> i32 {
@@ -12962,7 +12963,7 @@ fn append_object_tree_nodes(
         }
     }
     let mut cur_parent_state = build_parent_render_state(&info, bound.first().map(|rs| &rs.sprite));
-    if let Some(parent) = parent_state {
+    if let Some(parent) = parent_state.clone() {
         cur_parent_state = compose_parent_render_state(parent, cur_parent_state);
     }
 
@@ -12980,7 +12981,7 @@ fn append_object_tree_nodes(
                 &mut own_sprites,
             );
             for rs in own_sprites[out_len_before..].iter_mut() {
-                if let Some(parent) = parent_state {
+                if let Some(parent) = parent_state.clone() {
                     apply_parent_render_state_to_sprite(&mut rs.sprite, &info, &parent);
                 }
                 finalize_object_center_rep_to_sprite(&mut rs.sprite, &info);
@@ -13028,7 +13029,7 @@ fn append_object_tree_nodes(
                 rs.set_sorter(total_order, sprite_layer);
                 rs.sprite.order = legacy_packed_sorter_key(total_order, sprite_layer);
                 configure_sprite_3d(&mut rs.sprite, &info, worlds, ctx.screen_w, ctx.screen_h);
-                if let Some(parent) = parent_state {
+                if let Some(parent) = parent_state.clone() {
                     apply_parent_render_state_to_sprite(&mut rs.sprite, &info, &parent);
                 }
                 finalize_object_center_rep_to_sprite(&mut rs.sprite, &info);
@@ -13220,7 +13221,7 @@ fn append_object_tree_nodes(
             recurse_children,
             total_order,
             total_layer,
-            Some(cur_parent_state),
+            Some(cur_parent_state.clone()),
             &mut child_nodes,
             object_keys,
             debug_lines,
@@ -13655,7 +13656,7 @@ fn append_mwnd_embedded_object_list_groups(
             true,
             parent_order,
             parent_layer,
-            Some(parent),
+            Some(parent.clone()),
             wipe_order,
             wipe_layer,
             object_keys,
@@ -13782,7 +13783,7 @@ fn append_btnselitem_groups(
                 true,
                 wipe_order,
                 0,
-                Some(parent),
+                Some(parent.clone()),
                 wipe_order,
                 wipe_layer,
                 object_keys,
@@ -13801,7 +13802,7 @@ fn append_btnselitem_groups(
                 true,
                 wipe_order,
                 0,
-                Some(parent),
+                Some(parent.clone()),
                 wipe_order,
                 wipe_layer,
                 object_keys,
@@ -14016,8 +14017,8 @@ fn apply_selbtn_item_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSpri
                         Err(_) => ctx.images.load_bg_frame(file_name, patno as usize).ok(),
                     };
                     if let Some(image_id) = image_id {
-                        rs.sprite.image_id = Some(image_id);
-                        if let Some(img) = ctx.images.get(image_id) {
+                        rs.sprite.image_id = Some(image_id.clone());
+                        if let Some(img) = ctx.images.get(&image_id) {
                             rs.sprite.object_anchor = true;
                             rs.sprite.texture_center_x = img.center_x as f32;
                             rs.sprite.texture_center_y = img.center_y as f32;
@@ -14175,7 +14176,7 @@ fn append_mwnd_embedded_groups(
         }
         let local_parent =
             mwnd_button_parent_render_state(m, button_idx, window_x, window_y, window_w, window_h);
-        let parent = apply_mwnd_window_anim_parent(local_parent, anim_parent);
+        let parent = apply_mwnd_window_anim_parent(local_parent, anim_parent.clone());
         if sg_render_tree_debug_enabled() {
             debug.push(format!(
                 "[SG_DEBUG]       mwnd_button_parent[{}] file={} pos=({}, {}) local_base={:?} order={} layer={}",
@@ -14212,7 +14213,7 @@ fn append_mwnd_embedded_groups(
         }
         let parent = apply_mwnd_window_anim_parent(
             mwnd_face_parent_render_state(m, face_idx, window_x, window_y),
-            anim_parent,
+            anim_parent.clone(),
         );
         groups.extend(collect_object_render_nodes(
             ctx,
@@ -15044,8 +15045,8 @@ fn apply_button_state_visual(
             Err(_) => images.load_bg_frame(file_name, patno as usize).ok(),
         };
         if let Some(image_id) = image_id {
-            sprite.image_id = Some(image_id);
-            if let Some(img) = images.get(image_id) {
+            sprite.image_id = Some(image_id.clone());
+            if let Some(img) = images.get(&image_id) {
                 sprite.object_anchor = true;
                 sprite.texture_center_x = img.center_x as f32;
                 sprite.texture_center_y = img.center_y as f32;
@@ -15699,7 +15700,7 @@ fn apply_runtime_light_and_fog(ctx: &CommandContext, sprite: &mut Sprite) {
         sprite.fog_near = fog.near;
         sprite.fog_far = fog.far;
         sprite.fog_scroll_x = fog.scroll_x;
-        sprite.fog_texture_image_id = fog.texture_image_id;
+        sprite.fog_texture_image_id = fog.texture_image_id.clone();
     }
 }
 
@@ -16014,7 +16015,7 @@ mod render_tree_fidelity_tests {
             .map(|_| {
                 let id = layer.create_sprite();
                 let sprite = layer.sprite_mut(id).unwrap();
-                sprite.image_id = Some(image_id);
+                sprite.image_id = Some(image_id.clone());
                 // Tree-owned backend sprites can be hidden independently of digits.
                 sprite.visible = false;
                 id

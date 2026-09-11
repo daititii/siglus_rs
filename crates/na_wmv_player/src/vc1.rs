@@ -528,7 +528,7 @@ impl PictureHeader {
             QuantizerMode::Implicit => PQUANT_IMPLICIT[pqindex as usize],
             _ => pqindex,
         };
-        let halfqp = if pqindex < 9 { need_bit(&mut br, "HALFQP")? } else { false };
+        let mut halfqp = if pqindex < 9 { need_bit(&mut br, "HALFQP")? } else { false };
         let pquantizer = match seq.quantizer_mode {
             QuantizerMode::Implicit => pqindex < 9,
             QuantizerMode::NonUniform => false,
@@ -596,7 +596,12 @@ impl PictureHeader {
 
                 mvtab = need_bits(&mut br, 2, "MVTAB")? as u8;
                 cbptab = need_bits(&mut br, 2, "CBPTAB")? as u8;
-                if seq.dquant != 0 { dq = parse_dquant(&mut br, seq.dquant, pquant)?; }
+                if seq.dquant != 0 {
+                    dq = parse_dquant(&mut br, seq.dquant, pquant)?;
+                    // VC-1 §8.1.1.8 / FFmpeg vop_dquant_decoding(): ALL_MBS with
+                    // DQBILEVEL=0 disables HALFQP for the picture.
+                    if dq.enabled && dq.profile == 3 && !dq.bi_level { halfqp = false; }
+                }
                 if seq.vstransform {
                     ttmbf = need_bit(&mut br, "TTMBF")?;
                     ttfrm = if ttmbf { [0u8, 3, 6, 7][need_bits(&mut br, 2, "TTFRM")? as usize] } else { 0 };
@@ -615,7 +620,12 @@ impl PictureHeader {
                 if !skip.is_raw { skipmb_plane = Some(skip.data); }
                 mvtab = need_bits(&mut br, 2, "MVTAB")? as u8;
                 cbptab = need_bits(&mut br, 2, "CBPTAB")? as u8;
-                if seq.dquant != 0 { dq = parse_dquant(&mut br, seq.dquant, pquant)?; }
+                if seq.dquant != 0 {
+                    dq = parse_dquant(&mut br, seq.dquant, pquant)?;
+                    // VC-1 §8.1.1.8 / FFmpeg vop_dquant_decoding(): ALL_MBS with
+                    // DQBILEVEL=0 disables HALFQP for the picture.
+                    if dq.enabled && dq.profile == 3 && !dq.bi_level { halfqp = false; }
+                }
                 if seq.vstransform {
                     ttmbf = need_bit(&mut br, "TTMBF")?;
                     ttfrm = if ttmbf { [0u8, 3, 6, 7][need_bits(&mut br, 2, "TTFRM")? as usize] } else { 0 };

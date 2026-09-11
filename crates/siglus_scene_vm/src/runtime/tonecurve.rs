@@ -4,7 +4,7 @@ use anyhow::Result;
 use siglus_assets::gameexe::{decode_gameexe_dat_bytes, GameexeConfig};
 
 use crate::assets::RgbaImage;
-use crate::image_manager::{ImageId, ImageManager};
+use crate::image_manager::{ImageHandle, ImageManager};
 
 #[derive(Debug, Clone)]
 struct ToneCurveRow {
@@ -18,7 +18,7 @@ struct ToneCurveRow {
 pub struct ToneCurveRuntime {
     rows: Option<Vec<Option<ToneCurveRow>>>,
     source_path: Option<PathBuf>,
-    lut_image_id: Option<ImageId>,
+    lut_image_id: Option<ImageHandle>,
 }
 
 impl ToneCurveRuntime {
@@ -39,7 +39,7 @@ impl ToneCurveRuntime {
         &mut self,
         images: &mut ImageManager,
         tonecurve_no: i32,
-    ) -> Option<(ImageId, f32, f32)> {
+    ) -> Option<(ImageHandle, f32, f32)> {
         let idx = tonecurve_no.max(0) as usize;
         let row = self.rows.as_ref()?.get(idx)?.as_ref()?.clone();
         let lut_id = self.ensure_lut_image(images)?;
@@ -52,9 +52,9 @@ impl ToneCurveRuntime {
         Some((lut_id, row_y, sat))
     }
 
-    fn ensure_lut_image(&mut self, images: &mut ImageManager) -> Option<ImageId> {
-        if let Some(id) = self.lut_image_id {
-            return Some(id);
+    fn ensure_lut_image(&mut self, images: &mut ImageManager) -> Option<ImageHandle> {
+        if let Some(ref id) = self.lut_image_id {
+            return Some(id.clone());
         }
         let rows = self.rows.as_ref()?;
         let mut rgba = vec![0u8; 256 * 256 * 4];
@@ -81,7 +81,7 @@ impl ToneCurveRuntime {
             center_y: 0,
             rgba,
         });
-        self.lut_image_id = Some(id);
+        self.lut_image_id = Some(id.clone());
         Some(id)
     }
 

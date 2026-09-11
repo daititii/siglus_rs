@@ -837,6 +837,23 @@ impl VmWait {
             || self.wipe
     }
 
+    /// Whether wall-clock or frame-driven state can make this wait finish.
+    ///
+    /// Pure key waits still need to be checked after an input event, but they
+    /// must not keep the render loop running while the player is idle.
+    pub fn needs_continuous_frame(&self) -> bool {
+        self.message_reveal
+            || self.until.is_some()
+            || self.until_frame.is_some()
+            || self.audio.is_some()
+            || self.event.is_some()
+            || self.movie.is_some()
+            || self.emote.is_some()
+            || self.quake.is_some()
+            || self.global_movie
+            || self.wipe
+    }
+
     fn mark_block_request(&mut self) {
         self.block_generation = self.block_generation.wrapping_add(1);
     }
@@ -1861,11 +1878,14 @@ mod audio_wait_parity_tests {
         let mut wait = VmWait::default();
 
         wait.wait_message_reveal_then_key();
+        assert!(wait.needs_continuous_frame());
         assert!(wait.message_reveal_waiting());
         assert!(!wait.message_key_waiting());
         assert!(!wait.waiting_for_key());
 
         assert!(wait.finish_message_reveal());
+        assert!(wait.needs_runtime_poll());
+        assert!(!wait.needs_continuous_frame());
         assert!(!wait.message_reveal_waiting());
         assert!(wait.message_key_waiting());
         assert!(wait.waiting_for_key());
@@ -1873,6 +1893,16 @@ mod audio_wait_parity_tests {
         wait.finish_message_key_wait();
         assert!(!wait.message_key_waiting());
         assert!(!wait.waiting_for_key());
+    }
+
+    #[test]
+    fn pure_key_wait_does_not_request_idle_frames() {
+        let mut wait = VmWait::default();
+
+        wait.wait_input_key(false);
+
+        assert!(wait.needs_runtime_poll());
+        assert!(!wait.needs_continuous_frame());
     }
 
     #[test]

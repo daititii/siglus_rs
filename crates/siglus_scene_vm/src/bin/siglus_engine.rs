@@ -26,7 +26,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use siglus_assets::gameexe::{decode_gameexe_dat_bytes, GameexeConfig};
 use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
 
-use siglus_scene_vm::image_manager::ImageId;
+use siglus_scene_vm::image_manager::{ImageHandle, ImageKey};
 use siglus_scene_vm::render::{Renderer, RendererDebugTexture};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use siglus_scene_vm::desktop_config::{ConfigDialog, DesktopConfigAction, DesktopConfigWindow};
@@ -156,7 +156,7 @@ struct HudGui {
     ctx: egui::Context,
     renderer: EguiRenderer,
     start_time: Instant,
-    texture_cache: HashMap<ImageId, HudTextureCacheEntry>,
+    texture_cache: HashMap<ImageKey, HudTextureCacheEntry>,
     gpu_texture_cache: HashMap<String, HudTextureCacheEntry>,
 }
 
@@ -181,8 +181,8 @@ struct HudGalleryTile {
     alpha: i64,
     bind: String,
     patno: i64,
-    runtime_image_id: Option<ImageId>,
-    image_id: Option<ImageId>,
+    runtime_image_id: Option<ImageHandle>,
+    image_id: Option<ImageHandle>,
     width: u32,
     height: u32,
     source_label: String,
@@ -509,7 +509,7 @@ impl App {
 
     fn hud_populate_image_info(
         vm: &SceneVm<'static>,
-        image_id: ImageId,
+        image_id: &ImageHandle,
         tile: &mut HudGalleryTile,
     ) {
         if let Some(info) = vm.ctx.images.debug_image_info(image_id) {
@@ -527,24 +527,24 @@ impl App {
         }
     }
 
-    fn hud_renderer_image_id(texture: &RendererDebugTexture) -> Option<ImageId> {
+    fn hud_renderer_image_id(texture: &RendererDebugTexture) -> Option<ImageKey> {
         texture
             .key
             .strip_prefix("image:")?
             .parse::<u32>()
             .ok()
-            .map(ImageId)
+            .map(ImageKey)
     }
 
     fn collect_hud_runtime_image_sources(
         vm: &SceneVm<'static>,
-    ) -> HashMap<ImageId, Vec<String>> {
+    ) -> HashMap<ImageKey, Vec<String>> {
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         Self::collect_hud_tile_metadata_from_stage_forms(vm, &mut rows, &mut seen);
         Self::collect_hud_tile_metadata_from_runtime_probe(vm, &mut rows, &mut seen);
 
-        let mut sources: HashMap<ImageId, Vec<String>> = HashMap::new();
+        let mut sources: HashMap<ImageKey, Vec<String>> = HashMap::new();
         for tile in rows {
             let Some(image_id) = tile.runtime_image_id else {
                 continue;
@@ -561,7 +561,7 @@ impl App {
                 tile.tr,
                 tile.alpha,
             );
-            let entry = sources.entry(image_id).or_default();
+            let entry = sources.entry(image_id.key()).or_default();
             if !entry.iter().any(|existing| existing == &line) {
                 entry.push(line);
             }
@@ -572,13 +572,14 @@ impl App {
     fn collect_hud_image_origins(
         vm: &SceneVm<'static>,
         textures: &[RendererDebugTexture],
-    ) -> HashMap<ImageId, Vec<String>> {
+    ) -> HashMap<ImageKey, Vec<String>> {
         let mut origins = HashMap::new();
         for texture in textures {
             let Some(image_id) = Self::hud_renderer_image_id(texture) else {
                 continue;
             };
-            let Some(info) = vm.ctx.images.debug_image_info(image_id) else {
+            let Some(info) = vm.ctx.images.image_handle(image_id)
+                .as_ref().and_then(|id| vm.ctx.images.debug_image_info(id)) else {
                 continue;
             };
 
@@ -614,7 +615,7 @@ impl App {
         // Passive object-tree snapshot for debugging.  Do not resolve or load
         // preview images here: the HUD must not mutate ImageManager merely by
         // being open.  This intentionally includes objects that currently have
-        // no runtime ImageId/binding, which are exactly the cases hidden by the
+        // no runtime ImageHandle/binding, which are exactly the cases hidden by the
         // renderer-texture view.
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
@@ -733,7 +734,7 @@ impl App {
                                     // not to a stale layer flag, so keep `disp` from object/gfx state here.
                                     tr = sprite.tr as i64;
                                     alpha = sprite.alpha as i64;
-                                    runtime_image_id = sprite.image_id;
+                                    runtime_image_id = sprite.image_id.clone();
                                 }
                             }
                             format!("L{}:S{}", lid, sid)
@@ -760,7 +761,7 @@ impl App {
                         if let Some(sprite) = layer.sprite(*sprite_id) {
                             tr = sprite.tr as i64;
                             alpha = sprite.alpha as i64;
-                            runtime_image_id = sprite.image_id;
+                            runtime_image_id = sprite.image_id.clone();
                         }
                     }
                     format!("L{}:S{}", layer_id, sprite_id)
@@ -778,7 +779,7 @@ impl App {
                             if let Some(sprite) = layer.sprite(sid) {
                                 tr = sprite.tr as i64;
                                 alpha = sprite.alpha as i64;
-                                runtime_image_id = sprite.image_id;
+                                runtime_image_id = sprite.image_id.clone();
                             }
                         }
                         format!("L{}:S{}", layer_id, sid)
@@ -823,8 +824,8 @@ impl App {
                 alpha,
                 bind,
                 patno,
-                runtime_image_id,
-                image_id: runtime_image_id,
+                runtime_image_id: runtime_image_id.clone(),
+                image_id: runtime_image_id.clone(),
                 width,
                 height,
                 source_label: file,
@@ -834,8 +835,8 @@ impl App {
                     format!("stage-form-{}", stage_form_id)
                 },
             };
-            if let Some(image_id) = tile.runtime_image_id {
-                Self::hud_populate_image_info(vm, image_id, &mut tile);
+            if let Some(image_id) = tile.runtime_image_id.clone() {
+                Self::hud_populate_image_info(vm, &image_id, &mut tile);
             }
             rows.push(tile);
         }
@@ -878,12 +879,12 @@ impl App {
                 };
 
                 let key = (normal_stage_form_id, stage_idx, obj_idx);
-                let runtime_image_id = sprite.image_id;
+                let runtime_image_id = sprite.image_id.clone();
                 let mut file = format!("<obj {}>", obj_idx);
                 let mut source_label = format!("runtime L{}:S{}", layer_id, sprite_id);
                 let mut width = 0u32;
                 let mut height = 0u32;
-                if let Some(image_id) = runtime_image_id {
+                if let Some(image_id) = runtime_image_id.as_ref() {
                     if let Some(info) = vm.ctx.images.debug_image_info(image_id) {
                         width = info.width;
                         height = info.height;
@@ -912,7 +913,7 @@ impl App {
                             .gfx
                             .object_peek_patno(stage_idx, obj_idx as i64)
                             .unwrap_or(tile.patno);
-                        tile.runtime_image_id = runtime_image_id.or(tile.runtime_image_id);
+                        tile.runtime_image_id = runtime_image_id.or(tile.runtime_image_id.clone());
                         if (tile.file.is_empty()
                             || tile.file == "-"
                             || tile.file.starts_with("<obj "))
@@ -930,7 +931,7 @@ impl App {
                             tile.height = height;
                         }
                         if tile.runtime_image_id.is_some() {
-                            tile.image_id = tile.runtime_image_id;
+                            tile.image_id = tile.runtime_image_id.clone();
                             tile.source_kind = "runtime-bind".to_string();
                         }
                     }
@@ -953,8 +954,8 @@ impl App {
                         .gfx
                         .object_peek_patno(stage_idx, obj_idx as i64)
                         .unwrap_or(0),
-                    runtime_image_id,
-                    image_id: runtime_image_id,
+                    runtime_image_id: runtime_image_id.clone(),
+                    image_id: runtime_image_id.clone(),
                     width,
                     height,
                     source_label,
@@ -975,11 +976,11 @@ impl App {
     }
 
     fn resolve_hud_tile_image(vm: &mut SceneVm<'static>, tile: &mut HudGalleryTile) {
-        tile.image_id = tile.runtime_image_id;
-        if let Some(image_id) = tile.runtime_image_id {
+        tile.image_id = tile.runtime_image_id.clone();
+        if let Some(image_id) = tile.runtime_image_id.clone() {
             // For runtime-bound objects, the HUD must show the exact image submitted by the engine.
             // Do not replace it with file/patno 0 preview data.
-            Self::hud_populate_image_info(vm, image_id, tile);
+            Self::hud_populate_image_info(vm, &image_id, tile);
             tile.source_kind = "runtime-bind".to_string();
             return;
         }
@@ -990,15 +991,15 @@ impl App {
 
         match vm.ctx.images.load_g00(&tile.file, 0) {
             Ok(image_id) => {
-                tile.image_id = Some(image_id);
+                tile.image_id = Some(image_id.clone());
                 tile.source_kind = "preview-g00-0".to_string();
-                Self::hud_populate_image_info(vm, image_id, tile);
+                Self::hud_populate_image_info(vm, &image_id, tile);
             }
             Err(g00_err) => match vm.ctx.images.load_bg_frame(&tile.file, 0) {
                 Ok(image_id) => {
-                    tile.image_id = Some(image_id);
+                    tile.image_id = Some(image_id.clone());
                     tile.source_kind = "preview-bg-0".to_string();
-                    Self::hud_populate_image_info(vm, image_id, tile);
+                    Self::hud_populate_image_info(vm, &image_id, tile);
                 }
                 Err(bg_err) => {
                     if tile.image_id.is_none() {
@@ -1045,7 +1046,7 @@ impl App {
         )
     }
 
-    fn hud_alpha_summary(vm: &SceneVm<'static>, image_id: ImageId) -> Option<(u8, u8, usize)> {
+    fn hud_alpha_summary(vm: &SceneVm<'static>, image_id: &ImageHandle) -> Option<(u8, u8, usize)> {
         let (img, _) = vm.ctx.images.get_entry(image_id)?;
         let mut min_a = u8::MAX;
         let mut max_a = 0u8;
@@ -1066,11 +1067,11 @@ impl App {
         vm: &SceneVm<'static>,
         tile: &HudGalleryTile,
     ) -> Option<egui::TextureId> {
-        let image_id = tile.image_id?;
+        let image_id = tile.image_id.as_ref()?;
         let (img, version) = vm.ctx.images.get_entry(image_id)?;
         let (color, debug_hash) =
             Self::hud_debug_rgb_preview(img.rgba.as_slice(), img.width, img.height);
-        if let Some(entry) = gui.texture_cache.get_mut(&image_id) {
+        if let Some(entry) = gui.texture_cache.get_mut(&image_id.key()) {
             if entry.version != version
                 || entry.width != img.width
                 || entry.height != img.height
@@ -1085,13 +1086,13 @@ impl App {
             return Some(entry.handle.id());
         }
         let handle = gui.ctx.load_texture(
-            format!("siglus-hud-debug-rgb-image-{}", image_id.0),
+            format!("siglus-hud-debug-rgb-image-{}", image_id.key()),
             color,
             TextureOptions::LINEAR,
         );
         let id = handle.id();
         gui.texture_cache.insert(
-            image_id,
+            image_id.key(),
             HudTextureCacheEntry {
                 version,
                 handle,
@@ -1244,6 +1245,12 @@ impl App {
             let Some(gui) = self.hud_gui.as_mut() else {
                 return Ok(());
             };
+            // Preview caches must not retain every texture seen in a long run.
+            gui.gpu_texture_cache
+                .retain(|key, _| textures.iter().any(|texture| &texture.key == key));
+            gui.texture_cache.retain(|id, _| {
+                self.vm.as_ref().is_some_and(|vm| vm.ctx.images.contains(*id))
+            });
             for (idx, texture) in textures[start..end].iter().enumerate() {
                 visible_texture_ids[idx] = Self::sync_hud_gpu_texture(gui, texture);
             }
@@ -1290,8 +1297,8 @@ impl App {
                     egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
                         for tile in &stage_objects {
                             let image = tile
-                                .runtime_image_id
-                                .map(|id| format!("ImageId({})", id.index()))
+                                .runtime_image_id.as_ref()
+                                .map(|id| format!("ImageHandle({})", id.index()))
                                 .unwrap_or_else(|| "-".to_string());
                             let line = format!(
                                 "{}[{}] disp={} backend={} file={} patno={} bind={} image={} tr={} alpha={}",

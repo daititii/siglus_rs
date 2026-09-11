@@ -1,6 +1,6 @@
 //! Message-window rendering state projected from runtime MWND state.
 
-use crate::image_manager::ImageId;
+use crate::image_manager::ImageHandle;
 use crate::layer::{LayerId, Sprite, SpriteFit, SpriteId, SpriteSizeMode};
 use crate::runtime::globals::{EditBoxListState, ScriptRuntimeState, SyscomRuntimeState};
 use crate::text_render::{FontCache, PositionedTextGlyph, TextSpriteLayer, TextStyle};
@@ -55,9 +55,9 @@ pub struct MwndWindowRenderState {
 pub struct MwndWakuRuntime {
     pub bg_sprite: Option<SpriteId>,
     pub filter_sprite: Option<SpriteId>,
-    pub bg_image: Option<ImageId>,
-    pub filter_image: Option<ImageId>,
-    pub solid_filter_image: Option<ImageId>,
+    pub bg_image: Option<ImageHandle>,
+    pub filter_image: Option<ImageHandle>,
+    pub solid_filter_image: Option<ImageHandle>,
     pub bg_file: Option<String>,
     pub filter_file: Option<String>,
     pub bg_size: Option<(u32, u32)>,
@@ -71,7 +71,7 @@ pub struct MwndWakuRuntime {
 #[derive(Debug, Default)]
 pub struct MwndFaceRuntime {
     pub sprite: Option<SpriteId>,
-    pub image: Option<ImageId>,
+    pub image: Option<ImageHandle>,
     pub file: Option<String>,
     pub no: i64,
     pub rep_pos: Option<(i64, i64)>,
@@ -85,9 +85,9 @@ pub struct MwndGlyphLayerRuntime {
     pub shadow_sprite: Option<SpriteId>,
     pub fuchi_sprite: Option<SpriteId>,
     pub body_sprite: Option<SpriteId>,
-    pub shadow_image: Option<ImageId>,
-    pub fuchi_image: Option<ImageId>,
-    pub body_image: Option<ImageId>,
+    pub shadow_image: Option<ImageHandle>,
+    pub fuchi_image: Option<ImageHandle>,
+    pub body_image: Option<ImageHandle>,
     pub shadow_offset: (i32, i32),
     pub fuchi_offset: (i32, i32),
     pub body_offset: (i32, i32),
@@ -100,9 +100,9 @@ pub struct MwndNameRuntime {
     pub shadow_sprite: Option<SpriteId>,
     pub fuchi_sprite: Option<SpriteId>,
     pub text_sprite: Option<SpriteId>,
-    pub shadow_image: Option<ImageId>,
-    pub fuchi_image: Option<ImageId>,
-    pub text_image: Option<ImageId>,
+    pub shadow_image: Option<ImageHandle>,
+    pub fuchi_image: Option<ImageHandle>,
+    pub text_image: Option<ImageHandle>,
     pub text: Option<String>,
     pub glyphs: Vec<MwndGlyphProjection>,
     pub glyph_layers: Vec<MwndGlyphLayerRuntime>,
@@ -112,7 +112,7 @@ pub struct MwndNameRuntime {
 #[derive(Debug, Default)]
 pub struct MwndKeyIconRuntime {
     pub sprite: Option<SpriteId>,
-    pub image: Option<ImageId>,
+    pub image: Option<ImageHandle>,
     pub file: Option<String>,
     pub cached_mode: i64,
     pub cached_pat: i64,
@@ -134,7 +134,7 @@ pub struct MwndKeyIconRuntime {
 #[derive(Debug, Default)]
 pub struct MwndEmojiRuntime {
     pub sprite: Option<SpriteId>,
-    pub image: Option<ImageId>,
+    pub image: Option<ImageHandle>,
     pub cache_file: Option<String>,
     pub cache_code: i32,
 }
@@ -152,9 +152,9 @@ pub struct MwndMsgRuntime {
     pub shadow_sprite: Option<SpriteId>,
     pub fuchi_sprite: Option<SpriteId>,
     pub text_sprite: Option<SpriteId>,
-    pub shadow_image: Option<ImageId>,
-    pub fuchi_image: Option<ImageId>,
-    pub text_image: Option<ImageId>,
+    pub shadow_image: Option<ImageHandle>,
+    pub fuchi_image: Option<ImageHandle>,
+    pub text_image: Option<ImageHandle>,
     pub text: Option<String>,
     pub glyphs: Vec<MwndGlyphProjection>,
     /// Original C_elm_mwnd_msg owns one shadow/fuchi/body sprite triplet for
@@ -232,8 +232,8 @@ pub struct SysOverlayRuntime {
     pub active: bool,
     pub bg_sprite: Option<SpriteId>,
     pub text_sprite: Option<SpriteId>,
-    pub bg_image: Option<ImageId>,
-    pub text_image: Option<ImageId>,
+    pub bg_image: Option<ImageHandle>,
+    pub text_image: Option<ImageHandle>,
     pub text: String,
     pub text_dirty: bool,
 }
@@ -322,7 +322,7 @@ pub enum MsgBackHitAction {
 #[derive(Debug, Default)]
 pub struct MsgBackButtonRuntime {
     pub sprite: Option<SpriteId>,
-    pub image: Option<ImageId>,
+    pub image: Option<ImageHandle>,
     pub cached_file: Option<String>,
     pub size: Option<(u32, u32)>,
     pub center: Option<(i32, i32)>,
@@ -331,7 +331,7 @@ pub struct MsgBackButtonRuntime {
 #[derive(Debug, Default)]
 pub struct MsgBackTextRuntime {
     pub sprite: Option<SpriteId>,
-    pub image: Option<ImageId>,
+    pub image: Option<ImageHandle>,
 }
 
 #[derive(Debug, Default)]
@@ -340,11 +340,11 @@ pub struct MsgBackRuntime {
     pub waku_sprite: Option<SpriteId>,
     pub filter_sprite: Option<SpriteId>,
     pub text_sprite: Option<SpriteId>,
-    pub waku_image: Option<ImageId>,
-    pub filter_image: Option<ImageId>,
-    pub solid_filter_image: Option<ImageId>,
+    pub waku_image: Option<ImageHandle>,
+    pub filter_image: Option<ImageHandle>,
+    pub solid_filter_image: Option<ImageHandle>,
     pub solid_filter_color: Option<(u8, u8, u8, u8)>,
-    pub text_image: Option<ImageId>,
+    pub text_image: Option<ImageHandle>,
     pub cached_waku_file: Option<String>,
     pub cached_filter_file: Option<String>,
     pub text_dirty: bool,
@@ -363,7 +363,7 @@ pub struct MsgBackRuntime {
 pub struct EditBoxOverlayEntry {
     pub bg_sprite: Option<SpriteId>,
     pub text_sprite: Option<SpriteId>,
-    pub text_image: Option<ImageId>,
+    pub text_image: Option<ImageHandle>,
     pub last_text: String,
     pub last_cursor_pos: usize,
     pub last_selection: Option<(usize, usize)>,
@@ -382,8 +382,8 @@ pub struct EditBoxOverlayEntry {
 #[derive(Debug, Default)]
 pub struct EditBoxOverlayRuntime {
     pub layer: Option<LayerId>,
-    pub bg_image: Option<ImageId>,
-    pub focused_bg_image: Option<ImageId>,
+    pub bg_image: Option<ImageHandle>,
+    pub focused_bg_image: Option<ImageHandle>,
     pub entries: HashMap<(u32, usize), EditBoxOverlayEntry>,
 }
 
@@ -525,6 +525,7 @@ pub struct UiRuntime {
 }
 
 impl UiRuntime {
+
     pub fn set_text_colors(&mut self, text_color: (u8, u8, u8), shadow_color: (u8, u8, u8)) {
         self.set_text_colors_full(text_color, shadow_color, None);
     }
@@ -554,6 +555,14 @@ impl UiRuntime {
         name_shadow_color: (u8, u8, u8),
         name_fuchi_color: Option<(u8, u8, u8)>,
     ) {
+        let msg_changed = self.text_color != msg_text_color
+            || self.shadow_color != msg_shadow_color
+            || self.fuchi_enabled != msg_fuchi_color.is_some()
+            || msg_fuchi_color.is_some_and(|color| self.fuchi_color != color);
+        let name_changed = self.name_text_color != name_text_color
+            || self.name_shadow_color != name_shadow_color
+            || self.name_fuchi_enabled != name_fuchi_color.is_some()
+            || name_fuchi_color.is_some_and(|color| self.name_fuchi_color != color);
         self.text_color = msg_text_color;
         self.shadow_color = msg_shadow_color;
         self.fuchi_enabled = msg_fuchi_color.is_some();
@@ -566,8 +575,8 @@ impl UiRuntime {
         if let Some(color) = name_fuchi_color {
             self.name_fuchi_color = color;
         }
-        self.mwnd.msg.text_dirty = true;
-        self.mwnd.name.text_dirty = true;
+        self.mwnd.msg.text_dirty |= msg_changed;
+        self.mwnd.name.text_dirty |= name_changed;
     }
 
     fn mwnd_message_text_style(&self) -> TextStyle {
@@ -1573,9 +1582,9 @@ impl UiRuntime {
         let msg_x = mx + slide_offset + self.mwnd.msg.glyph_offset.0;
         let msg_y = my + self.mwnd.msg.glyph_offset.1;
         for (sprite_id, image, order) in [
-            (msg_shadow_sprite, self.mwnd.msg.shadow_image, 1_000_010),
-            (msg_fuchi_sprite, self.mwnd.msg.fuchi_image, 1_000_011),
-            (msg_text_sprite, self.mwnd.msg.text_image, 1_000_012),
+            (msg_shadow_sprite, self.mwnd.msg.shadow_image.clone(), 1_000_010),
+            (msg_fuchi_sprite, self.mwnd.msg.fuchi_image.clone(), 1_000_011),
+            (msg_text_sprite, self.mwnd.msg.text_image.clone(), 1_000_012),
         ] {
             if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
                 s.size_mode = if image.is_some() {
@@ -1606,19 +1615,19 @@ impl UiRuntime {
             for (sprite_id, image, offset, order) in [
                 (
                     shadow_sprite,
-                    runtime.shadow_image,
+                    runtime.shadow_image.clone(),
                     runtime.shadow_offset,
                     1_000_010,
                 ),
                 (
                     fuchi_sprite,
-                    runtime.fuchi_image,
+                    runtime.fuchi_image.clone(),
                     runtime.fuchi_offset,
                     1_000_011,
                 ),
                 (
                     body_sprite,
-                    runtime.body_image,
+                    runtime.body_image.clone(),
                     runtime.body_offset,
                     1_000_012,
                 ),
@@ -1681,9 +1690,9 @@ impl UiRuntime {
 
         let ((_, _, nw, nh), (nx, ny)) = self.name_layout(w, h);
         for (sprite_id, image, order) in [
-            (name_shadow_sprite, self.mwnd.name.shadow_image, 1_000_020),
-            (name_fuchi_sprite, self.mwnd.name.fuchi_image, 1_000_021),
-            (name_text_sprite, self.mwnd.name.text_image, 1_000_022),
+            (name_shadow_sprite, self.mwnd.name.shadow_image.clone(), 1_000_020),
+            (name_fuchi_sprite, self.mwnd.name.fuchi_image.clone(), 1_000_021),
+            (name_text_sprite, self.mwnd.name.text_image.clone(), 1_000_022),
         ] {
             if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
                 s.size_mode = if image.is_some() {
@@ -1714,19 +1723,19 @@ impl UiRuntime {
             for (sprite_id, image, offset, order) in [
                 (
                     shadow_sprite,
-                    runtime.shadow_image,
+                    runtime.shadow_image.clone(),
                     runtime.shadow_offset,
                     1_000_020,
                 ),
                 (
                     fuchi_sprite,
-                    runtime.fuchi_image,
+                    runtime.fuchi_image.clone(),
                     runtime.fuchi_offset,
                     1_000_021,
                 ),
                 (
                     body_sprite,
-                    runtime.body_image,
+                    runtime.body_image.clone(),
                     runtime.body_offset,
                     1_000_022,
                 ),
@@ -1787,15 +1796,15 @@ impl UiRuntime {
             if let Some(sys_bg) = self.sys.bg_sprite {
                 if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sys_bg)) {
                     s.visible = self.sys.active;
-                    if let Some(img) = self.sys.bg_image {
-                        s.image_id = Some(img);
+                    if let Some(ref img) = self.sys.bg_image {
+                        s.image_id = Some(img.clone());
                     }
                 }
             }
             if let Some(sys_text) = self.sys.text_sprite {
                 if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sys_text)) {
                     s.visible = self.sys.active && self.sys.text_image.is_some();
-                    s.image_id = self.sys.text_image;
+                    s.image_id = self.sys.text_image.clone();
                 }
             }
         }
@@ -1851,12 +1860,12 @@ impl UiRuntime {
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(bg_sprite)) {
             s.visible = mwnd_visible && self.mwnd.waku.bg_image.is_some();
             s.alpha = anim_alpha;
-            s.image_id = self.mwnd.waku.bg_image;
+            s.image_id = self.mwnd.waku.bg_image.clone();
         }
 
         if let Some(sprite_id) = self.mwnd.waku.filter_sprite {
             if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
-                let image_id = self.mwnd.waku.filter_image.or(self.mwnd.waku.solid_filter_image);
+                let image_id = self.mwnd.waku.filter_image.clone().or(self.mwnd.waku.solid_filter_image.clone());
                 s.visible = mwnd_visible && image_id.is_some();
                 s.image_id = image_id;
                 const GET_FILTER_COLOR_R: i32 = 84;
@@ -1900,7 +1909,7 @@ impl UiRuntime {
                 s.visible = !self.mwnd.projection_active
                     && mwnd_visible
                     && self.mwnd.face.image.is_some();
-                s.image_id = self.mwnd.face.image;
+                s.image_id = self.mwnd.face.image.clone();
                 s.alpha = anim_alpha;
             }
         }
@@ -1911,9 +1920,9 @@ impl UiRuntime {
             .iter()
             .any(|runtime| runtime.source_index.is_some());
         for (sprite_id, image) in [
-            (self.mwnd.msg.shadow_sprite, self.mwnd.msg.shadow_image),
-            (self.mwnd.msg.fuchi_sprite, self.mwnd.msg.fuchi_image),
-            (self.mwnd.msg.text_sprite, self.mwnd.msg.text_image),
+            (self.mwnd.msg.shadow_sprite, self.mwnd.msg.shadow_image.clone()),
+            (self.mwnd.msg.fuchi_sprite, self.mwnd.msg.fuchi_image.clone()),
+            (self.mwnd.msg.text_sprite, self.mwnd.msg.text_image.clone()),
         ] {
             if let Some(sprite_id) = sprite_id {
                 if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
@@ -1932,9 +1941,9 @@ impl UiRuntime {
                 .map(|glyph| glyph.appeared || glyph.reveal_index <= visible)
                 .unwrap_or(false);
             for (sprite_id, image) in [
-                (runtime.shadow_sprite, runtime.shadow_image),
-                (runtime.fuchi_sprite, runtime.fuchi_image),
-                (runtime.body_sprite, runtime.body_image),
+                (runtime.shadow_sprite, runtime.shadow_image.clone()),
+                (runtime.fuchi_sprite, runtime.fuchi_image.clone()),
+                (runtime.body_sprite, runtime.body_image.clone()),
             ] {
                 let Some(sprite_id) = sprite_id else {
                     continue;
@@ -1961,7 +1970,7 @@ impl UiRuntime {
                 .unwrap_or(false);
             if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
                 s.visible = mwnd_visible && glyph_visible && runtime.image.is_some();
-                s.image_id = runtime.image;
+                s.image_id = runtime.image.clone();
                 s.alpha = anim_alpha;
             }
         }
@@ -1972,9 +1981,9 @@ impl UiRuntime {
             .iter()
             .any(|runtime| runtime.source_index.is_some());
         for (sprite_id, image) in [
-            (self.mwnd.name.shadow_sprite, self.mwnd.name.shadow_image),
-            (self.mwnd.name.fuchi_sprite, self.mwnd.name.fuchi_image),
-            (self.mwnd.name.text_sprite, self.mwnd.name.text_image),
+            (self.mwnd.name.shadow_sprite, self.mwnd.name.shadow_image.clone()),
+            (self.mwnd.name.fuchi_sprite, self.mwnd.name.fuchi_image.clone()),
+            (self.mwnd.name.text_sprite, self.mwnd.name.text_image.clone()),
         ] {
             if let Some(sprite_id) = sprite_id {
                 if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
@@ -1987,9 +1996,9 @@ impl UiRuntime {
         for runtime in &self.mwnd.name.glyph_layers {
             let glyph_visible = runtime.source_index.is_some();
             for (sprite_id, image) in [
-                (runtime.shadow_sprite, runtime.shadow_image),
-                (runtime.fuchi_sprite, runtime.fuchi_image),
-                (runtime.body_sprite, runtime.body_image),
+                (runtime.shadow_sprite, runtime.shadow_image.clone()),
+                (runtime.fuchi_sprite, runtime.fuchi_image.clone()),
+                (runtime.body_sprite, runtime.body_image.clone()),
             ] {
                 let Some(sprite_id) = sprite_id else {
                     continue;
@@ -2007,7 +2016,7 @@ impl UiRuntime {
         if let Some(sprite_id) = self.mwnd.key_icon.sprite {
             if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
                 s.visible = mwnd_visible && self.mwnd.key_icon.appear && self.mwnd.key_icon.image.is_some();
-                s.image_id = self.mwnd.key_icon.image;
+                s.image_id = self.mwnd.key_icon.image.clone();
                 s.alpha = anim_alpha;
             }
         }
@@ -2292,7 +2301,7 @@ impl UiRuntime {
         }
     }
 
-    pub fn set_message_bg(&mut self, img: ImageId) {
+    pub fn set_message_bg(&mut self, img: ImageHandle) {
         self.mwnd.projection_active = true;
         self.mwnd.waku.bg_image = Some(img);
     }
@@ -2348,7 +2357,7 @@ impl UiRuntime {
         }
     }
 
-    pub fn set_message_filter(&mut self, img: Option<ImageId>) {
+    pub fn set_message_filter(&mut self, img: Option<ImageHandle>) {
         self.mwnd.waku.filter_image = img;
     }
 
@@ -2514,9 +2523,31 @@ impl UiRuntime {
         name_message_pos_rep: (i64, i64),
         name_message_margin: (i64, i64, i64, i64),
     ) {
-        self.mwnd.window.pos = window_pos.map(|(x, y)| (x as i32, y as i32));
-        self.mwnd.window.size = window_size.map(|(w, h)| (w.max(1) as u32, h.max(1) as u32));
-        self.mwnd.window.message_pos = message_pos.map(|(x, y)| (x as i32, y as i32));
+        let next_pos = window_pos.map(|(x, y)| (x as i32, y as i32));
+        let next_size = window_size.map(|(w, h)| (w.max(1) as u32, h.max(1) as u32));
+        let next_message_pos = message_pos.map(|(x, y)| (x as i32, y as i32));
+        let next_slide_time_ms = slide_time.max(0) as u64;
+        let msg_layout_changed = self.mwnd.window.size != next_size
+            || self.mwnd.window.message_pos != next_message_pos
+            || self.mwnd.window.message_margin != message_margin
+            || self.mwnd.window.moji_cnt != window_moji_cnt
+            || self.mwnd.window.moji_size != moji_size
+            || self.mwnd.window.moji_space != moji_space
+            || self.mwnd.window.extend_type != mwnd_extend_type
+            || self.mwnd.window.vertical_writing != vertical_writing;
+        let name_layout_changed = msg_layout_changed
+            || self.mwnd.window.name_extend_type != name_extend_type
+            || self.mwnd.window.name_window_align != name_window_align
+            || self.mwnd.window.name_window_pos != name_window_pos
+            || self.mwnd.window.name_window_size != name_window_size
+            || self.mwnd.window.name_window_rect != name_window_rect
+            || self.mwnd.window.name_message_pos != name_message_pos
+            || self.mwnd.window.name_message_pos_rep != name_message_pos_rep
+            || self.mwnd.window.name_message_margin != name_message_margin;
+
+        self.mwnd.window.pos = next_pos;
+        self.mwnd.window.size = next_size;
+        self.mwnd.window.message_pos = next_message_pos;
         self.mwnd.window.message_margin = message_margin;
         self.mwnd.window.moji_cnt = window_moji_cnt;
         self.mwnd.window.moji_size = moji_size;
@@ -2536,15 +2567,15 @@ impl UiRuntime {
         self.mwnd.window.name_message_margin = name_message_margin;
         self.mwnd.face.rep_pos = rep_pos;
         self.mwnd.msg.slide_enabled = slide_enabled;
-        self.mwnd.msg.slide_time_ms = slide_time.max(0) as u64;
+        self.mwnd.msg.slide_time_ms = next_slide_time_ms;
         let new_face = face_file.filter(|s| !s.is_empty()).map(str::to_string);
         if self.mwnd.face.file != new_face || self.mwnd.face.no != face_no {
             self.mwnd.face.file = new_face;
             self.mwnd.face.no = face_no;
             self.mwnd.face.image = None;
         }
-        self.mwnd.msg.text_dirty = true;
-        self.mwnd.name.text_dirty = true;
+        self.mwnd.msg.text_dirty |= msg_layout_changed;
+        self.mwnd.name.text_dirty |= name_layout_changed;
     }
 
     pub fn clear_mwnd_window_state(&mut self) {
@@ -2888,7 +2919,7 @@ impl UiRuntime {
         images: &mut crate::image_manager::ImageManager,
         project_dir: &Path,
     ) {
-        if let Some(id) = self.mwnd.waku.bg_image {
+        if let Some(ref id) = self.mwnd.waku.bg_image {
             if self.mwnd.waku.bg_size.is_none() {
                 if let Some(img) = images.get(id) {
                     self.mwnd.waku.bg_size = Some((img.width, img.height));
@@ -2908,7 +2939,7 @@ impl UiRuntime {
                     } else if let Ok(id) = images.load_bg(raw) {
                         self.mwnd.waku.bg_image = Some(id);
                     }
-                    if let Some(id) = self.mwnd.waku.bg_image {
+                    if let Some(ref id) = self.mwnd.waku.bg_image {
                         if let Some(img) = images.get(id) {
                             self.mwnd.waku.bg_size = Some((img.width, img.height));
                         }
@@ -2930,7 +2961,7 @@ impl UiRuntime {
                     } else if let Ok(id) = images.load_bg(raw) {
                         self.mwnd.waku.filter_image = Some(id);
                     }
-                    if let Some(id) = self.mwnd.waku.filter_image {
+                    if let Some(ref id) = self.mwnd.waku.filter_image {
                         if let Some(img) = images.get(id) {
                             self.mwnd.waku.filter_size = Some((img.width, img.height));
                         }
@@ -3043,12 +3074,12 @@ impl UiRuntime {
             }
         }
 
-        self.mwnd.key_icon.image = loaded;
+        self.mwnd.key_icon.image = loaded.clone();
         self.mwnd.key_icon.file = Some(raw);
         self.mwnd.key_icon.cached_mode = self.mwnd.key_icon.mode;
         self.mwnd.key_icon.cached_pat = pat;
         self.mwnd.key_icon.size =
-            loaded.and_then(|id| images.get(id).map(|img| (img.width, img.height)));
+            loaded.as_ref().and_then(|id| images.get(id).map(|img| (img.width, img.height)));
     }
 
     fn refresh_emoji_images(
@@ -3138,7 +3169,7 @@ impl UiRuntime {
             if glyph.shadow {
                 if let Some(render) = font_cache.render_single_glyph_layer_into(
                     images,
-                    runtime.shadow_image,
+                    runtime.shadow_image.clone(),
                     positioned,
                     TextSpriteLayer::Shadow,
                 ) {
@@ -3156,7 +3187,7 @@ impl UiRuntime {
             if glyph.fuchi {
                 if let Some(render) = font_cache.render_single_glyph_layer_into(
                     images,
-                    runtime.fuchi_image,
+                    runtime.fuchi_image.clone(),
                     positioned,
                     TextSpriteLayer::Fuchi,
                 ) {
@@ -3173,7 +3204,7 @@ impl UiRuntime {
 
             if let Some(render) = font_cache.render_single_glyph_layer_into(
                 images,
-                runtime.body_image,
+                runtime.body_image.clone(),
                 positioned,
                 TextSpriteLayer::Body,
             ) {
@@ -3202,7 +3233,7 @@ impl UiRuntime {
                 self.mwnd.msg.shadow_image = if msg_style.shadow {
                     self.font_cache.render_mwnd_text_layer_styled_into(
                         images,
-                        self.mwnd.msg.shadow_image,
+                        self.mwnd.msg.shadow_image.clone(),
                         &visible_text,
                         font_size,
                         mw,
@@ -3218,7 +3249,7 @@ impl UiRuntime {
                 self.mwnd.msg.fuchi_image = if msg_style.fuchi {
                     self.font_cache.render_mwnd_text_layer_styled_into(
                         images,
-                        self.mwnd.msg.fuchi_image,
+                        self.mwnd.msg.fuchi_image.clone(),
                         &visible_text,
                         font_size,
                         mw,
@@ -3233,7 +3264,7 @@ impl UiRuntime {
                 };
                 self.mwnd.msg.text_image = self.font_cache.render_mwnd_text_layer_styled_into(
                     images,
-                    self.mwnd.msg.text_image,
+                    self.mwnd.msg.text_image.clone(),
                     &visible_text,
                     font_size,
                     mw,
@@ -3275,7 +3306,7 @@ impl UiRuntime {
                 self.mwnd.name.shadow_image = if name_style.shadow {
                     self.font_cache.render_mwnd_text_layer_styled_into(
                         images,
-                        self.mwnd.name.shadow_image,
+                        self.mwnd.name.shadow_image.clone(),
                         name_text,
                         font_size,
                         mw,
@@ -3291,7 +3322,7 @@ impl UiRuntime {
                 self.mwnd.name.fuchi_image = if name_style.fuchi {
                     self.font_cache.render_mwnd_text_layer_styled_into(
                         images,
-                        self.mwnd.name.fuchi_image,
+                        self.mwnd.name.fuchi_image.clone(),
                         name_text,
                         font_size,
                         mw,
@@ -3306,7 +3337,7 @@ impl UiRuntime {
                 };
                 self.mwnd.name.text_image = self.font_cache.render_mwnd_text_layer_styled_into(
                     images,
-                    self.mwnd.name.text_image,
+                    self.mwnd.name.text_image.clone(),
                     name_text,
                     font_size,
                     mw,
@@ -3350,8 +3381,8 @@ impl UiRuntime {
             self.editbox.focused_bg_image = Some(images.solid_rgba((0, 120, 215, 255)));
         }
 
-        let normal_bg_image = self.editbox.bg_image;
-        let focused_bg_image = self.editbox.focused_bg_image;
+        let normal_bg_image = &self.editbox.bg_image;
+        let focused_bg_image = &self.editbox.focused_bg_image;
         let mut active_keys: Vec<(u32, usize)> = Vec::new();
         for (form_id, list) in editbox_lists.iter() {
             for (idx, eb) in list.boxes.iter().enumerate() {
@@ -3400,7 +3431,7 @@ impl UiRuntime {
                 {
                     entry.text_image = self.font_cache.render_editbox_into(
                         images,
-                        entry.text_image,
+                        entry.text_image.clone(),
                         &eb.text,
                         eb.cursor_pos,
                         rendered_selection,
@@ -3433,9 +3464,9 @@ impl UiRuntime {
                 {
                     s.visible = true;
                     s.image_id = if focused {
-                        focused_bg_image
+                        focused_bg_image.clone()
                     } else {
-                        normal_bg_image
+                        normal_bg_image.clone()
                     };
                     s.fit = SpriteFit::PixelRect;
                     s.size_mode = SpriteSizeMode::Explicit {
@@ -3452,7 +3483,7 @@ impl UiRuntime {
                     .and_then(|l| l.sprite_mut(text_sprite))
                 {
                     s.visible = entry.text_image.is_some();
-                    s.image_id = entry.text_image;
+                    s.image_id = entry.text_image.clone();
                     s.fit = SpriteFit::PixelRect;
                     if entry.text_image.is_some() {
                         s.size_mode = SpriteSizeMode::Intrinsic;
@@ -3645,7 +3676,7 @@ impl UiRuntime {
         images: &mut crate::image_manager::ImageManager,
         project_dir: &Path,
         file: Option<&String>,
-    ) -> Option<ImageId> {
+    ) -> Option<ImageHandle> {
         let raw = file.map(|s| s.trim()).filter(|s| !s.is_empty())?;
         if let Ok(id) = images.load_g00(raw, 0) {
             return Some(id);
@@ -3673,10 +3704,10 @@ impl UiRuntime {
         }
         button.image = Self::load_msg_back_image(images, project_dir, file);
         button.size = button
-            .image
+            .image.as_ref()
             .and_then(|id| images.get(id).map(|img| (img.width, img.height)));
         button.center = button
-            .image
+            .image.as_ref()
             .and_then(|id| images.get(id).map(|img| (img.center_x, img.center_y)));
         button.cached_file = file.cloned();
     }
@@ -3684,9 +3715,9 @@ impl UiRuntime {
     fn apply_msg_back_pct_anchor(
         sprite: &mut Sprite,
         images: &crate::image_manager::ImageManager,
-        image: Option<ImageId>,
+        image: Option<ImageHandle>,
     ) {
-        if let Some(img) = image.and_then(|id| images.get(id)) {
+        if let Some(img) = image.as_ref().and_then(|id| images.get(id)) {
             sprite.object_anchor = true;
             sprite.texture_center_x = img.center_x as f32;
             sprite.texture_center_y = img.center_y as f32;
@@ -3709,7 +3740,7 @@ impl UiRuntime {
         let sprite_id = Self::ensure_msg_back_button_sprite(layers, ui_layer, button);
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
             s.visible = button.image.is_some();
-            s.image_id = button.image;
+            s.image_id = button.image.clone();
             s.fit = SpriteFit::PixelRect;
             s.size_mode = SpriteSizeMode::Intrinsic;
             s.x = projection.window_x + pos.0;
@@ -3727,7 +3758,7 @@ impl UiRuntime {
             s.color_g = 0;
             s.color_b = 0;
             s.mask_mode = 0;
-            Self::apply_msg_back_pct_anchor(s, images, button.image);
+            Self::apply_msg_back_pct_anchor(s, images, button.image.clone());
             s.dst_clip = None;
             s.src_clip = None;
         }
@@ -3757,7 +3788,7 @@ impl UiRuntime {
         let sprite_id = Self::ensure_msg_back_button_sprite(layers, ui_layer, button);
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
             s.visible = button.image.is_some();
-            s.image_id = button.image;
+            s.image_id = button.image.clone();
             s.fit = SpriteFit::PixelRect;
             s.size_mode = SpriteSizeMode::Intrinsic;
             s.x = pos.0;
@@ -3775,7 +3806,7 @@ impl UiRuntime {
             s.color_g = 0;
             s.color_b = 0;
             s.mask_mode = 0;
-            Self::apply_msg_back_pct_anchor(s, images, button.image);
+            Self::apply_msg_back_pct_anchor(s, images, button.image.clone());
             s.dst_clip = clip;
             s.src_clip = None;
         }
@@ -3851,7 +3882,7 @@ impl UiRuntime {
 
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(waku_sprite)) {
             s.visible = self.msg_back.waku_image.is_some();
-            s.image_id = self.msg_back.waku_image;
+            s.image_id = self.msg_back.waku_image.clone();
             s.fit = SpriteFit::PixelRect;
             s.size_mode = if self.msg_back.waku_image.is_some() {
                 SpriteSizeMode::Intrinsic
@@ -3876,12 +3907,12 @@ impl UiRuntime {
             s.color_g = 0;
             s.color_b = 0;
             s.mask_mode = 0;
-            Self::apply_msg_back_pct_anchor(s, images, self.msg_back.waku_image);
+            Self::apply_msg_back_pct_anchor(s, images, self.msg_back.waku_image.clone());
             s.dst_clip = None;
             s.src_clip = None;
         }
 
-        let filter_image = self.msg_back.filter_image.or(self.msg_back.solid_filter_image);
+        let filter_image = self.msg_back.filter_image.clone().or(self.msg_back.solid_filter_image.clone());
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(filter_sprite)) {
             let (ml, mt, mr, mb) = projection.filter_margin;
             s.visible = filter_image.is_some();
@@ -3914,7 +3945,7 @@ impl UiRuntime {
             s.color_b = 0;
             s.mask_mode = 0;
             if self.msg_back.filter_image.is_some() {
-                Self::apply_msg_back_pct_anchor(s, images, self.msg_back.filter_image);
+                Self::apply_msg_back_pct_anchor(s, images, self.msg_back.filter_image.clone());
             } else {
                 s.object_anchor = false;
                 s.texture_center_x = 0.0;
@@ -3967,7 +3998,7 @@ impl UiRuntime {
             let render_text = entry.text.replace('\u{0007}', "\n");
             runtime.image = self.font_cache.render_mwnd_text_styled_into(
                 images,
-                runtime.image,
+                runtime.image.clone(),
                 &render_text,
                 projection.moji_size.max(1) as f32,
                 entry.width.max(1),
@@ -3977,7 +4008,7 @@ impl UiRuntime {
             );
             if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(sprite_id)) {
                 s.visible = runtime.image.is_some();
-                s.image_id = runtime.image;
+                s.image_id = runtime.image.clone();
                 s.fit = SpriteFit::PixelRect;
                 if runtime.image.is_some() {
                     s.size_mode = SpriteSizeMode::Intrinsic;
@@ -4152,7 +4183,7 @@ impl UiRuntime {
 
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(bg)) {
             s.visible = self.sys.active;
-            s.image_id = self.sys.bg_image;
+            s.image_id = self.sys.bg_image.clone();
             s.fit = SpriteFit::PixelRect;
             s.size_mode = SpriteSizeMode::Explicit {
                 width: w,
@@ -4165,7 +4196,7 @@ impl UiRuntime {
 
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(text)) {
             s.visible = self.sys.active && self.sys.text_image.is_some();
-            s.image_id = self.sys.text_image;
+            s.image_id = self.sys.text_image.clone();
             s.fit = SpriteFit::PixelRect;
             s.size_mode = SpriteSizeMode::Explicit {
                 width: w.saturating_sub(80),
@@ -4179,7 +4210,7 @@ impl UiRuntime {
         if self.sys.text_dirty {
             self.sys.text_image = self.font_cache.render_text_into(
                 images,
-                self.sys.text_image,
+                self.sys.text_image.clone(),
                 &self.sys.text,
                 24.0,
                 w.saturating_sub(80),
@@ -4189,7 +4220,7 @@ impl UiRuntime {
         }
         if let Some(s) = layers.layer_mut(ui_layer).and_then(|l| l.sprite_mut(text)) {
             s.visible = self.sys.active && self.sys.text_image.is_some();
-            s.image_id = self.sys.text_image;
+            s.image_id = self.sys.text_image.clone();
         }
     }
 
@@ -4251,6 +4282,34 @@ fn message_speed_ms(script: &ScriptRuntimeState, syscom: &SyscomRuntimeState) ->
         None
     } else {
         Some(speed as u64)
+    }
+}
+
+#[cfg(test)]
+mod projection_dirty_tests {
+    use super::*;
+
+    #[test]
+    fn identical_mwnd_projection_does_not_rasterize_text_again() {
+        let mut ui = UiRuntime::default();
+        let mut projection = MwndProjectionState::default();
+        projection.window_size = Some((1280, 240));
+        projection.message_pos = Some((40, 32));
+        projection.msg_text = "test".to_string();
+
+        ui.apply_mwnd_projection(&projection);
+        ui.mwnd.msg.text_dirty = false;
+        ui.mwnd.name.text_dirty = false;
+
+        ui.apply_mwnd_projection(&projection);
+
+        assert!(!ui.mwnd.msg.text_dirty);
+        assert!(!ui.mwnd.name.text_dirty);
+
+        projection.window_size = Some((1024, 240));
+        ui.apply_mwnd_projection(&projection);
+        assert!(ui.mwnd.msg.text_dirty);
+        assert!(ui.mwnd.name.text_dirty);
     }
 }
 

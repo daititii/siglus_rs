@@ -1,4 +1,4 @@
-use crate::image_manager::ImageId;
+use crate::image_manager::ImageHandle;
 
 pub type LayerId = usize;
 pub type SpriteId = usize;
@@ -117,14 +117,14 @@ impl SpriteBlend {
 
 #[derive(Debug, Clone)]
 pub struct Sprite {
-    pub image_id: Option<ImageId>,
+    pub image_id: Option<ImageHandle>,
     /// Dynamic texture produced by the Eluna Emote compositor.
     /// The outer Siglus object still uses the normal sprite pipeline.
     pub emote_render: Option<std::sync::Arc<crate::emote::EmoteRenderPacket>>,
-    pub mask_image_id: Option<ImageId>,
+    pub mask_image_id: Option<ImageHandle>,
     pub mask_offset_x: i32,
     pub mask_offset_y: i32,
-    pub tonecurve_image_id: Option<ImageId>,
+    pub tonecurve_image_id: Option<ImageHandle>,
     pub tonecurve_row: f32,
     pub tonecurve_sat: f32,
     pub fit: SpriteFit,
@@ -176,7 +176,7 @@ pub struct Sprite {
     pub fog_near: f32,
     pub fog_far: f32,
     pub fog_scroll_x: f32,
-    pub fog_texture_image_id: Option<ImageId>,
+    pub fog_texture_image_id: Option<ImageHandle>,
     pub world_no: i32,
     pub billboard: bool,
     pub mesh_file_name: Option<String>,
@@ -192,7 +192,7 @@ pub struct Sprite {
     pub wipe_fx_mode: u8,
     pub wipe_fx_params: [f32; 4],
     /// Optional secondary source texture for dual-source wipe/effect composition.
-    pub wipe_src_image_id: Option<ImageId>,
+    pub wipe_src_image_id: Option<ImageHandle>,
     pub tr: u8,
     pub mono: u8,
     pub reverse: u8,
@@ -465,7 +465,7 @@ pub struct WipeRenderPlan {
     pub wipe_type: i32,
     pub option: Vec<i32>,
     pub progress: f32,
-    pub mask_image_id: Option<ImageId>,
+    pub mask_image_id: Option<ImageHandle>,
     /// One RNG sample is chosen when WIPE starts and stays fixed for its lifetime.
     pub random_seed: u32,
 }
@@ -561,6 +561,7 @@ pub struct LayerManager {
 }
 
 impl LayerManager {
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -569,7 +570,7 @@ impl LayerManager {
         &mut self.bg
     }
 
-    pub fn set_bg_image(&mut self, image_id: ImageId) {
+    pub fn set_bg_image(&mut self, image_id: ImageHandle) {
         self.bg.image_id = Some(image_id);
         self.bg.mask_image_id = None;
         self.bg.mask_offset_x = 0;
@@ -768,9 +769,9 @@ impl LayerManager {
         let mut out = Vec::new();
 
         if self.bg.visible && self.bg.alpha > 0 && self.bg.tr > 0 {
-            if let Some(img) = self.bg.image_id {
+            if let Some(ref img) = self.bg.image_id {
                 let mut bg = self.bg.clone();
-                bg.image_id = Some(img);
+                bg.image_id = Some(img.clone());
                 out.push(RenderSprite::new(None, None, bg));
             }
         }

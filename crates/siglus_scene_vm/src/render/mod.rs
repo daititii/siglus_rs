@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::assets::load_image_any;
-use crate::image_manager::{ImageId, ImageManager};
+use crate::image_manager::{ImageHandle, ImageKey, ImageManager};
 use crate::layer::{
     ClipRect, RenderFrame, RenderSprite, SpriteBlend, SpriteFit, SpriteSizeMode,
     WipeRenderPlan,
@@ -672,7 +672,8 @@ pub struct Renderer {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     vertex_sprite2d_capacity: usize,
 
-    textures: HashMap<ImageId, GpuTexture>,
+    // Numeric keys must not own the runtime images they identify.
+    textures: HashMap<ImageKey, GpuTexture>,
     mipmap_generator: mipmap::MipmapGenerator,
     external_textures: HashMap<PathBuf, GpuTexture>,
     mesh_assets: HashMap<String, MeshAsset>,
@@ -745,7 +746,7 @@ enum RendererDebugRenderTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum RendererDebugTextureKey {
     DefaultAux,
-    Image(ImageId),
+    Image(ImageKey),
     External(PathBuf),
     RenderTarget(RendererDebugRenderTarget),
 }
@@ -832,15 +833,15 @@ enum ColorTarget<'a> {
 
 #[derive(Debug, Clone)]
 struct DrawCommand {
-    image_id: Option<ImageId>,
+    image_id: Option<ImageHandle>,
     emote_render_id: Option<u64>,
     mesh_texture_path: Option<PathBuf>,
     mesh_normal_texture_path: Option<PathBuf>,
     mesh_toon_texture_path: Option<PathBuf>,
-    mask_image_id: Option<ImageId>,
-    tonecurve_image_id: Option<ImageId>,
-    fog_image_id: Option<ImageId>,
-    wipe_src_image_id: Option<ImageId>,
+    mask_image_id: Option<ImageHandle>,
+    tonecurve_image_id: Option<ImageHandle>,
+    fog_image_id: Option<ImageHandle>,
+    wipe_src_image_id: Option<ImageHandle>,
     range: std::ops::Range<u32>,
     scissor: Option<ScissorRect>,
     pipeline_key: PipelineKey,
@@ -854,15 +855,15 @@ struct DrawCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DrawBindKey {
-    image_id: Option<ImageId>,
+    image_id: Option<ImageKey>,
     emote_render_id: Option<u64>,
     mesh_texture_path: Option<PathBuf>,
     mesh_normal_texture_path: Option<PathBuf>,
     mesh_toon_texture_path: Option<PathBuf>,
-    mask_image_id: Option<ImageId>,
-    tonecurve_image_id: Option<ImageId>,
-    fog_image_id: Option<ImageId>,
-    wipe_src_image_id: Option<ImageId>,
+    mask_image_id: Option<ImageKey>,
+    tonecurve_image_id: Option<ImageKey>,
+    fog_image_id: Option<ImageKey>,
+    wipe_src_image_id: Option<ImageKey>,
     overlay_backdrop: Option<BackdropTarget>,
     mesh_base_sampler: bool,
 }
@@ -870,15 +871,15 @@ struct DrawBindKey {
 impl DrawBindKey {
     fn from_command(cmd: &DrawCommand, overlay_backdrop: Option<BackdropTarget>) -> Self {
         Self {
-            image_id: cmd.image_id,
+            image_id: cmd.image_id.as_ref().map(|id| id.key()),
             emote_render_id: cmd.emote_render_id,
             mesh_texture_path: cmd.mesh_texture_path.clone(),
             mesh_normal_texture_path: cmd.mesh_normal_texture_path.clone(),
             mesh_toon_texture_path: cmd.mesh_toon_texture_path.clone(),
-            mask_image_id: cmd.mask_image_id,
-            tonecurve_image_id: cmd.tonecurve_image_id,
-            fog_image_id: cmd.fog_image_id,
-            wipe_src_image_id: cmd.wipe_src_image_id,
+            mask_image_id: cmd.mask_image_id.as_ref().map(|id| id.key()),
+            tonecurve_image_id: cmd.tonecurve_image_id.as_ref().map(|id| id.key()),
+            fog_image_id: cmd.fog_image_id.as_ref().map(|id| id.key()),
+            wipe_src_image_id: cmd.wipe_src_image_id.as_ref().map(|id| id.key()),
             overlay_backdrop: if matches!(
                 cmd.pipeline_key.technique.special,
                 TechniqueSpecial::Overlay
@@ -2588,8 +2589,8 @@ impl Renderer {
 
         for s in sprites {
             let sprite = &s.sprite;
-            let img_id = sprite.image_id;
-            let img = img_id.and_then(|id| images.get(id));
+            let img_id = &sprite.image_id;
+            let img = img_id.as_ref().and_then(|id| images.get(id));
             let emote_packet = sprite.emote_render.as_deref();
             let emote_render_id = if let Some(packet) = emote_packet {
                 self.emote_compositor.prepare(&self.device, &self.queue, packet)?;
@@ -2597,7 +2598,7 @@ impl Renderer {
             } else {
                 None
             };
-            let (source_width, source_height) = if let Some(img) = img {
+            let (source_width, source_height) = if let Some(img) = img.as_ref() {
                 (img.width, img.height)
             } else if let Some(packet) = emote_packet {
                 (packet.width, packet.height)
@@ -2692,17 +2693,17 @@ impl Renderer {
             let effects2 = [dark, color_rate, color_add_r, color_add_g];
             let effects3 = [color_add_b, color_r, color_g, color_b];
 
-            let has_mask = sprite.mask_image_id.and_then(|id| images.get(id)).is_some();
+            let has_mask = sprite.mask_image_id.as_ref().and_then(|id| images.get(id)).is_some();
             let has_tonecurve = sprite
-                .tonecurve_image_id
+                .tonecurve_image_id.as_ref()
                 .and_then(|id| images.get(id))
                 .is_some();
             let has_wipe_src = sprite
-                .wipe_src_image_id
+                .wipe_src_image_id.as_ref()
                 .and_then(|id| images.get(id))
                 .is_some();
             let has_fog_tex = sprite
-                .fog_texture_image_id
+                .fog_texture_image_id.as_ref()
                 .and_then(|id| images.get(id))
                 .is_some();
 
@@ -3127,24 +3128,24 @@ impl Renderer {
                     }
                     if added != 0 {
                         self.draws.push(DrawCommand {
-                            image_id: img_id,
+                            image_id: img_id.clone(),
                             emote_render_id: None,
                             mesh_texture_path: batch.texture_path.clone(),
                             mesh_normal_texture_path: batch.material.normal_texture_path.clone(),
                             mesh_toon_texture_path: batch.material.toon_texture_path.clone(),
                             mask_image_id: None,
                             tonecurve_image_id: if has_tonecurve {
-                                sprite.tonecurve_image_id
+                                sprite.tonecurve_image_id.clone()
                             } else {
                                 None
                             },
                             fog_image_id: if has_fog_tex {
-                                sprite.fog_texture_image_id
+                                sprite.fog_texture_image_id.clone()
                             } else {
                                 None
                             },
                             wipe_src_image_id: if has_wipe_src {
-                                sprite.wipe_src_image_id
+                                sprite.wipe_src_image_id.clone()
                             } else {
                                 None
                             },
@@ -3203,7 +3204,7 @@ impl Renderer {
             // logical pixel positions before any half-pixel correction, hence
             // the equivalent coordinate here is simply
             // (vertex - mask_pos + mask_center) / mask_size.
-            let mask_uv = if let Some(mask_id) = sprite.mask_image_id {
+            let mask_uv = if let Some(ref mask_id) = sprite.mask_image_id {
                 if let Some(mask_img) = images.get(mask_id) {
                     let mw = mask_img.width.max(1) as f32;
                     let mh = mask_img.height.max(1) as f32;
@@ -3405,24 +3406,24 @@ impl Renderer {
             );
 
             self.draws.push(DrawCommand {
-                image_id: img_id,
+                image_id: img_id.clone(),
                 emote_render_id,
                 mesh_texture_path: None,
                 mesh_normal_texture_path: None,
                 mesh_toon_texture_path: None,
-                mask_image_id: if has_mask { sprite.mask_image_id } else { None },
+                mask_image_id: if has_mask { sprite.mask_image_id.clone() } else { None },
                 tonecurve_image_id: if has_tonecurve {
-                    sprite.tonecurve_image_id
+                    sprite.tonecurve_image_id.clone()
                 } else {
                     None
                 },
                 fog_image_id: if has_fog_tex {
-                    sprite.fog_texture_image_id
+                    sprite.fog_texture_image_id.clone()
                 } else {
                     None
                 },
                 wipe_src_image_id: if has_wipe_src {
-                    sprite.wipe_src_image_id
+                    sprite.wipe_src_image_id.clone()
                 } else {
                     None
                 },
@@ -3460,30 +3461,26 @@ impl Renderer {
 
         let mut live_image_ids = HashSet::new();
         for cmd in &self.draws {
-            if let Some(id) = cmd.image_id {
-                live_image_ids.insert(id);
+            if let Some(ref id) = cmd.image_id {
+                live_image_ids.insert(id.key());
             }
-            if let Some(id) = cmd.mask_image_id {
-                live_image_ids.insert(id);
+            if let Some(ref id) = cmd.mask_image_id {
+                live_image_ids.insert(id.key());
             }
-            if let Some(id) = cmd.tonecurve_image_id {
-                live_image_ids.insert(id);
+            if let Some(ref id) = cmd.tonecurve_image_id {
+                live_image_ids.insert(id.key());
             }
-            if let Some(id) = cmd.fog_image_id {
-                live_image_ids.insert(id);
+            if let Some(ref id) = cmd.fog_image_id {
+                live_image_ids.insert(id.key());
             }
-            if let Some(id) = cmd.wipe_src_image_id {
-                live_image_ids.insert(id);
+            if let Some(ref id) = cmd.wipe_src_image_id {
+                live_image_ids.insert(id.key());
             }
         }
-        for id in live_image_ids.iter().copied() {
+        for id in live_image_ids {
             self.ensure_texture_uploaded(images, id)?;
         }
-        // Runtime ImageIds remain stable until scene restart. Keep uploaded
-        // textures resident for that lifetime instead of evicting everything
-        // not referenced by the current frame. PATNO/animation-heavy games
-        // otherwise bounce the same textures through create/upload every frame.
-        // Scene restart explicitly calls clear_runtime_image_textures().
+        self.organize_textures(images);
 
         let pipeline_requests: Vec<(PipelineKey, Option<PipelineKey>)> = self
             .draws
@@ -3805,8 +3802,8 @@ impl Renderer {
             return self.render_page_wipe(wipe, under);
         }
 
-        if let Some(id) = wipe.mask_image_id {
-            self.ensure_texture_uploaded(images, id)?;
+        if let Some(ref id) = wipe.mask_image_id {
+            self.ensure_texture_uploaded(images, id.key())?;
         } else {
             self.ensure_generated_wipe_mask(wipe)?;
         }
@@ -3842,8 +3839,8 @@ impl Renderer {
         let current_texture = &self.wipe_a;
         let next_texture = &self.wipe_b;
         let external_mask = wipe
-            .mask_image_id
-            .and_then(|id| self.textures.get(&id));
+            .mask_image_id.as_ref()
+            .and_then(|id| self.textures.get(&id.key()));
         let generated_mask = self.wipe_mask_cache.as_ref().map(|(_, texture)| texture);
         let mask_texture = external_mask.or(generated_mask).unwrap_or(&self.default_aux);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4024,19 +4021,19 @@ impl Renderer {
             self.debug_add_base_texture_usage(&mut pending, cmd, &format!("{role_prefix}.base"));
             self.debug_add_image_texture_usage(
                 &mut pending,
-                cmd.mask_image_id,
+                cmd.mask_image_id.as_ref(),
                 "image",
                 &format!("{role_prefix}.mask"),
             );
             self.debug_add_image_texture_usage(
                 &mut pending,
-                cmd.tonecurve_image_id,
+                cmd.tonecurve_image_id.as_ref(),
                 "image",
                 &format!("{role_prefix}.tonecurve"),
             );
             self.debug_add_image_texture_usage(
                 &mut pending,
-                cmd.fog_image_id,
+                cmd.fog_image_id.as_ref(),
                 "image",
                 &format!("{role_prefix}.fog"),
             );
@@ -4157,17 +4154,17 @@ impl Renderer {
     fn debug_add_image_texture_usage(
         &self,
         pending: &mut HashMap<RendererDebugTextureKey, PendingRendererDebugTexture>,
-        image_id: Option<ImageId>,
+        image_id: Option<&ImageHandle>,
         kind: &str,
         usage: &str,
     ) {
         if let Some(id) = image_id {
-            if let Some(tex) = self.textures.get(&id) {
+            if let Some(tex) = self.textures.get(&id.key()) {
                 self.debug_add_pending_texture_usage(
                     pending,
-                    RendererDebugTextureKey::Image(id),
+                    RendererDebugTextureKey::Image(id.key()),
                     kind,
-                    format!("ImageId({})", id.index()),
+                    format!("ImageHandle({})", id.index()),
                     tex.width,
                     tex.height,
                     tex.version,
@@ -4248,7 +4245,7 @@ impl Renderer {
                 return;
             }
         }
-        self.debug_add_image_texture_usage(pending, cmd.image_id, "image", usage);
+        self.debug_add_image_texture_usage(pending, cmd.image_id.as_ref(), "image", usage);
     }
 
     fn debug_add_aux_texture_usage(
@@ -4265,7 +4262,7 @@ impl Renderer {
             self.debug_add_render_target_usage(pending, RendererDebugRenderTarget::SceneB, usage);
             return;
         }
-        self.debug_add_image_texture_usage(pending, cmd.wipe_src_image_id, "image", usage);
+        self.debug_add_image_texture_usage(pending, cmd.wipe_src_image_id.as_ref(), "image", usage);
     }
 
     fn debug_render_target_ref(&self, target: RendererDebugRenderTarget) -> &RenderTargetTexture {
@@ -4279,7 +4276,7 @@ impl Renderer {
     fn debug_texture_key_string(key: &RendererDebugTextureKey) -> String {
         match key {
             RendererDebugTextureKey::DefaultAux => "default_aux".to_string(),
-            RendererDebugTextureKey::Image(id) => format!("image:{}", id.index()),
+            RendererDebugTextureKey::Image(id) => format!("image:{id}"),
             RendererDebugTextureKey::External(path) => format!("external:{}", path.display()),
             RendererDebugTextureKey::RenderTarget(RendererDebugRenderTarget::SceneA) => {
                 "render-target:scene_a".to_string()
@@ -4781,24 +4778,24 @@ impl Renderer {
         } else if let Some(path) = cmd.mesh_texture_path.as_deref() {
             self.external_textures
                 .get(path)
-                .or_else(|| cmd.image_id.and_then(|id| self.textures.get(&id)))
+                .or_else(|| cmd.image_id.as_ref().and_then(|id| self.textures.get(&id.key())))
                 .unwrap_or(&self.default_aux)
         } else {
-            cmd.image_id
-                .and_then(|id| self.textures.get(&id))
+            cmd.image_id.as_ref()
+                .and_then(|id| self.textures.get(&id.key()))
                 .unwrap_or(&self.default_aux)
         };
         let mask = cmd
-            .mask_image_id
-            .and_then(|id| self.textures.get(&id))
+            .mask_image_id.as_ref()
+            .and_then(|id| self.textures.get(&id.key()))
             .unwrap_or(&self.default_aux);
         let tone = cmd
-            .tonecurve_image_id
-            .and_then(|id| self.textures.get(&id))
+            .tonecurve_image_id.as_ref()
+            .and_then(|id| self.textures.get(&id.key()))
             .unwrap_or(&self.default_aux);
         let fog = cmd
-            .fog_image_id
-            .and_then(|id| self.textures.get(&id))
+            .fog_image_id.as_ref()
+            .and_then(|id| self.textures.get(&id.key()))
             .unwrap_or(&self.default_aux);
         let normal = cmd
             .mesh_normal_texture_path
@@ -4819,8 +4816,8 @@ impl Renderer {
             } else {
                 (&self.default_aux.view, &self.default_aux.sampler)
             }
-        } else if let Some(id) = cmd.wipe_src_image_id {
-            if let Some(tex) = self.textures.get(&id) {
+        } else if let Some(ref id) = cmd.wipe_src_image_id {
+            if let Some(tex) = self.textures.get(&id.key()) {
                 (&tex.view, &tex.sampler)
             } else {
                 (&self.default_aux.view, &self.default_aux.sampler)
@@ -5241,25 +5238,54 @@ impl Renderer {
         Ok(())
     }
 
-    /// Drop GPU textures that are keyed by runtime ImageId.
+    /// Drop GPU textures that are keyed by runtime ImageKey.
     ///
-    /// Scene restart reinitializes ImageManager and reuses ImageId indices from 0.
+    /// Scene restart reinitializes ImageManager and reuses ImageKey indices from 0.
     /// Keeping the old GPU cache would make a newly decoded image with the same
-    /// ImageId/version sample the previous scene's texture. External path based
+    /// ImageKey/version sample the previous scene's texture. External path based
     /// textures are intentionally kept because their keys are stable resource paths.
     pub fn clear_runtime_image_textures(&mut self) {
+        self.draws.clear();
         self.textures.clear();
+        self.clear_draw_bindings();
+    }
+
+    fn clear_draw_bindings(&mut self) {
+        for slot in &mut self.draw_gpu_slots {
+            slot.bind_group = None;
+            slot.bind_key = None;
+        }
         self.draw_bind_epoch = self.draw_bind_epoch.wrapping_add(1).max(1);
     }
 
-    fn ensure_texture_uploaded(&mut self, images: &ImageManager, id: ImageId) -> Result<()> {
-        let Some((img, version)) = images.get_entry(id) else {
+    pub fn texture_cache_bytes(&self) -> u64 {
+        self.textures
+            .values()
+            .map(|tex| u64::from(tex.width) * u64::from(tex.height) * 4 * 4 / 3)
+            .sum()
+    }
+
+    fn organize_textures(&mut self, images: &ImageManager) {
+        let before = self.textures.len();
+        self.textures.retain(|id, _| images.contains(*id));
+        if self.textures.len() != before {
+            // Bind groups also own texture views. Drop those references, not
+            // just their cache keys, when the runtime releases a resource.
+            self.clear_draw_bindings();
+        }
+    }
+
+    fn ensure_texture_uploaded(&mut self, images: &ImageManager, key: ImageKey) -> Result<()> {
+        let Some(id) = images.image_handle(key) else {
             return Ok(());
         };
-        if let Some(mut tex) = self.textures.remove(&id) {
+        let Some((img, version)) = images.get_entry(&id) else {
+            return Ok(());
+        };
+        if let Some(mut tex) = self.textures.remove(&id.key()) {
             if tex.version != version {
                 if tex.width == img.width && tex.height == img.height {
-                    self.update_texture(&mut tex, img)?;
+                    self.update_texture(&mut tex, &img)?;
                     tex.version = version;
                 } else {
                     tex = create_gpu_texture(
@@ -5267,23 +5293,23 @@ impl Renderer {
                         &self.queue,
                         &self.mipmap_generator,
                         &format!("siglus-texture-{}", id.index()),
-                        img,
+                        &img,
                         version,
                     )?;
-                    self.draw_bind_epoch = self.draw_bind_epoch.wrapping_add(1).max(1);
+                    self.clear_draw_bindings();
                 }
             }
-            self.textures.insert(id, tex);
+            self.textures.insert(id.key(), tex);
         } else {
             let tex = create_gpu_texture(
                 &self.device,
                 &self.queue,
                 &self.mipmap_generator,
                 &format!("siglus-texture-{}", id.index()),
-                img,
+                &img,
                 version,
             )?;
-            self.textures.insert(id, tex);
+            self.textures.insert(id.key(), tex);
         }
         Ok(())
     }

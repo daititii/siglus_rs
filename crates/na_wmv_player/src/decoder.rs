@@ -22,8 +22,7 @@ use crate::na_wmv2_tables::{FF_MSMP4_DC_TABLES, FF_MSMP4_MB_I_TABLE};
 use crate::na_wmv2dsp as wmv2dsp;
 use crate::vc1::{FrameType, MvMode, PictureHeader, SequenceHeader};
 use crate::vlc::{
-    cbpcy_i_vlc, cbpcy_p_vlc, dc_chroma_vlc, dc_luma_vlc, inter_tcoef_vlc, intra_tcoef_vlc,
-    mv_diff_vlc, ttblk_vlc, ttmb_vlc, unpack_rl, wmv2_cbpc_p_vlc, wmv2_cbpy_vlc,
+    unpack_rl, wmv2_cbpc_p_vlc, wmv2_cbpy_vlc,
     wmv2_tcoef_inter_vlc, wmv2_tcoef_intra_vlc, VlcTable, SCAN_INTRA, SCAN_VERT, VLC_ESCAPE,
     ZIGZAG,
 };
@@ -31,7 +30,7 @@ use crate::vlc_tree::VlcTree;
 use crate::vc1_tables::{
     ac_tables, cbpcy_vlcs, mvdata_vlcs, subblkpat_vlcs, ttblk_vlcs, ttmb_vlcs,
     Vc1AcTable, TTBLK_TO_TT, TT_4X4, TT_4X8, TT_4X8_LEFT, TT_4X8_RIGHT, TT_8X4,
-    TT_8X4_BOTTOM, TT_8X4_TOP, TT_8X8, VC1_ZZ_4X4, VC1_ZZ_4X8, VC1_ZZ_8X4,
+    TT_8X4_BOTTOM, TT_8X4_TOP, TT_8X8, VC1_ZZ_4X4,
 };
 use crate::wmv2::{Wmv2FrameHeader, Wmv2FrameType, Wmv2Params};
 
@@ -807,6 +806,11 @@ impl AcPredBuffer {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.row.fill([[0i32; 7]; 6]);
+        self.col.fill([[0i32; 7]; 6]);
+    }
+
     /// Get the AC predictor row (indices 1..7 of the reconstructed block).
     /// Returns the first row of the left neighbour (for horizontal prediction).
     pub fn pred_row(&self, mb_row: usize, mb_col: usize, blk: usize) -> [i32; 7] {
@@ -844,7 +848,7 @@ impl AcPredBuffer {
     pub fn pred_top_row(&self, mb_row: usize, mb_col: usize, blk: usize) -> [i32; 7] {
         let (r, c, b) = Self::top_neighbour(mb_row, mb_col, blk);
         let idx = r.wrapping_mul(self.mb_w).wrapping_add(c);
-        if r < self.row.len().div_ceil(self.mb_w.max(1)) && c < self.mb_w && idx < self.row.len() { self.row[idx][b] } else { [0; 7] }
+        if self.mb_w != 0 && c < self.mb_w && idx < self.row.len() { self.row[idx][b] } else { [0; 7] }
     }
 
     pub fn store_row(&mut self, mb_row: usize, mb_col: usize, blk: usize, row: [i32; 7]) {
@@ -965,98 +969,61 @@ fn mid_pred(a: i32, b: i32, c: i32) -> i32 {
     median3(a, b, c)
 }
 
-// ─── Overlap smoothing filter (Main profile) ─────────────────────────────────
-// SMPTE 421M §6.2.1.  Applied at 8×8 block boundaries post-IDCT.
+// ─── VC-1 overlap transform (Simple/Main) ───────────────────────────────────
+// SMPTE 421M §8.6. The four samples straddling each 8×8 edge are filtered
+// using the normative VC-1 overlap equations. Rounding alternates along the
+// edge exactly as vc1_h_overlap_c()/vc1_v_overlap_c() in the reference decoder.
 
-#[allow(dead_code)]
-fn overlap_filter_h(a: &mut [i16], b: &mut [i16]) {
-    // 4-tap filter across horizontal boundary between a[] and b[]
-    // a holds last 4 samples of left block, b holds first 4 of right block
-    for i in 0..4 {
-        let x0 = a[i] as i32;
-        let x1 = b[i] as i32;
-        a[i] = ((9 * x0 + 3 * x1 + 8) >> 4) as i16;
-        b[i] = ((3 * x0 + 9 * x1 + 8) >> 4) as i16;
-    }
+#[inline]
+fn vc1_overlap_pair(a: i32, b: i32, c: i32, d: i32, rnd: i32) -> (u8, u8, u8, u8) {
+    let d1 = (a - d + 3 + rnd) >> 3;
+    let d2 = (a - d + b - c + 4 - rnd) >> 3;
+    (
+        (a - d1).clamp(0, 255) as u8,
+        (b - d2).clamp(0, 255) as u8,
+        (c + d2).clamp(0, 255) as u8,
+        (d + d1).clamp(0, 255) as u8,
+    )
 }
 
-#[allow(dead_code)]
-fn overlap_filter_v(a: &mut i16, b: &mut i16) {
-    let x0 = *a as i32;
-    let x1 = *b as i32;
-    *a = ((9 * x0 + 3 * x1 + 8) >> 4) as i16;
-    *b = ((3 * x0 + 9 * x1 + 8) >> 4) as i16;
+fn vc1_overlap_plane(plane: &mut [u8], width: usize, height: usize) {
+    if width < 4 || height < 4 { return; }
+
+    // Vertical block edges (filter horizontally, one four-sample tuple per row).
+    for x in (8..width).step_by(8) {
+        if x < 2 || x + 1 >= width { continue; }
+        let mut rnd = 1i32;
+        for y in 0..height {
+            let base = y * width;
+            let (a,b,c,d) = vc1_overlap_pair(
+                plane[base+x-2] as i32, plane[base+x-1] as i32,
+                plane[base+x] as i32, plane[base+x+1] as i32, rnd);
+            plane[base+x-2]=a; plane[base+x-1]=b;
+            plane[base+x]=c; plane[base+x+1]=d;
+            rnd ^= 1;
+        }
+    }
+
+    // Horizontal block edges (filter vertically, alternating rounding per column).
+    for y in (8..height).step_by(8) {
+        if y < 2 || y + 1 >= height { continue; }
+        let mut rnd = 1i32;
+        for x in 0..width {
+            let (a,b,c,d) = vc1_overlap_pair(
+                plane[(y-2)*width+x] as i32, plane[(y-1)*width+x] as i32,
+                plane[y*width+x] as i32, plane[(y+1)*width+x] as i32, rnd);
+            plane[(y-2)*width+x]=a; plane[(y-1)*width+x]=b;
+            plane[y*width+x]=c; plane[(y+1)*width+x]=d;
+            rnd ^= 1;
+        }
+    }
 }
 
 pub fn apply_overlap_filter(frame: &mut YuvFrame) {
-    let w = frame.width as usize;
-    let h = frame.height as usize;
-    let cw = w / 2;
-    let ch = h / 2;
-
-    // Convert to i16 for filtering, then back to u8
-    let mut y_i16: Vec<i16> = frame.y.iter().map(|&v| v as i16).collect();
-
-    // Horizontal block boundaries (every 8 columns)
-    for row in 0..h {
-        for col in (8..w).step_by(8) {
-            for k in 0..4 {
-                let ia = row * w + col - 4 + k;
-                let ib = row * w + col + k;
-                if ib < y_i16.len() {
-                    let a = y_i16[ia] as i32;
-                    let b = y_i16[ib] as i32;
-                    y_i16[ia] = ((9 * a + 3 * b + 8) >> 4) as i16;
-                    y_i16[ib] = ((3 * a + 9 * b + 8) >> 4) as i16;
-                }
-            }
-        }
-    }
-
-    // Vertical block boundaries
-    for row in (8..h).step_by(8) {
-        for col in 0..w {
-            let a = y_i16[(row - 1) * w + col] as i32;
-            let b = y_i16[row * w + col] as i32;
-            y_i16[(row - 1) * w + col] = ((9 * a + 3 * b + 8) >> 4) as i16;
-            y_i16[row * w + col] = ((3 * a + 9 * b + 8) >> 4) as i16;
-        }
-    }
-
-    // Write back
-    for (dst, src) in frame.y.iter_mut().zip(y_i16.iter()) {
-        *dst = (*src).clamp(0, 255) as u8;
-    }
-
-    // Chroma (same logic, half size)
-    let mut cb_i16: Vec<i16> = frame.cb.iter().map(|&v| v as i16).collect();
-    let mut cr_i16: Vec<i16> = frame.cr.iter().map(|&v| v as i16).collect();
-    for plane in [&mut cb_i16, &mut cr_i16] {
-        for row in 0..ch {
-            for col in (8..cw).step_by(8) {
-                for k in 0..4 {
-                    let a = plane[row * cw + col - 4 + k] as i32;
-                    let b = plane[row * cw + col + k] as i32;
-                    plane[row * cw + col - 4 + k] = ((9 * a + 3 * b + 8) >> 4) as i16;
-                    plane[row * cw + col + k] = ((3 * a + 9 * b + 8) >> 4) as i16;
-                }
-            }
-        }
-        for row in (8..ch).step_by(8) {
-            for col in 0..cw {
-                let a = plane[(row - 1) * cw + col] as i32;
-                let b = plane[row * cw + col] as i32;
-                plane[(row - 1) * cw + col] = ((9 * a + 3 * b + 8) >> 4) as i16;
-                plane[row * cw + col] = ((3 * a + 9 * b + 8) >> 4) as i16;
-            }
-        }
-    }
-    for (dst, src) in frame.cb.iter_mut().zip(cb_i16.iter()) {
-        *dst = (*src).clamp(0, 255) as u8;
-    }
-    for (dst, src) in frame.cr.iter_mut().zip(cr_i16.iter()) {
-        *dst = (*src).clamp(0, 255) as u8;
-    }
+    let w=frame.width as usize; let h=frame.height as usize;
+    vc1_overlap_plane(&mut frame.y,w,h);
+    vc1_overlap_plane(&mut frame.cb,w/2,h/2);
+    vc1_overlap_plane(&mut frame.cr,w/2,h/2);
 }
 
 // ─── Motion compensation ─────────────────────────────────────────────────────
@@ -1117,9 +1084,9 @@ fn read_mquant(
     mb_y: u32,
     mb_width: u32,
     mb_height: u32,
-) -> i32 {
+) -> Result<i32> {
     if !dquant.enabled {
-        return pquant;
+        return Ok(pquant);
     }
 
     let mut mquant = pquant;
@@ -1127,44 +1094,38 @@ fn read_mquant(
     match dquant.profile {
         3 => { // DQPROFILE_ALL_MBS
             if dquant.bi_level {
-                mquant = if br.read_bit().unwrap_or(false) {
-                    -(dquant.alt_pquant as i32)
-                } else {
-                    pquant
-                };
+                let bilevel = br.read_bit().ok_or_else(|| {
+                    DecoderError::InvalidData("truncated WMV3 DQBILEVEL macroblock bit".into())
+                })?;
+                mquant = if bilevel { -(dquant.alt_pquant as i32) } else { pquant };
             } else {
-                let mqdiff = br.read_bits(3).unwrap_or(0) as i32;
+                let mqdiff = br.read_bits(3).ok_or_else(|| {
+                    DecoderError::InvalidData("truncated WMV3 MQDIFF".into())
+                })? as i32;
                 mquant = if mqdiff != 7 {
                     -pquant - mqdiff
                 } else {
-                    -(br.read_bits(5).unwrap_or(1) as i32)
+                    -(br.read_bits(5).ok_or_else(|| {
+                        DecoderError::InvalidData("truncated WMV3 MQUANT".into())
+                    })? as i32)
                 };
             }
         }
-        0 => edges = 1u8 << dquant.edge.min(3), // DQPROFILE_SINGLE_EDGE
-        1 => edges = ((3u16 << dquant.edge.min(3)) % 15) as u8, // DOUBLE_EDGES
-        2 => edges = 15, // DQPROFILE_FOUR_EDGES
+        0 => edges = 1u8 << dquant.edge.min(3),
+        1 => edges = ((3u16 << dquant.edge.min(3)) % 15) as u8,
+        2 => edges = 15,
         _ => {}
     }
 
-    if (edges & 1) != 0 && mb_x == 0 {
-        mquant = -(dquant.alt_pquant as i32);
-    }
-    if (edges & 2) != 0 && mb_y == 0 {
-        mquant = -(dquant.alt_pquant as i32);
-    }
-    if (edges & 4) != 0 && mb_x + 1 == mb_width {
-        mquant = -(dquant.alt_pquant as i32);
-    }
-    if (edges & 8) != 0 && mb_y + 1 == mb_height {
-        mquant = -(dquant.alt_pquant as i32);
-    }
+    if (edges & 1) != 0 && mb_x == 0 { mquant = -(dquant.alt_pquant as i32); }
+    if (edges & 2) != 0 && mb_y == 0 { mquant = -(dquant.alt_pquant as i32); }
+    if (edges & 4) != 0 && mb_x + 1 == mb_width { mquant = -(dquant.alt_pquant as i32); }
+    if (edges & 8) != 0 && mb_y + 1 == mb_height { mquant = -(dquant.alt_pquant as i32); }
 
     if mquant == 0 || !(-31..=31).contains(&mquant) {
-        1
-    } else {
-        mquant
+        mquant = 1;
     }
+    Ok(mquant)
 }
 
 // ─── Range Reduction / Expansion ─────────────────────────────────────────────
@@ -1257,6 +1218,39 @@ fn write_intra_block(
             }
             let idx = (by + r) * stride + (bx + c);
             plane[idx] = (128 + coeff[r * 8 + c]).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// VC-1 Simple/Main I pictures without the high-quant overlap path use
+/// put_pixels_clamped(): the inverse-transform result is already in the
+/// unsigned pixel domain and must not receive the +128 signed-block bias.
+fn write_intra_block_unsigned(
+    frame: &mut YuvFrame,
+    mb_row: u32,
+    mb_col: u32,
+    blk: usize,
+    coeff: &[i32; 64],
+) {
+    let (is_luma, bx, by, stride, ph) =
+        block_coords(mb_row, mb_col, blk, frame.width, frame.height);
+    let plane: &mut Vec<u8> = if is_luma {
+        &mut frame.y
+    } else if blk == 4 {
+        &mut frame.cb
+    } else {
+        &mut frame.cr
+    };
+    for r in 0..8 {
+        if by + r >= ph {
+            break;
+        }
+        for c in 0..8 {
+            if bx + c >= stride {
+                break;
+            }
+            let idx = (by + r) * stride + (bx + c);
+            plane[idx] = coeff[r * 8 + c].clamp(0, 255) as u8;
         }
     }
 }
@@ -2305,27 +2299,381 @@ fn vc1_scale_level(level: i32, mquant: i32, halfqp: bool, pquantizer: bool) -> i
 }
 
 #[inline(always)]
-fn vc1_rescale_ac_pred(v: i32, from_q: i32, to_q: i32, halfqp: bool) -> i32 {
-    if v == 0 || from_q == 0 || to_q == 0 || from_q == to_q {
+fn vc1_rescale_dc_pred(v: i32, current_q: i32, neighbour_q: i32) -> i32 {
+    const DQSCALE: [i32; 63] = [
+        0x40000,0x20000,0x15555,0x10000,0x0CCCD,0x0AAAB,0x09249,0x08000,
+        0x071C7,0x06666,0x05D17,0x05555,0x04EC5,0x04925,0x04444,0x04000,
+        0x03C3C,0x038E4,0x035E5,0x03333,0x030C3,0x02E8C,0x02C86,0x02AAB,
+        0x028F6,0x02762,0x025ED,0x02492,0x0234F,0x02222,0x02108,0x02000,
+        0x01F08,0x01E1E,0x01D42,0x01C72,0x01BAD,0x01AF3,0x01A42,0x0199A,
+        0x018FA,0x01862,0x017D0,0x01746,0x016C1,0x01643,0x015CA,0x01555,
+        0x014E6,0x0147B,0x01414,0x013B1,0x01352,0x012F7,0x0129E,0x01249,
+        0x011F7,0x011A8,0x0115B,0x01111,0x010C9,0x01084,0x01041,
+    ];
+    let q1 = current_q.abs().clamp(1,31);
+    let q2 = neighbour_q.abs().clamp(1,31);
+    if v == 0 || neighbour_q == 0 || q1 == q2 {
         return v;
     }
-    let fq = from_q.abs() * 2 + if from_q < 0 { 0 } else if halfqp { 1 } else { 0 } - 1;
-    let tq = to_q.abs() * 2 + if to_q < 0 { 0 } else if halfqp { 1 } else { 0 } - 1;
-    if fq <= 0 || tq <= 0 {
+    let idx = vc1_dc_scale(q1) - 1;
+    if !(0..63).contains(&idx) {
         return v;
     }
-    if v >= 0 {
-        (v * fq + tq / 2) / tq
-    } else {
-        -(((-v) * fq + tq / 2) / tq)
+    (((v as i64) * vc1_dc_scale(q2) as i64 * DQSCALE[idx as usize] as i64 + 0x20000) >> 18) as i32
+}
+
+#[inline(always)]
+fn vc1_rescale_ac_pred(v: i32, current_q: i32, neighbour_q: i32, halfqp: bool) -> i32 {
+    const DQSCALE: [i32; 63] = [
+        0x40000,0x20000,0x15555,0x10000,0x0CCCD,0x0AAAB,0x09249,0x08000,
+        0x071C7,0x06666,0x05D17,0x05555,0x04EC5,0x04925,0x04444,0x04000,
+        0x03C3C,0x038E4,0x035E5,0x03333,0x030C3,0x02E8C,0x02C86,0x02AAB,
+        0x028F6,0x02762,0x025ED,0x02492,0x0234F,0x02222,0x02108,0x02000,
+        0x01F08,0x01E1E,0x01D42,0x01C72,0x01BAD,0x01AF3,0x01A42,0x0199A,
+        0x018FA,0x01862,0x017D0,0x01746,0x016C1,0x01643,0x015CA,0x01555,
+        0x014E6,0x0147B,0x01414,0x013B1,0x01352,0x012F7,0x0129E,0x01249,
+        0x011F7,0x011A8,0x0115B,0x01111,0x010C9,0x01084,0x01041,
+    ];
+    if v == 0 || neighbour_q == 0 || current_q == neighbour_q {
+        return v;
+    }
+    let q1 = current_q.abs() * 2 + if current_q < 0 { 0 } else if halfqp { 1 } else { 0 } - 1;
+    let q2 = neighbour_q.abs() * 2 + if neighbour_q < 0 { 0 } else if halfqp { 1 } else { 0 } - 1;
+    if q1 < 1 || q1 > 63 || q2 < 1 {
+        return v;
+    }
+    (((v as i64) * (q2 as i64) * (DQSCALE[(q1 - 1) as usize] as i64) + 0x20000) >> 18) as i32
+}
+
+#[inline(always)]
+fn vc1_bfraction_scale(num: i32, den: i32) -> i32 {
+    // SMPTE 421M / FFmpeg use a fixed denominator of 256 for B-fraction
+    // motion-vector scaling.  These are not the exact mathematical fractions:
+    // e.g. 1/3 is represented by 85 and 2/3 by 170.  Using num/den directly
+    // changes rounding, especially for negative vectors, and causes visible
+    // drift/ghosting across B pictures.
+    match (num, den) {
+        (1, 2) => 128,
+        (1, 3) => 85,
+        (2, 3) => 170,
+        (1, 4) => 64,
+        (3, 4) => 192,
+        (1, 5) => 51,
+        (2, 5) => 102,
+        (3, 5) => 153,
+        (4, 5) => 204,
+        (1, 6) => 43,
+        (5, 6) => 215,
+        (1, 7) => 37,
+        (2, 7) => 74,
+        (3, 7) => 111,
+        (4, 7) => 148,
+        (5, 7) => 185,
+        (6, 7) => 222,
+        (1, 8) => 32,
+        (3, 8) => 96,
+        (5, 8) => 160,
+        (7, 8) => 224,
+        _ => 0,
     }
 }
 
 #[inline(always)]
-fn vc1_direct_scale(mv: i32, num: i32, den: i32) -> i32 {
-    if den == 0 { return 0; }
-    let prod = mv.saturating_mul(num);
-    if prod >= 0 { (prod + den / 2) / den } else { -(((-prod) + den / 2) / den) }
+fn vc1_scale_b_mv(value: i32, num: i32, den: i32, inverse: bool, quarter_sample: bool) -> i32 {
+    let mut n = vc1_bfraction_scale(num, den);
+    if inverse {
+        n -= 256;
+    }
+    // FFmpeg scale_mv(), B_FRACTION_DEN == 256.  Rust signed right shift is
+    // arithmetic, matching the C implementation for the values used here.
+    if quarter_sample {
+        (value * n + 128) >> 8
+    } else {
+        2 * ((value * n + 255) >> 9)
+    }
+}
+
+#[inline(always)]
+fn vc1_sample_clamped(src: &[u8], stride: usize, w: usize, h: usize, x: i32, y: i32) -> i32 {
+    if w == 0 || h == 0 || src.is_empty() { return 0; }
+    let xx = x.clamp(0, w as i32 - 1) as usize;
+    let yy = y.clamp(0, h as i32 - 1) as usize;
+    src[yy * stride + xx] as i32
+}
+
+#[inline(always)]
+fn vc1_mspel_raw4(a: i32, b: i32, c: i32, d: i32, mode: i32) -> i32 {
+    match mode {
+        1 => -4*a + 53*b + 18*c - 3*d,
+        2 => -a + 9*b + 9*c - d,
+        3 => -3*a + 18*b + 53*c - 4*d,
+        _ => b,
+    }
+}
+
+#[inline(always)]
+fn vc1_mspel_one(a: i32, b: i32, c: i32, d: i32, mode: i32, r: i32) -> i32 {
+    match mode {
+        1 | 3 => (vc1_mspel_raw4(a,b,c,d,mode) + 32 - r) >> 6,
+        2 => (vc1_mspel_raw4(a,b,c,d,mode) + 8 - r) >> 4,
+        _ => b,
+    }
+}
+
+fn vc1_mspel_block(
+    dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize,
+    sw: usize, sh: usize, src_x: i32, src_y: i32, bw: usize, bh: usize,
+    hmode: i32, vmode: i32, rnd: bool,
+) {
+    let rnd_i = rnd as i32;
+
+    // FFmpeg runs the normal MC path directly on the reference picture and
+    // only invokes edge emulation for blocks whose filter footprint crosses a
+    // picture boundary. The old Rust port called clamp() for every single tap,
+    // even for interior macroblocks. At 1080p that means hundreds of millions
+    // of redundant clamps/index calculations per second.
+    let x0 = src_x as i64;
+    let y0 = src_y as i64;
+    let interior_hv = x0 >= 1
+        && y0 >= 1
+        && x0 + bw as i64 + 1 < sw as i64
+        && y0 + bh as i64 + 1 < sh as i64;
+    let interior_v = x0 >= 0
+        && y0 >= 1
+        && x0 + bw as i64 <= sw as i64
+        && y0 + bh as i64 + 1 < sh as i64;
+    let interior_h = x0 >= 1
+        && y0 >= 0
+        && x0 + bw as i64 + 1 < sw as i64
+        && y0 + bh as i64 <= sh as i64;
+    let interior_copy = x0 >= 0
+        && y0 >= 0
+        && x0 + bw as i64 <= sw as i64
+        && y0 + bh as i64 <= sh as i64;
+
+    if hmode != 0 && vmode != 0 {
+        let shift_value = [0i32, 5, 1, 5];
+        let shift = (shift_value[hmode as usize] + shift_value[vmode as usize]) >> 1;
+        let r1 = (1 << (shift - 1)) + rnd_i - 1;
+        let tw = bw + 3;
+        // VC-1 luma MC is at most 16x16, so the separable-filter scratch
+        // buffer is bounded by (16 + 3) * 16. Keep it on the stack: this
+        // routine is called thousands of times per 1080p frame.
+        let mut tmp_storage = [0i32; 19 * 16];
+        let tmp = &mut tmp_storage[..tw * bh];
+
+        if interior_hv {
+            let sx = src_x as usize;
+            let sy = src_y as usize;
+            for y in 0..bh {
+                let yy = sy + y;
+                for tx in 0..tw {
+                    let x = sx + tx - 1;
+                    let raw = vc1_mspel_raw4(
+                        src[(yy - 1) * src_stride + x] as i32,
+                        src[yy * src_stride + x] as i32,
+                        src[(yy + 1) * src_stride + x] as i32,
+                        src[(yy + 2) * src_stride + x] as i32,
+                        vmode,
+                    );
+                    tmp[y * tw + tx] = (raw + r1) >> shift;
+                }
+            }
+        } else {
+            for y in 0..bh {
+                for tx in 0..tw {
+                    let x = src_x + tx as i32 - 1;
+                    let yy = src_y + y as i32;
+                    let raw = vc1_mspel_raw4(
+                        vc1_sample_clamped(src, src_stride, sw, sh, x, yy - 1),
+                        vc1_sample_clamped(src, src_stride, sw, sh, x, yy),
+                        vc1_sample_clamped(src, src_stride, sw, sh, x, yy + 1),
+                        vc1_sample_clamped(src, src_stride, sw, sh, x, yy + 2),
+                        vmode,
+                    );
+                    tmp[y * tw + tx] = (raw + r1) >> shift;
+                }
+            }
+        }
+
+        let r2 = 64 - rnd_i;
+        for y in 0..bh {
+            for x in 0..bw {
+                let i = y * tw + x;
+                let raw = vc1_mspel_raw4(tmp[i], tmp[i + 1], tmp[i + 2], tmp[i + 3], hmode);
+                dst[y * dst_stride + x] = ((raw + r2) >> 7).clamp(0, 255) as u8;
+            }
+        }
+    } else if vmode != 0 {
+        let r = 1 - rnd_i;
+        if interior_v {
+            let sx = src_x as usize;
+            let sy = src_y as usize;
+            for y in 0..bh {
+                let yy = sy + y;
+                for x in 0..bw {
+                    let xx = sx + x;
+                    let v = vc1_mspel_one(
+                        src[(yy - 1) * src_stride + xx] as i32,
+                        src[yy * src_stride + xx] as i32,
+                        src[(yy + 1) * src_stride + xx] as i32,
+                        src[(yy + 2) * src_stride + xx] as i32,
+                        vmode,
+                        r,
+                    );
+                    dst[y * dst_stride + x] = v.clamp(0, 255) as u8;
+                }
+            }
+        } else {
+            for y in 0..bh {
+                for x in 0..bw {
+                    let xx = src_x + x as i32;
+                    let yy = src_y + y as i32;
+                    let v = vc1_mspel_one(
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx, yy - 1),
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx, yy),
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx, yy + 1),
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx, yy + 2),
+                        vmode,
+                        r,
+                    );
+                    dst[y * dst_stride + x] = v.clamp(0, 255) as u8;
+                }
+            }
+        }
+    } else if hmode != 0 {
+        let r = rnd_i;
+        if interior_h {
+            let sx = src_x as usize;
+            let sy = src_y as usize;
+            for y in 0..bh {
+                let yy = sy + y;
+                let row = yy * src_stride;
+                for x in 0..bw {
+                    let xx = sx + x;
+                    let v = vc1_mspel_one(
+                        src[row + xx - 1] as i32,
+                        src[row + xx] as i32,
+                        src[row + xx + 1] as i32,
+                        src[row + xx + 2] as i32,
+                        hmode,
+                        r,
+                    );
+                    dst[y * dst_stride + x] = v.clamp(0, 255) as u8;
+                }
+            }
+        } else {
+            for y in 0..bh {
+                for x in 0..bw {
+                    let xx = src_x + x as i32;
+                    let yy = src_y + y as i32;
+                    let v = vc1_mspel_one(
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx - 1, yy),
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx, yy),
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx + 1, yy),
+                        vc1_sample_clamped(src, src_stride, sw, sh, xx + 2, yy),
+                        hmode,
+                        r,
+                    );
+                    dst[y * dst_stride + x] = v.clamp(0, 255) as u8;
+                }
+            }
+        }
+    } else if interior_copy {
+        let sx = src_x as usize;
+        let sy = src_y as usize;
+        for y in 0..bh {
+            let src_off = (sy + y) * src_stride + sx;
+            let dst_off = y * dst_stride;
+            dst[dst_off..dst_off + bw].copy_from_slice(&src[src_off..src_off + bw]);
+        }
+    } else {
+        for y in 0..bh {
+            for x in 0..bw {
+                dst[y * dst_stride + x] = vc1_sample_clamped(
+                    src,
+                    src_stride,
+                    sw,
+                    sh,
+                    src_x + x as i32,
+                    src_y + y as i32,
+                ) as u8;
+            }
+        }
+    }
+}
+
+fn vc1_bilinear_qpel_block(
+    dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize,
+    sw: usize, sh: usize, src_x: i32, src_y: i32, bw: usize, bh: usize,
+    fx: i32, fy: i32, denom: i32, rnd: bool,
+) {
+    // H.264-style chroma interpolation uses +32 before >>6 when rounded.
+    // VC-1's no-round chroma primitive is *not* +31: FFmpeg/SMPTE use
+    // +32-4 (+28) before >>6. Keep the generic half-pel case unchanged.
+    let add = if denom == 8 && rnd {
+        28
+    } else {
+        (denom * denom) / 2 - rnd as i32
+    };
+    let denom2 = denom * denom;
+    let x0 = src_x as i64;
+    let y0 = src_y as i64;
+    let interior = x0 >= 0
+        && y0 >= 0
+        && x0 + (bw as i64) < sw as i64
+        && y0 + (bh as i64) < sh as i64;
+
+    if interior {
+        let sx = src_x as usize;
+        let sy = src_y as usize;
+        let wa = (denom - fx) * (denom - fy);
+        let wb = fx * (denom - fy);
+        let wc = (denom - fx) * fy;
+        let wd = fx * fy;
+        for y in 0..bh {
+            let row0 = (sy + y) * src_stride + sx;
+            let row1 = row0 + src_stride;
+            let dst_row = y * dst_stride;
+            for x in 0..bw {
+                let v = src[row0 + x] as i32 * wa
+                    + src[row0 + x + 1] as i32 * wb
+                    + src[row1 + x] as i32 * wc
+                    + src[row1 + x + 1] as i32 * wd;
+                dst[dst_row + x] = ((v + add) / denom2).clamp(0, 255) as u8;
+            }
+        }
+    } else {
+        for y in 0..bh {
+            for x in 0..bw {
+                let xx = src_x + x as i32;
+                let yy = src_y + y as i32;
+                let a = vc1_sample_clamped(src, src_stride, sw, sh, xx, yy);
+                let b = vc1_sample_clamped(src, src_stride, sw, sh, xx + 1, yy);
+                let c = vc1_sample_clamped(src, src_stride, sw, sh, xx, yy + 1);
+                let d = vc1_sample_clamped(src, src_stride, sw, sh, xx + 1, yy + 1);
+                let v = a * (denom - fx) * (denom - fy)
+                    + b * fx * (denom - fy)
+                    + c * (denom - fx) * fy
+                    + d * fx * fy;
+                dst[y * dst_stride + x] = ((v + add) / denom2).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+fn vc1_ic_value(v: u8, lumscale: u8, lumshift: u8, chroma: bool) -> u8 {
+    let (scale, shift) = if lumscale == 0 {
+        let mut sh = (255 - 2 * lumshift as i32) << 6;
+        if lumshift > 31 { sh += 128 << 6; }
+        (-64, sh)
+    } else {
+        let sh = if lumshift > 31 { (lumshift as i32 - 64) << 6 } else { (lumshift as i32) << 6 };
+        (lumscale as i32 + 32, sh)
+    };
+    let x = if chroma { v as i32 - 128 } else { v as i32 };
+    let base = if chroma { 128 << 6 } else { 0 };
+    ((scale * x + shift + base + 32) >> 6).clamp(0,255) as u8
 }
 
 pub struct MacroblockDecoder {
@@ -2335,17 +2683,6 @@ pub struct MacroblockDecoder {
     pub height_mb: u32,
     /// Reference frame for P/B decoding
     pub ref_frame: Option<YuvFrame>,
-    // Legacy WMV3 decode-path tables retained until the VC-1 macroblock rewrite is fully switched over.
-    dc_luma: VlcTable,
-    dc_chroma: VlcTable,
-    ac_inter: [VlcTable; 4],
-    ac_intra: [VlcTable; 4],
-    cbpcy_i: VlcTable,
-    cbpcy_p: [VlcTable; 2],
-    ttmb: VlcTable,
-    ttblk: VlcTable,
-    mv_vlc: [VlcTable; 4],
-    dc_pred: DcPredBuffer,
     // Exact VC-1 Simple/Main tables and per-picture predictor state.
     vc1_ac: [Vc1AcTable; 8],
     vc1_cbpcy: [VlcTable; 4],
@@ -2364,6 +2701,7 @@ pub struct MacroblockDecoder {
     mv_pred: MvPredictor,
     vc1_bwd_anchor_mvs: Option<Vec<(i32, i32)>>,
     vc1_fwd_anchor_mvs: Option<Vec<(i32, i32)>>,
+    vc1_rnd: bool,
     // ── WMV2 VLC tables (built lazily; shared with VC-1 decode machinery) ─────
     wmv2_inter: [VlcTable; 2], // ttcoef 0-1
     wmv2_intra: [VlcTable; 2],
@@ -2491,31 +2829,6 @@ impl MacroblockDecoder {
             width_mb: (width + 15) / 16,
             height_mb: (height + 15) / 16,
             ref_frame: None,
-            dc_luma: dc_luma_vlc(),
-            dc_chroma: dc_chroma_vlc(),
-            ac_inter: [
-                inter_tcoef_vlc(0),
-                inter_tcoef_vlc(1),
-                inter_tcoef_vlc(2),
-                inter_tcoef_vlc(3),
-            ],
-            ac_intra: [
-                intra_tcoef_vlc(0),
-                intra_tcoef_vlc(1),
-                intra_tcoef_vlc(2),
-                intra_tcoef_vlc(3),
-            ],
-            cbpcy_i: cbpcy_i_vlc(),
-            cbpcy_p: [cbpcy_p_vlc(0), cbpcy_p_vlc(1)],
-            ttmb: ttmb_vlc(),
-            ttblk: ttblk_vlc(),
-            mv_vlc: [
-                mv_diff_vlc(0),
-                mv_diff_vlc(1),
-                mv_diff_vlc(2),
-                mv_diff_vlc(3),
-            ],
-            dc_pred: DcPredBuffer::new(mb_w, mb_h),
             vc1_ac: ac_tables(),
             vc1_cbpcy: cbpcy_vlcs(),
             vc1_mvdata: mvdata_vlcs(),
@@ -2533,6 +2846,7 @@ impl MacroblockDecoder {
             mv_pred: MvPredictor::new(mb_w, mb_h),
             vc1_bwd_anchor_mvs: None,
             vc1_fwd_anchor_mvs: None,
+            vc1_rnd: false,
             ref_rangeredfrm: false,
             ac_pred: AcPredBuffer::new(mb_w, mb_h),
             fwd_ref: None,
@@ -2592,6 +2906,11 @@ impl MacroblockDecoder {
         frame: &mut YuvFrame,
     ) -> Result<()> {
         match pic_hdr.frame_type {
+            FrameType::I | FrameType::BI => self.vc1_rnd = true,
+            FrameType::P => self.vc1_rnd = !self.vc1_rnd,
+            _ => {}
+        }
+        match pic_hdr.frame_type {
             FrameType::I | FrameType::BI => {
                 self.decode_intra(payload, pic_hdr, seq, frame)?;
                 if seq.overlap && pic_hdr.pquant >= 9 {
@@ -2631,11 +2950,10 @@ impl MacroblockDecoder {
             }
         }
 
-        // Post-decode: expand range if RANGEREDFRM
+        // Post-decode: expand range if RANGEREDFRM.
         if seq.rangered && pic_hdr.rangeredfrm {
             apply_rangered_expand(frame);
         }
-        self.ref_rangeredfrm = pic_hdr.rangeredfrm;
 
         // Update reference frame chain.
         // Anchor frames (I/P) become forward reference for upcoming B-frames
@@ -2645,676 +2963,903 @@ impl MacroblockDecoder {
                 // B-frames don't update the anchor chain
             }
             _ => {
-                // Current forward becomes previous, new frame becomes forward anchor
+                // Current forward becomes previous, new frame becomes forward anchor.
                 self.fwd_ref = self.bwd_ref.take();
                 self.bwd_ref = Some(frame.clone());
                 self.ref_frame = Some(frame.clone());
+                self.vc1_fwd_anchor_mvs = self.vc1_bwd_anchor_mvs.take();
+                self.vc1_bwd_anchor_mvs = Some(self.vc1_current_mvs.clone());
+                self.ref_rangeredfrm = pic_hdr.rangeredfrm;
             }
         }
         Ok(())
+    }
+
+    // ─── VC-1 Simple/Main macroblock helpers ───────────────────────────────
+
+    fn vc1_reset_picture_state(&mut self) {
+        for v in &mut self.vc1_coded_block { *v = 0; }
+        for v in &mut self.vc1_dc { *v = [0; 6]; }
+        for v in &mut self.vc1_intra_blocks { *v = [false; 6]; }
+        for v in &mut self.vc1_qscale { *v = 0; }
+        for v in &mut self.vc1_current_mvs { *v = (0, 0); }
+        for v in &mut self.vc1_mv4 { *v = [(0, 0); 4]; }
+        self.vc1_esc3_level_length = 0;
+        self.vc1_esc3_run_length = 0;
+        self.ac_pred.clear();
+    }
+
+    #[inline]
+    fn vc1_coding_sets(pic: &PictureHeader) -> (usize, usize) {
+        let intra = match pic.transacfrm2 {
+            0 => if pic.pqindex <= 8 { 6 } else { 2 },
+            1 => 0,
+            _ => 4,
+        };
+        let inter = match pic.transacfrm {
+            0 => if pic.pqindex <= 8 { 7 } else { 3 },
+            1 => 1,
+            _ => 5,
+        };
+        (intra, inter)
+    }
+
+    #[inline]
+    fn vc1_read_dc_diff(&self, br: &mut BitReader<'_>, pic: &PictureHeader, chroma: bool, quant: i32) -> Result<i32> {
+        let table = &self.wmv2_dc_vlc[pic.dctab as usize][chroma as usize];
+        let mut d = table.decode(br).ok_or_else(|| DecoderError::InvalidData("invalid WMV3 DC VLC".into()))?;
+        if d != 0 {
+            let m = if quant == 1 || quant == 2 { 3 - quant } else { 0 };
+            if d == 119 {
+                d = br.read_bits((8 + m) as u8).ok_or_else(|| DecoderError::InvalidData("truncated WMV3 DC escape".into()))? as i32;
+            } else if m != 0 {
+                let ext = br.read_bits(m as u8).ok_or_else(|| DecoderError::InvalidData("truncated WMV3 DC extension".into()))? as i32;
+                d = (d << m) + ext - ((1 << m) - 1);
+            }
+            if br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated WMV3 DC sign".into()))? { d = -d; }
+        }
+        Ok(d)
+    }
+
+    fn vc1_decode_ac_coeff(&mut self, br: &mut BitReader<'_>, set: usize, pq: i32, dquantfrm: bool) -> Result<(usize, i32, bool)> {
+        let set = set.min(7);
+        let idx = self.vc1_ac[set].decode_index(br)
+            .ok_or_else(|| DecoderError::InvalidData("invalid WMV3 AC VLC".into()))?;
+        let (run, level, last, sign) = if !self.vc1_ac[set].is_escape(idx) {
+            let (r,l)=self.vc1_ac[set].run_level(idx).ok_or_else(|| DecoderError::InvalidData("invalid WMV3 AC symbol".into()))?;
+            let sign=br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated WMV3 AC sign".into()))?;
+            (r as usize,l as i32,self.vc1_ac[set].is_last(idx),sign)
+        } else {
+            let escape=vc1_decode210_bits(br)?;
+            if escape != 2 {
+                let idx2=self.vc1_ac[set].decode_index(br).ok_or_else(|| DecoderError::InvalidData("invalid WMV3 escaped AC VLC".into()))?;
+                if self.vc1_ac[set].is_escape(idx2) { return Err(DecoderError::InvalidData("nested WMV3 AC escape".into())); }
+                let (r0,l0)=self.vc1_ac[set].run_level(idx2).ok_or_else(|| DecoderError::InvalidData("invalid WMV3 escaped AC symbol".into()))?;
+                let last=self.vc1_ac[set].is_last(idx2);
+                let (r,l)=if escape==0 {
+                    (r0 as usize, l0 as i32 + self.vc1_ac[set].max_level(last,r0 as usize) as i32)
+                } else {
+                    (r0 as usize + self.vc1_ac[set].max_run(last,l0 as usize) as usize + 1, l0 as i32)
+                };
+                let sign=br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escaped AC sign".into()))?;
+                (r,l,last,sign)
+            } else {
+                let last=br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escape3 last".into()))?;
+                if self.vc1_esc3_level_length==0 {
+                    let ll=if pq<8 || dquantfrm {
+                        let n=br.read_bits(3).ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escape3 level length".into()))? as u8;
+                        if n==0 { br.read_bits(2).ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escape3 extended level length".into()))? as u8 + 8 } else { n }
+                    } else { vc1_read_unary_stop_one(br,6)? + 2 };
+                    self.vc1_esc3_level_length=ll;
+                    self.vc1_esc3_run_length=3+br.read_bits(2).ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escape3 run length".into()))? as u8;
+                }
+                let r=br.read_bits(self.vc1_esc3_run_length).ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escape3 run".into()))? as usize;
+                let sign=br.read_bit().ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escape3 sign".into()))?;
+                let l=br.read_bits(self.vc1_esc3_level_length).ok_or_else(|| DecoderError::InvalidData("truncated WMV3 escape3 level".into()))? as i32;
+                (r,l,last,sign)
+            }
+        };
+        Ok((run, if sign { -level } else { level }, last))
+    }
+
+    #[inline]
+    fn vc1_mb_index(&self, r: usize, c: usize) -> Option<usize> {
+        if r < self.height_mb as usize && c < self.width_mb as usize { Some(r*self.width_mb as usize+c) } else { None }
+    }
+
+    fn vc1_luma_slot(&self, gx: isize, gy: isize) -> Option<(usize,usize)> {
+        if gx<0 || gy<0 { return None; }
+        let gx=gx as usize; let gy=gy as usize;
+        let c=gx/2; let r=gy/2;
+        let idx=self.vc1_mb_index(r,c)?;
+        let blk=(gy&1)*2+(gx&1);
+        Some((idx,blk))
+    }
+
+    fn vc1_dc_neighbours(&self, r: usize, c: usize, blk: usize) -> (Option<i32>,Option<i32>,Option<i32>) {
+        if blk<4 {
+            let gx=(c*2+(blk&1)) as isize; let gy=(r*2+(blk>>1)) as isize;
+            let get=|x:isize,y:isize| self.vc1_luma_slot(x,y).map(|(i,b)| self.vc1_dc[i][b]);
+            (get(gx,gy-1),get(gx-1,gy-1),get(gx-1,gy))
+        } else {
+            let get=|rr:isize,cc:isize| -> Option<i32> {
+                if rr<0||cc<0{return None;} self.vc1_mb_index(rr as usize,cc as usize).map(|i| self.vc1_dc[i][blk])
+            };
+            (get(r as isize-1,c as isize),get(r as isize-1,c as isize-1),get(r as isize,c as isize-1))
+        }
+    }
+
+    fn vc1_i_dc_pred(&self, r:usize,c:usize,blk:usize, seq:&SequenceHeader, pq:i32) -> (i32,bool) {
+        const DCPRED:[i32;32]=[-1,1024,512,341,256,205,171,146,128,114,102,93,85,79,73,68,64,60,57,54,51,49,47,45,43,41,39,38,37,35,34,33];
+        let (oa,ob,oc)=self.vc1_dc_neighbours(r,c,blk);
+        let boundary=if pq<9 || !seq.overlap { DCPRED[vc1_dc_scale(pq) as usize] } else { 0 };
+        let a=oa.unwrap_or(boundary); let b=ob.unwrap_or(boundary); let cc=oc.unwrap_or(boundary);
+        if (a-b).abs() <= (b-cc).abs() { (cc,true) } else { (a,false) }
+    }
+
+    fn vc1_intra_neighbour(&self, r:usize,c:usize,blk:usize, top:bool) -> Option<(usize,usize)> {
+        if blk<4 {
+            let gx=(c*2+(blk&1)) as isize; let gy=(r*2+(blk>>1)) as isize;
+            let (x,y)=if top {(gx,gy-1)} else {(gx-1,gy)};
+            self.vc1_luma_slot(x,y)
+        } else {
+            let (rr,cc)=if top {(r as isize-1,c as isize)} else {(r as isize,c as isize-1)};
+            if rr<0||cc<0{return None;} self.vc1_mb_index(rr as usize,cc as usize).map(|i|(i,blk))
+        }
+    }
+
+    fn vc1_inter_dc_pred(&self,r:usize,c:usize,blk:usize,mquant:i32,_halfqp:bool)->(i32,bool,bool,bool,i32) {
+        let cur_idx=self.vc1_mb_index(r,c).unwrap_or(0);
+        let top_slot=self.vc1_intra_neighbour(r,c,blk,true);
+        let left_slot=self.vc1_intra_neighbour(r,c,blk,false);
+        let diag_slot=if blk<4 {
+            let gx=(c*2+(blk&1)) as isize;
+            let gy=(r*2+(blk>>1)) as isize;
+            self.vc1_luma_slot(gx-1,gy-1)
+        } else if r>0 && c>0 {
+            self.vc1_mb_index(r-1,c-1).map(|i|(i,blk))
+        } else {
+            None
+        };
+        let a_av=top_slot.map(|(i,b)|self.vc1_intra_blocks[i][b]).unwrap_or(false);
+        let c_av=left_slot.map(|(i,b)|self.vc1_intra_blocks[i][b]).unwrap_or(false);
+        let mut a=top_slot.filter(|(i,b)|self.vc1_intra_blocks[*i][*b]).map(|(i,b)|self.vc1_dc[i][b]).unwrap_or(0);
+        let mut cc=left_slot.filter(|(i,b)|self.vc1_intra_blocks[*i][*b]).map(|(i,b)|self.vc1_dc[i][b]).unwrap_or(0);
+        let mut b=diag_slot.map(|(i,b)|self.vc1_dc[i][b]).unwrap_or(0);
+        if a_av {
+            if let Some((i,_))=top_slot { a=vc1_rescale_dc_pred(a,mquant,self.vc1_qscale[i]); }
+        }
+        if c_av {
+            if let Some((i,_))=left_slot { cc=vc1_rescale_dc_pred(cc,mquant,self.vc1_qscale[i]); }
+        }
+        // ff_vc1_pred_dc rescales B only when both directional predictors
+        // are available and block 3 is not being decoded.
+        if a_av && c_av && blk!=3 {
+            if let Some((i,_))=diag_slot { b=vc1_rescale_dc_pred(b,mquant,self.vc1_qscale[i]); }
+        }
+        let (pred,left)=if c_av && (!a_av || (a-b).abs() <= (b-cc).abs()) {
+            (cc,true)
+        } else if a_av {
+            (a,false)
+        } else {
+            (0,true)
+        };
+        let q2=if left {
+            left_slot.map(|(i,_)|self.vc1_qscale[i]).unwrap_or(self.vc1_qscale[cur_idx])
+        } else {
+            top_slot.map(|(i,_)|self.vc1_qscale[i]).unwrap_or(self.vc1_qscale[cur_idx])
+        };
+        (pred,left,a_av,c_av,q2)
+    }
+
+    fn vc1_decode_intra_coeffs(&mut self,br:&mut BitReader<'_>,pic:&PictureHeader,seq:&SequenceHeader,r:usize,c:usize,blk:usize,coded:bool,mquant:i32,acpred:bool,pure_i:bool,set:usize)->Result<[i32;64]> {
+        let quant=mquant.abs().clamp(1,31);
+        let dc_diff=self.vc1_read_dc_diff(br,pic,blk>=4,quant)?;
+        let (pred,mut left,a_av,c_av,q2)=if pure_i {
+            let (p,l)=self.vc1_i_dc_pred(r,c,blk,seq,quant); (p,l,true,true,mquant)
+        } else { self.vc1_inter_dc_pred(r,c,blk,mquant,pic.halfqp) };
+        if !pure_i { if !a_av {left=true;} if !c_av {left=false;} }
+        let use_pred=acpred && (pure_i || a_av || c_av);
+        let dc=pred+dc_diff;
+        let mbi=self.vc1_mb_index(r,c).unwrap();
+        self.vc1_dc[mbi][blk]=dc;
+        self.vc1_intra_blocks[mbi][blk]=true;
+        let mut coeff=[0i32;64];
+        coeff[0]=dc*vc1_dc_scale(quant);
+        if coded {
+            let scan:&[usize;64]=if pure_i {
+                if use_pred { if left {&FF_WMV1_SCANTABLE[3]} else {&FF_WMV1_SCANTABLE[2]} } else {&FF_WMV1_SCANTABLE[1]}
+            } else { &FF_WMV1_SCANTABLE[0] };
+            let mut pos=1usize; let mut last=false;
+            while !last && pos<64 {
+                let (run,level,l)=self.vc1_decode_ac_coeff(br,set,pic.pquant as i32,pic.dquant.enabled)?;
+                let at=pos.saturating_add(run); if at>63 {break;} coeff[scan[at]]=level; pos=at+1; last=l;
+            }
+        }
+        if use_pred {
+            if left {
+                let mut p=self.ac_pred.pred_left_col(r,c,blk);
+                if !pure_i && q2!=0 && q2!=mquant { for v in &mut p {*v=vc1_rescale_ac_pred(*v,mquant,q2,pic.halfqp);} }
+                for k in 1..8 { coeff[k*8]+=p[k-1]; }
+            } else {
+                let mut p=self.ac_pred.pred_top_row(r,c,blk);
+                if !pure_i && q2!=0 && q2!=mquant { for v in &mut p {*v=vc1_rescale_ac_pred(*v,mquant,q2,pic.halfqp);} }
+                for k in 1..8 { coeff[k]+=p[k-1]; }
+            }
+        }
+        self.ac_pred.store_row(r,c,blk,[coeff[1],coeff[2],coeff[3],coeff[4],coeff[5],coeff[6],coeff[7]]);
+        self.ac_pred.store_col(r,c,blk,[coeff[8],coeff[16],coeff[24],coeff[32],coeff[40],coeff[48],coeff[56]]);
+        for k in 1..64 { if coeff[k]!=0 { coeff[k]=vc1_scale_level(coeff[k],mquant,pic.halfqp,pic.pqual_mode!=0); } }
+        Ok(coeff)
+    }
+
+    fn vc1_coded_block_pred(&mut self,r:usize,c:usize,blk:usize,diff:bool)->bool {
+        let bw=self.width_mb as usize*2; let x=c*2+(blk&1); let y=r*2+(blk>>1); let idx=y*bw+x;
+        let a=if x>0 {self.vc1_coded_block[idx-1]} else {0};
+        let b=if x>0&&y>0 {self.vc1_coded_block[idx-bw-1]} else {0};
+        let cc=if y>0 {self.vc1_coded_block[idx-bw]} else {0};
+        let pred=if b==cc {a} else {cc}; let v=pred ^ diff as u8; self.vc1_coded_block[idx]=v; v!=0
+    }
+
+    fn vc1_read_mvdata(
+        &self,
+        br: &mut BitReader<'_>,
+        pic: &PictureHeader,
+        quarter_sample: bool,
+    ) -> Result<Vc1MvData> {
+        let vlc_bit = br.bits_read();
+        let sym = self.vc1_mvdata[(pic.mvtab as usize).min(3)]
+            .decode(br)
+            .ok_or_else(|| {
+                DecoderError::InvalidData(format!(
+                    "invalid WMV3 MVDATA VLC at bit {vlc_bit} (left={})",
+                    br.bits_left()
+                ))
+            })?;
+        let mut index = 1 + sym;
+        let has_coeffs = index > 36;
+        if has_coeffs {
+            index -= 37;
+        }
+        if index == 0 {
+            return Ok(Vc1MvData { dx: 0, dy: 0, intra: false, has_coeffs });
+        }
+
+        let (_, _, _, _, kx, ky) = self.vc1_mv_params(pic);
+        if index == 35 {
+            let xb = (kx - 1 + quarter_sample as i32) as u8;
+            let yb = (ky - 1 + quarter_sample as i32) as u8;
+            let xbit = br.bits_read();
+            let dx = br.read_bits(xb).ok_or_else(|| {
+                DecoderError::InvalidData(format!(
+                    "truncated WMV3 MVDATA x escape at bit {xbit}: need {xb}, left={}",
+                    br.bits_left()
+                ))
+            })? as i32;
+            let ybit = br.bits_read();
+            let dy = br.read_bits(yb).ok_or_else(|| {
+                DecoderError::InvalidData(format!(
+                    "truncated WMV3 MVDATA y escape at bit {ybit}: need {yb}, left={}",
+                    br.bits_left()
+                ))
+            })? as i32;
+            return Ok(Vc1MvData { dx, dy, intra: false, has_coeffs });
+        }
+        if index == 36 {
+            return Ok(Vc1MvData { dx: 0, dy: 0, intra: true, has_coeffs });
+        }
+
+        const SIZE: [i32; 6] = [0, 2, 3, 4, 5, 8];
+        const OFF: [i32; 6] = [0, 1, 3, 7, 15, 31];
+        let dec = |br: &mut BitReader<'_>, g: i32, axis: char| -> Result<i32> {
+            let gi = g as usize;
+            let mut out = OFF[gi];
+            let n = SIZE[gi] - ((!quarter_sample && gi == 5) as i32);
+            if n > 0 {
+                let bit = br.bits_read();
+                let v = br.read_bits(n as u8).ok_or_else(|| {
+                    DecoderError::InvalidData(format!(
+                        "truncated WMV3 MVDATA {axis} component at bit {bit}: index={index} group={gi} need={n}, left={}",
+                        br.bits_left()
+                    ))
+                })? as i32;
+                let sign = -(v & 1);
+                out = (sign ^ ((v >> 1) + out)) - sign;
+            }
+            Ok(out)
+        };
+        Ok(Vc1MvData {
+            dx: dec(br, index % 6, 'x')?,
+            dy: dec(br, index / 6, 'y')?,
+            intra: false,
+            has_coeffs,
+        })
+    }
+
+    #[inline]
+    fn vc1_mv_params(&self, pic: &PictureHeader) -> (bool, bool, i32, i32, i32, i32) {
+        let mode = if pic.mv_mode == MvMode::IntensityComp {
+            pic.mv_mode2
+        } else {
+            pic.mv_mode
+        };
+        let quarter = !matches!(mode, MvMode::OneMvHpel | MvMode::OneMvHpelBilin);
+        let mspel = mode != MvMode::OneMvHpelBilin;
+
+        // FFmpeg ff_vc1_parse_frame_header():
+        //   k_x = mvrange + 9 + (mvrange >> 1)
+        //   k_y = mvrange + 8
+        // Thus MVRANGE=0 is 9/8, not 10/9.  The old values make an escape
+        // MVDATA component consume one bit too many and desynchronise the MB layer.
+        let r = pic.mvrange as i32;
+        let mut kx = r + 9 + (r >> 1);
+        let mut ky = r + 8;
+        if self.width < 120 {
+            kx = 9;
+        }
+        if self.height < 60 {
+            ky = 8;
+        }
+        (quarter, mspel, 1 << (kx - 1), 1 << (ky - 1), kx, ky)
+    }
+
+    fn vc1_predict_p_mv(
+        &mut self,
+        br: &mut BitReader<'_>,
+        pic: &PictureHeader,
+        seq: &SequenceHeader,
+        r: usize,
+        c: usize,
+        n: usize,
+        dmv: (i32, i32),
+        mv1: bool,
+        intra: bool,
+    ) -> Result<(i32, i32)> {
+        let (quarter, _, rx, ry, _, _) = self.vc1_mv_params(pic);
+        let mut dx = dmv.0;
+        let mut dy = dmv.1;
+        if !quarter {
+            dx *= 2;
+            dy *= 2;
+        }
+
+        let idx = self.vc1_mb_index(r, c).unwrap();
+        if intra {
+            self.vc1_mv4[idx][n] = (0, 0);
+            if mv1 {
+                self.vc1_mv4[idx] = [(0, 0); 4];
+                self.vc1_current_mvs[idx] = (0, 0);
+            }
+            return Ok((0, 0));
+        }
+
+        let gx = (c * 2 + (n & 1)) as isize;
+        let gy = (r * 2 + (n >> 1)) as isize;
+
+        // A = above, B = above-right/above-left according to block number,
+        // C = left. Keep the slots as well as the vectors because VC-1 hybrid
+        // prediction tests the exact A/C block's intra state.
+        let a_slot = self.vc1_luma_slot(gx, gy - 1);
+        let c_slot = self.vc1_luma_slot(gx - 1, gy);
+        let boff: isize = if mv1 {
+            if c + 1 >= self.width_mb as usize { -1 } else { 2 }
+        } else {
+            match n {
+                0 => {
+                    if seq.res_rtm_flag {
+                        if c > 0 { -1 } else { 1 }
+                    } else {
+                        // With our compact 2*mb_width luma grid this is the
+                        // progressive equivalent of FFmpeg's
+                        // 2*mb_width - b8_stride - 1.
+                        -2
+                    }
+                }
+                1 => if c + 1 >= self.width_mb as usize { -1 } else { 1 },
+                2 => 1,
+                _ => -1,
+            }
+        };
+        let b_slot = self.vc1_luma_slot(gx + boff, gy - 1);
+
+        let a = a_slot.map(|(mi, bi)| self.vc1_mv4[mi][bi]);
+        let b = b_slot.map(|(mi, bi)| self.vc1_mv4[mi][bi]);
+        let cc = c_slot.map(|(mi, bi)| self.vc1_mv4[mi][bi]);
+        let vals = [a.unwrap_or((0, 0)), b.unwrap_or((0, 0)), cc.unwrap_or((0, 0))];
+        let valid = (a.is_some() as usize) + (b.is_some() as usize) + (cc.is_some() as usize);
+        let (mut px, mut py) = if valid > 1 {
+            (
+                median3(vals[0].0, vals[1].0, vals[2].0),
+                median3(vals[0].1, vals[1].1, vals[2].1),
+            )
+        } else if let Some(v) = a {
+            v
+        } else if let Some(v) = cc {
+            v
+        } else {
+            b.unwrap_or((0, 0))
+        };
+
+        // Pullback, SMPTE 421M 8.3.5.3.4.
+        let lim = if mv1 { -60 } else { -28 };
+        let qx = ((c as i32) << 6) + if !mv1 && matches!(n, 1 | 3) { 32 } else { 0 };
+        let qy = ((r as i32) << 6) + if !mv1 && matches!(n, 2 | 3) { 32 } else { 0 };
+        let xx = ((self.width_mb as i32) << 6) - 4;
+        let yy = ((self.height_mb as i32) << 6) - 4;
+        if qx + px < lim { px = lim - qx; }
+        if qy + py < lim { py = lim - qy; }
+        if qx + px > xx { px = xx - qx; }
+        if qy + py > yy { py = yy - qy; }
+
+        // Hybrid prediction, SMPTE 421M 8.3.5.3.5 / FFmpeg ff_vc1_pred_mv().
+        // This is a bitstream operation, not merely a predictor choice: both A
+        // and C tests can independently require consumption of HYBRIDPRED.
+        // The previous port only implemented the A test. If A did not cross
+        // the threshold but C did, one bit was left unread and every following
+        // macroblock was shifted by one bit, eventually ending in truncated
+        // MVDATA.
+        if let (Some(av), Some(cv)) = (a, cc) {
+            let a_intra = a_slot
+                .map(|(mi, bi)| self.vc1_intra_blocks[mi][bi])
+                .unwrap_or(false);
+            let c_intra = c_slot
+                .map(|(mi, bi)| self.vc1_intra_blocks[mi][bi])
+                .unwrap_or(false);
+
+            let mut sum = if a_intra {
+                px.abs() + py.abs()
+            } else {
+                (px - av.0).abs() + (py - av.1).abs()
+            };
+
+            let mut need_hybrid_bit = sum > 32;
+            if !need_hybrid_bit {
+                sum = if c_intra {
+                    px.abs() + py.abs()
+                } else {
+                    (px - cv.0).abs() + (py - cv.1).abs()
+                };
+                need_hybrid_bit = sum > 32;
+            }
+
+            if need_hybrid_bit {
+                if br
+                    .read_bit()
+                    .ok_or_else(|| DecoderError::InvalidData("truncated WMV3 HYBRIDPRED".into()))?
+                {
+                    (px, py) = av;
+                } else {
+                    (px, py) = cv;
+                }
+            }
+        }
+
+        let mv = (
+            ((px + dx + rx) & ((rx << 1) - 1)) - rx,
+            ((py + dy + ry) & ((ry << 1) - 1)) - ry,
+        );
+        self.vc1_mv4[idx][n] = mv;
+        if mv1 {
+            self.vc1_mv4[idx] = [mv; 4];
+            self.vc1_current_mvs[idx] = mv;
+        } else if n == 0 {
+            self.vc1_current_mvs[idx] = mv;
+        }
+        Ok(mv)
+    }
+
+    fn vc1_decode_p_residual(&mut self,br:&mut BitReader<'_>,pic:&PictureHeader,seq:&SequenceHeader,mquant:i32,ttmb:i32,first_block:bool)->Result<([i32;64],u8)> {
+        let tt_index=((pic.pquant>4) as usize)+((pic.pquant>12) as usize);
+        let mut tt=if ttmb<0 {let sym=self.vc1_ttblk[tt_index].decode(br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 TTBLK".into()))? as usize;TTBLK_TO_TT[tt_index][sym.min(7)]}else{(ttmb as u8)&7};
+        let mut sub=0u8;
+        if tt==TT_4X4 {let sym=self.vc1_subblkpat[tt_index].decode(br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 SUBBLKPAT".into()))? as u8;sub=(!(sym.wrapping_add(1)))&0x0f;}
+        if tt!=TT_8X8&&tt!=TT_4X4&&((pic.ttmbf||(ttmb>=0&&((ttmb as u8)&8)!=0&&!first_block))||(!seq.res_rtm_flag&&!first_block)) {sub=vc1_decode012_bits(br)?;if sub!=0{sub^=3;}if matches!(tt,TT_8X4_TOP|TT_8X4_BOTTOM){tt=TT_8X4;}if matches!(tt,TT_4X8_LEFT|TT_4X8_RIGHT){tt=TT_4X8;}}
+        if tt==TT_8X4_TOP||tt==TT_8X4_BOTTOM{sub=2-(tt==TT_8X4_TOP) as u8;tt=TT_8X4;}if tt==TT_4X8_LEFT||tt==TT_4X8_RIGHT{sub=2-(tt==TT_4X8_LEFT) as u8;tt=TT_4X8;}
+        let (_,set)=Self::vc1_coding_sets(pic);let mut out=[0i32;64];
+        let mut decode_part=|this:&mut Self,scan:&[usize],base:usize,limit:usize,already_last:bool|->Result<()> {if already_last{return Ok(());}let mut pos=0usize;let mut last=false;while !last&&pos<limit{let(run,lev,l)=this.vc1_decode_ac_coeff(br,set,pic.pquant as i32,pic.dquant.enabled)?;let at=pos.saturating_add(run);if at>=limit{break;}let idx=base+scan[at];if idx<64{out[idx]=vc1_scale_level(lev,mquant,pic.halfqp,pic.pqual_mode!=0);}pos=at+1;last=l;}Ok(())};
+        match tt {TT_8X8=>decode_part(self,&FF_WMV1_SCANTABLE[0],0,64,false)?,TT_4X4=>{for j in 0..4{let base=(j&1)*4+(j&2)*16;decode_part(self,&VC1_ZZ_4X4,base,16,(sub&(1<<(3-j)))!=0)?;}},TT_8X4=>{for j in 0..2{decode_part(self,&FF_WMV2_SCANTABLE_A, j*32,32,(sub&(1<<(1-j)))!=0)?;}},TT_4X8=>{for j in 0..2{decode_part(self,&FF_WMV2_SCANTABLE_B,j*4,32,(sub&(1<<(1-j)))!=0)?;}},_=>{}}
+        apply_idct(&mut out,tt);Ok((out,tt))
+    }
+
+    fn vc1_mc_single(
+        &self,
+        frame: &mut YuvFrame,
+        r: usize,
+        c: usize,
+        reference: &YuvFrame,
+        mv: (i32, i32),
+        pic: &PictureHeader,
+        seq: &SequenceHeader,
+        block: Option<usize>,
+    ) {
+        let (quarter, mspel, _, _, _, _) = self.vc1_mv_params(pic);
+        let mx = mv.0;
+        let my = mv.1;
+        if !quarter {
+            // Motion vectors are already stored internally in qpel units by
+            // vc1_predict_p_mv(). Nothing to rescale here.
+        }
+
+        let (bx, by, bw, bh) = if let Some(n) = block {
+            (c * 16 + (n & 1) * 8, r * 16 + (n >> 1) * 8, 8usize, 8usize)
+        } else {
+            (c * 16, r * 16, 16usize, 16usize)
+        };
+
+        // The caller prepares picture-level intensity compensation once.
+        // Motion compensation itself must never rebuild a full reference frame
+        // per macroblock.
+        let src_y = reference.y.as_slice();
+
+        let sx = bx as i32 + (mx >> 2);
+        let sy = by as i32 + (my >> 2);
+        let fx = mx & 3;
+        let fy = my & 3;
+        // A macroblock prediction is at most 16x16. Avoid one heap
+        // allocation for every 1MV/4MV luma prediction.
+        let mut tmp_storage = [0u8; 16 * 16];
+        let tmp = &mut tmp_storage[..bw * bh];
+        if mspel {
+            vc1_mspel_block(
+                tmp,
+                bw,
+                src_y,
+                self.width as usize,
+                self.width as usize,
+                self.height as usize,
+                sx,
+                sy,
+                bw,
+                bh,
+                fx,
+                fy,
+                self.vc1_rnd,
+            );
+        } else {
+            vc1_bilinear_qpel_block(
+                tmp,
+                bw,
+                src_y,
+                self.width as usize,
+                self.width as usize,
+                self.height as usize,
+                sx,
+                sy,
+                bw,
+                bh,
+                fx & 2,
+                fy & 2,
+                4,
+                self.vc1_rnd,
+            );
+        }
+        for y in 0..bh {
+            let dy = by + y;
+            if dy >= self.height as usize {
+                break;
+            }
+            for x in 0..bw {
+                let dx = bx + x;
+                if dx >= self.width as usize {
+                    break;
+                }
+                frame.y[dy * self.width as usize + dx] = tmp[y * bw + x];
+            }
+        }
+
+        if block.is_some() {
+            return;
+        }
+
+        self.vc1_mc_chroma(frame, r, c, reference, mv, seq);
+    }
+
+    fn vc1_mc_chroma(
+        &self,
+        frame: &mut YuvFrame,
+        r: usize,
+        c: usize,
+        reference: &YuvFrame,
+        mv: (i32, i32),
+        seq: &SequenceHeader,
+    ) {
+        let mx = mv.0;
+        let my = mv.1;
+        let cw = self.width as usize / 2;
+        let ch = self.height as usize / 2;
+        if cw == 0 || ch == 0 {
+            return;
+        }
+        let mut uvmx = (mx + ((mx & 3) == 3) as i32) >> 1;
+        let mut uvmy = (my + ((my & 3) == 3) as i32) >> 1;
+        if seq.fastuvmc {
+            uvmx += if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) };
+            uvmy += if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) };
+        }
+        let csx = (c * 8) as i32 + (uvmx >> 2);
+        let csy = (r * 8) as i32 + (uvmy >> 2);
+        let cfx = (uvmx & 3) << 1;
+        let cfy = (uvmy & 3) << 1;
+
+        let cb = reference.cb.as_slice();
+        let cr = reference.cr.as_slice();
+        let mut tb = [0u8; 64];
+        let mut tr = [0u8; 64];
+        vc1_bilinear_qpel_block(&mut tb, 8, cb, cw, cw, ch, csx, csy, 8, 8, cfx, cfy, 8, self.vc1_rnd);
+        vc1_bilinear_qpel_block(&mut tr, 8, cr, cw, cw, ch, csx, csy, 8, 8, cfx, cfy, 8, self.vc1_rnd);
+        for y in 0..8 {
+            for x in 0..8 {
+                let dx = c * 8 + x;
+                let dy = r * 8 + y;
+                if dx < cw && dy < ch {
+                    frame.cb[dy * cw + dx] = tb[y * 8 + x];
+                    frame.cr[dy * cw + dx] = tr[y * 8 + x];
+                }
+            }
+        }
+    }
+
+    fn vc1_mc_4mv_chroma(&self,frame:&mut YuvFrame,r:usize,c:usize,reference:&YuvFrame,mvs:[(i32,i32);4],intra:[bool;4],pic:&PictureHeader,seq:&SequenceHeader) {
+        // VC-1 derives a single chroma MV from the non-intra luma blocks.
+        // This follows FFmpeg get_chroma_mv(): median of 4, median of the
+        // three valid vectors, or the arithmetic mean of the two valid ones.
+        let mut valid = [(0i32, 0i32); 4];
+        let mut count = 0usize;
+        for i in 0..4 {
+            if !intra[i] {
+                valid[count] = mvs[i];
+                count += 1;
+            }
+        }
+        if count < 2 {
+            // get_chroma_mv() returns zero for 0/1 valid luma MVs; chroma is
+            // not motion compensated for this macroblock.
+            for i in 0..4 {
+                if !intra[i] {
+                    self.vc1_mc_single(frame, r, c, reference, mvs[i], pic, seq, Some(i));
+                }
+            }
+            return;
+        }
+        #[inline]
+        fn median4(a:i32,b:i32,c:i32,d:i32)->i32 {
+            if a < b {
+                if c < d { (b.min(d) + a.max(c)) / 2 } else { (b.min(c) + a.max(d)) / 2 }
+            } else if c < d {
+                (a.min(d) + b.max(c)) / 2
+            } else {
+                (a.min(c) + b.max(d)) / 2
+            }
+        }
+        let mv = match count {
+            2 => ((valid[0].0 + valid[1].0) / 2, (valid[0].1 + valid[1].1) / 2),
+            3 => (median3(valid[0].0,valid[1].0,valid[2].0), median3(valid[0].1,valid[1].1,valid[2].1)),
+            _ => (median4(valid[0].0,valid[1].0,valid[2].0,valid[3].0), median4(valid[0].1,valid[1].1,valid[2].1,valid[3].1)),
+        };
+        // 4MV derives one chroma MV, but it must not run a fake 16x16 luma
+        // prediction just to obtain U/V. The old path did that and then
+        // restored all four 8x8 luma blocks, nearly doubling MC work.
+        self.vc1_mc_chroma(frame, r, c, reference, mv, seq);
+        // Now generate the four independently compensated luma blocks once.
+        for i in 0..4 {
+            if !intra[i] {
+                self.vc1_mc_single(frame,r,c,reference,mvs[i],pic,seq,Some(i));
+            }
+        }
+    }
+
+    fn vc1_b_predict(&self,r:usize,c:usize,dmv:[(i32,i32);2],direct:bool,mode:u8,intra:bool,pic:&PictureHeader,fwd_hist:&[(i32,i32)],bwd_hist:&[(i32,i32)])->[(i32,i32);2] {
+        let (quarter,_,rx,ry,_,_)=self.vc1_mv_params(pic);
+        let idx=r*self.width_mb as usize+c;
+        if intra {
+            return [(0,0);2];
+        }
+
+        // ff_vc1_pred_b_mv() always begins with the direct-mode vectors
+        // derived from the future anchor.  A non-direct MB only replaces the
+        // direction(s) selected by BMVTYPE; the inactive direction remains
+        // this scaled anchor vector and is still stored in B-picture MV
+        // history for later predictors.
+        let base=self.vc1_bwd_anchor_mvs.as_ref().and_then(|v|v.get(idx)).copied().unwrap_or((0,0));
+        let mut out=[
+            (vc1_scale_b_mv(base.0,pic.bfrac_num,pic.bfrac_den,false,quarter),vc1_scale_b_mv(base.1,pic.bfrac_num,pic.bfrac_den,false,quarter)),
+            (vc1_scale_b_mv(base.0,pic.bfrac_num,pic.bfrac_den,true,quarter),vc1_scale_b_mv(base.1,pic.bfrac_num,pic.bfrac_den,true,quarter)),
+        ];
+
+        // Direct vectors use the progressive 1-MV qpel pullback (8.4.5.4):
+        // [-60-qx, X-qx] / [-60-qy, Y-qy].  The previous port returned the
+        // scaled vectors without this clipping.
+        let qx6=(c as i32)<<6;
+        let qy6=(r as i32)<<6;
+        let x6=((self.width_mb as i32)<<6)-4;
+        let y6=((self.height_mb as i32)<<6)-4;
+        for mv in &mut out {
+            mv.0=mv.0.clamp(-60-qx6,x6-qx6);
+            mv.1=mv.1.clamp(-60-qy6,y6-qy6);
+        }
+        if direct {
+            return out;
+        }
+
+        let pred=|hist:&[(i32,i32)]|->(i32,i32){
+            let w=self.width_mb as usize;
+            let left=if c>0{Some(hist[idx-1])}else{None};
+            let top=if r>0{Some(hist[idx-w])}else{None};
+            let tr=if r>0{if c+1<w{Some(hist[idx-w+1])}else if c>0{Some(hist[idx-w-1])}else{None}}else{None};
+            match(top,tr,left){
+                (Some(a),Some(b),Some(cc))=>(median3(a.0,b.0,cc.0),median3(a.1,b.1,cc.1)),
+                (Some(a),_,_)=>a,
+                (_,_,Some(cc))=>cc,
+                (_,Some(b),_)=>b,
+                _=>(0,0),
+            }
+        };
+
+        // For progressive Main Profile B pictures, only the direction(s)
+        // selected by BMVTYPE are re-predicted.  This matches the two guarded
+        // branches in ff_vc1_pred_b_mv().
+        for dir in 0..2 {
+            let active=(dir==0&&(mode==0||mode==2))||(dir==1&&(mode==1||mode==2));
+            if !active {
+                continue;
+            }
+            let p=if dir==0{pred(fwd_hist)}else{pred(bwd_hist)};
+            let (mut dx,mut dy)=dmv[dir];
+            if !quarter{dx*=2;dy*=2;}
+
+            // Non-direct B prediction uses profile<Advanced pullback with
+            // sh=5 (MV=-28), then signed MV-range modulus.
+            let qx=(c as i32)<<5;
+            let qy=(r as i32)<<5;
+            let xx=((self.width_mb as i32)<<5)-4;
+            let yy=((self.height_mb as i32)<<5)-4;
+            let mut px=p.0;
+            let mut py=p.1;
+            if qx+px < -28 { px=-28-qx; }
+            if qy+py < -28 { py=-28-qy; }
+            if qx+px > xx { px=xx-qx; }
+            if qy+py > yy { py=yy-qy; }
+            out[dir]=(
+                ((px+dx+rx)&((rx<<1)-1))-rx,
+                ((py+dy+ry)&((ry<<1)-1))-ry,
+            );
+        }
+        out
     }
 
     // ─── Intra frame ─────────────────────────────────────────────────────────
 
-    fn decode_intra(
-        &mut self,
-        payload: &[u8],
-        pic_hdr: &PictureHeader,
-        seq: &SequenceHeader,
-        frame: &mut YuvFrame,
-    ) -> Result<()> {
-        // The ASF payload includes the picture header and bitplanes.
-        // Start macroblock decoding exactly at the macroblock layer.
-        let mut br = BitReader::new_at(payload, pic_hdr.header_bits);
-        let pquant = pic_hdr.pquant as i32;
-        let halfqp = pic_hdr.halfqp;
-        let uniform = pic_hdr.pqual_mode != 0;
-
-        // Reset DC and AC prediction buffers for this frame
-        let mb_w = self.width_mb as usize;
-        let mb_h = self.height_mb as usize;
-        self.dc_pred = DcPredBuffer::new(mb_w, mb_h);
-        self.ac_pred = AcPredBuffer::new(mb_w, mb_h);
-
-        for mb_row in 0..self.height_mb {
-            for mb_col in 0..self.width_mb {
-                if br.is_empty() {
-                    return Ok(());
-                }
-
-                // CBPCY: 6-bit coded-block pattern
-                let cbp = self.cbpcy_i.decode(&mut br).unwrap_or(0) as u8;
-
-                // Per-MB quantizer override (DQUANT)
-                let mb_mquant = read_mquant(
-                    &mut br,
-                    &pic_hdr.dquant,
-                    pquant,
-                    mb_col,
-                    mb_row,
-                    self.width_mb,
-                    self.height_mb,
-                );
-                let mb_pquant = mb_mquant.abs();
-                let mb_halfqp = halfqp && mb_mquant >= 0;
-
-                // Transform type for this MB
-                let mb_tt = if seq.vstransform {
-                    self.ttmb.decode(&mut br).unwrap_or(0) as u8
+    fn decode_intra(&mut self,payload:&[u8],pic:&PictureHeader,seq:&SequenceHeader,frame:&mut YuvFrame)->Result<()> {
+        let mut br=BitReader::new_at(payload,pic.header_bits);self.vc1_reset_picture_state();let(intra_set,_)=Self::vc1_coding_sets(pic);let q=pic.pquant as i32;
+        for r in 0..self.height_mb as usize {for c in 0..self.width_mb as usize {
+            let cbp=self.wmv2_mb_i_vlc.decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 I CBPCY".into()))? as u8;
+            let acpred=br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 ACPRED".into()))?;let mbi=r*self.width_mb as usize+c;self.vc1_qscale[mbi]=q;
+            for blk in 0..6usize {
+                let mut coded=((cbp>>(5-blk))&1)!=0;
+                if blk<4{coded=self.vc1_coded_block_pred(r,c,blk,coded);}
+                let mut coeff=self.vc1_decode_intra_coeffs(&mut br,pic,seq,r,c,blk,coded,q,acpred,true,if blk<4{intra_set}else{Self::vc1_coding_sets(pic).1})?;
+                apply_idct(&mut coeff,TT_8X8);
+                if seq.overlap && pic.pquant >= 9 {
+                    write_intra_block(frame,r as u32,c as u32,blk,&coeff);
                 } else {
-                    0
-                };
-
-                for blk in 0..6usize {
-                    let is_luma = blk < 4;
-
-                    // ── DC prediction (SMPTE 421M §8.1.4.6) ──────────────────
-                    let dc_vlc = if is_luma {
-                        &self.dc_luma
-                    } else {
-                        &self.dc_chroma
-                    };
-                    let dc_diff = read_dc_diff(&mut br, dc_vlc);
-
-                    // DC step from SMPTE 421M Table 3 (×128 domain for IDCT)
-                    let dc_scale = dc_step(mb_pquant, is_luma);
-                    let (dc_pred_val, _use_left) =
-                        self.dc_pred.predict(mb_row as usize, mb_col as usize, blk);
-
-                    let dc_recon = dc_pred_val + dc_diff * dc_scale;
-                    self.dc_pred
-                        .store(mb_row as usize, mb_col as usize, blk, dc_recon);
-
-                    let coded = (cbp >> (5 - blk)) & 1 != 0;
-                    let blk_tt = if coded && mb_tt == 6 {
-                        self.ttblk.decode(&mut br).unwrap_or(0) as u8
-                    } else {
-                        mb_tt
-                    };
-
-                    let mut coeff = if coded {
-                        decode_block_ac(
-                            &mut br,
-                            is_luma,
-                            mb_pquant,
-                            mb_halfqp,
-                            uniform,
-                            blk_tt,
-                            &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
-                        )
-                    } else {
-                        [0i32; 64]
-                    };
-
-                    // Place reconstructed DC into coeff[0]
-                    coeff[0] = dc_recon;
-
-                    // ── AC Prediction (SMPTE 421M §8.1.4.7) ──────────────────
-                    // The direction follows the DC predictor choice:
-                    // use_left=true  → horizontal: add pred_row to coeff[1..7]
-                    // use_left=false → vertical:   add pred_col to coeff[8,16,..56]
-                    if _use_left {
-                        // Horizontal: predictor is first row of left neighbour
-                        let pred = self.ac_pred.pred_row(mb_row as usize, mb_col as usize, blk);
-                        for i in 0..7 {
-                            coeff[i + 1] += pred[i];
-                        }
-                        // Store our first row for future left→right neighbours
-                        let our_row = [
-                            coeff[1], coeff[2], coeff[3], coeff[4], coeff[5], coeff[6], coeff[7],
-                        ];
-                        self.ac_pred
-                            .store_row(mb_row as usize, mb_col as usize, blk, our_row);
-                    } else {
-                        // Vertical: predictor is first column of top neighbour
-                        let pred = self.ac_pred.pred_col(mb_row as usize, mb_col as usize, blk);
-                        for i in 0..7 {
-                            coeff[(i + 1) * 8] += pred[i];
-                        }
-                        let our_col = [
-                            coeff[8], coeff[16], coeff[24], coeff[32], coeff[40], coeff[48],
-                            coeff[56],
-                        ];
-                        self.ac_pred
-                            .store_col(mb_row as usize, mb_col as usize, blk, our_col);
-                    }
-
-                    apply_idct(&mut coeff, blk_tt);
-                    write_intra_block(frame, mb_row, mb_col, blk, &coeff);
+                    write_intra_block_unsigned(frame,r as u32,c as u32,blk,&coeff);
                 }
             }
-        }
-        Ok(())
+        }}Ok(())
     }
 
-    // ─── P frame ─────────────────────────────────────────────────────────────
-
-    fn decode_p(
-        &mut self,
-        payload: &[u8],
-        pic_hdr: &PictureHeader,
-        seq: &SequenceHeader,
-        frame: &mut YuvFrame,
-    ) -> Result<()> {
-        // Start from reference frame copy
-        if let Some(ref rf) = self.ref_frame {
-            frame.y.copy_from_slice(&rf.y);
-            frame.cb.copy_from_slice(&rf.cb);
-            frame.cr.copy_from_slice(&rf.cr);
+    fn decode_p(&mut self,payload:&[u8],pic:&PictureHeader,seq:&SequenceHeader,frame:&mut YuvFrame)->Result<()> {
+        let mut reference=match self.ref_frame.clone(){Some(v)=>v,None=>return Ok(())};
+        // Intensity compensation is picture-level state.  Build the transformed
+        // reference once for this P picture and reuse it for every macroblock.
+        // Rebuilding a full 1080p YUV reference from vc1_mc_single() for every
+        // MB turns one frame into tens of gigabytes of memory traffic.
+        if pic.mv_mode==MvMode::IntensityComp {
+            for v in &mut reference.y { *v=vc1_ic_value(*v,pic.lumscale,pic.lumshift,false); }
+            for v in &mut reference.cb { *v=vc1_ic_value(*v,pic.lumscale,pic.lumshift,true); }
+            for v in &mut reference.cr { *v=vc1_ic_value(*v,pic.lumscale,pic.lumshift,true); }
         }
-
-        let mut br = BitReader::new_at(payload, pic_hdr.header_bits);
-        let pquant = pic_hdr.pquant as i32;
-        let halfqp = pic_hdr.halfqp;
-        let uniform = pic_hdr.pqual_mode != 0;
-        let mv_vlc = &self.mv_vlc[(pic_hdr.mvtab as usize).min(3)];
-
-        // MV range (quarter-pel)
-        let mv_scale = 1i32 << (pic_hdr.mvrange as i32 + 1);
-
-        let ref_y = self
-            .ref_frame
-            .as_ref()
-            .map(|f| f.y.clone())
-            .unwrap_or_default();
-        let ref_cb = self
-            .ref_frame
-            .as_ref()
-            .map(|f| f.cb.clone())
-            .unwrap_or_default();
-        let ref_cr = self
-            .ref_frame
-            .as_ref()
-            .map(|f| f.cr.clone())
-            .unwrap_or_default();
-        let fw = self.width as usize;
-        let fh = self.height as usize;
-
-        // Reset MV predictor for this frame
-        let mb_w = self.width_mb as usize;
-        let mb_h = self.height_mb as usize;
-        self.mv_pred = MvPredictor::new(mb_w, mb_h);
-
-        // Read skipped-MB bitplane from picture header
-        let skip_plane = pic_hdr.skipmb_plane.clone().unwrap_or_default();
-
-        for mb_row in 0..self.height_mb {
-            for mb_col in 0..self.width_mb {
-                if br.is_empty() {
-                    return Ok(());
-                }
-
-                let mb_idx = mb_row as usize * mb_w + mb_col as usize;
-
-                // Skipped macroblock (from bitplane or inline 1-bit flag)
-                let skipped = if skip_plane.is_empty() {
-                    br.read_bit().unwrap_or(false)
-                } else {
-                    skip_plane.get(mb_idx).copied().unwrap_or(0) != 0
-                };
-
-                if skipped {
-                    // Use predicted MV for skipped MB (copy from reference)
-                    let (pvx, pvy) = self.mv_pred.predict(mb_row as usize, mb_col as usize);
-                    self.mv_pred
-                        .store(mb_row as usize, mb_col as usize, (pvx, pvy), true);
-                    continue;
-                }
-
-                // Median MV predictor from A (left), B (top), C (top-right)
-                let (pvx, pvy) = self.mv_pred.predict(mb_row as usize, mb_col as usize);
-
-                // Motion vector differential
-                let dmvx = Self::read_mv_diff(&mut br, mv_vlc, mv_scale);
-                let dmvy = Self::read_mv_diff(&mut br, mv_vlc, mv_scale);
-                let mvx = pvx + dmvx;
-                let mvy = pvy + dmvy;
-
-                // Store for future neighbours
-                self.mv_pred
-                    .store(mb_row as usize, mb_col as usize, (mvx, mvy), false);
-
-                // Luma motion compensation (16×16)
-                {
-                    let dst_x = (mb_col * 16) as usize;
-                    let dst_y = (mb_row * 16) as usize;
-                    let src_x = (dst_x as i32 * 2 + mvx) as i32; // half-pel
-                    let src_y = (dst_y as i32 * 2 + mvy) as i32;
-                    let mut tmp = [0u8; 256];
-                    if ref_y.len() == fw * fh {
-                        mc_luma(&mut tmp, 16, &ref_y, fw, fw, fh, src_x, src_y, 16, 16);
-                        let dst = &mut frame.y[dst_y * fw + dst_x..];
-                        for r in 0..16 {
-                            dst[r * fw..r * fw + 16].copy_from_slice(&tmp[r * 16..r * 16 + 16]);
-                        }
-                    }
-                }
-
-                // Chroma MC (8×8, MV /2 with optional FASTUVMC rounding)
-                {
-                    let cw = fw / 2;
-                    let ch = fh / 2;
-                    let dst_x = (mb_col * 8) as usize;
-                    let dst_y = (mb_row * 8) as usize;
-                    // Chroma MV is luma MV / 2 (half-pel chroma = quarter-pel luma)
-                    let cmvx_raw = mvx / 2;
-                    let cmvy_raw = mvy / 2;
-                    // FASTUVMC: round chroma MVs so that fractional part is 0 or ½ pel
-                    // i.e. strip the quarter-pel bit, rounding toward zero.
-                    let (cmvx, cmvy) = if seq.fastuvmc {
-                        // round: remove lowest half-pel bit, biased toward zero
-                        let round = |v: i32| -> i32 {
-                            if v >= 0 {
-                                v & !1
-                            } else {
-                                -((-v) & !1)
-                            }
-                        };
-                        (round(cmvx_raw), round(cmvy_raw))
-                    } else {
-                        (cmvx_raw, cmvy_raw)
-                    };
-                    let src_x = (dst_x as i32 * 2 + cmvx) as i32;
-                    let src_y = (dst_y as i32 * 2 + cmvy) as i32;
-                    let mut tmp_cb = [0u8; 64];
-                    let mut tmp_cr = [0u8; 64];
-                    if ref_cb.len() == cw * ch {
-                        mc_luma(&mut tmp_cb, 8, &ref_cb, cw, cw, ch, src_x, src_y, 8, 8);
-                        mc_luma(&mut tmp_cr, 8, &ref_cr, cw, cw, ch, src_x, src_y, 8, 8);
-                        let dcb = &mut frame.cb[dst_y * cw + dst_x..];
-                        let dcr = &mut frame.cr[dst_y * cw + dst_x..];
-                        for r in 0..8 {
-                            dcb[r * cw..r * cw + 8].copy_from_slice(&tmp_cb[r * 8..r * 8 + 8]);
-                            dcr[r * cw..r * cw + 8].copy_from_slice(&tmp_cr[r * 8..r * 8 + 8]);
-                        }
-                    }
-                }
-
-                // Residual (CBPCY + coefficients)
-                let cbp = self.cbpcy_p[(pic_hdr.cbptab as usize).min(1)]
-                    .decode(&mut br)
-                    .unwrap_or(0) as u8;
-                // Per-MB quantizer (DQUANT)
-                let mb_mquant = read_mquant(
-                    &mut br,
-                    &pic_hdr.dquant,
-                    pquant,
-                    mb_col,
-                    mb_row,
-                    self.width_mb,
-                    self.height_mb,
-                );
-                let mb_pquant = mb_mquant.abs();
-                let mb_halfqp = halfqp && mb_mquant >= 0;
-                let mb_tt = if seq.vstransform {
-                    self.ttmb.decode(&mut br).unwrap_or(0) as u8
-                } else {
-                    0
-                };
-
-                for blk in 0..6usize {
-                    if (cbp >> (5 - blk)) & 1 == 0 {
-                        continue;
-                    }
-                    let is_luma = blk < 4;
-                    let blk_tt = if mb_tt == 6 {
-                        self.ttblk.decode(&mut br).unwrap_or(0) as u8
-                    } else {
-                        mb_tt
-                    };
-
-                    let mut coeff = decode_block(
-                        &mut br,
-                        false,
-                        is_luma,
-                        mb_pquant,
-                        mb_halfqp,
-                        uniform,
-                        blk_tt,
-                        &self.dc_luma,
-                        &self.dc_chroma,
-                        &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
-                        &self.ac_inter[(pic_hdr.transacfrm as usize).min(3)],
-                    );
-                    apply_idct(&mut coeff, blk_tt);
-                    add_residual_block(frame, mb_row as u32, mb_col as u32, blk, &coeff);
-                }
+        let mut br=BitReader::new_at(payload,pic.header_bits);self.vc1_reset_picture_state();let(intra_set,_)=Self::vc1_coding_sets(pic);let(quarter,_,_,_,_,_)=self.vc1_mv_params(pic);let mixed=pic.mv_mode==MvMode::MixedMv||(pic.mv_mode==MvMode::IntensityComp&&pic.mv_mode2==MvMode::MixedMv);let skip_plane=pic.skipmb_plane.as_ref();let mvtype_plane=pic.mvtypemb_plane.as_ref();
+        for r in 0..self.height_mb as usize {for c in 0..self.width_mb as usize {let mbi=r*self.width_mb as usize+c;let fourmv=if mixed{if pic.mvtypemb_raw{br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 MVTYPE".into()))?}else{mvtype_plane.and_then(|p|p.get(mbi)).copied().unwrap_or(0)!=0}}else{false};let skipped=if pic.skipmb_raw{br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 SKIPMB".into()))?}else{skip_plane.and_then(|p|p.get(mbi)).copied().unwrap_or(0)!=0};
+            if !fourmv {
+                if skipped {let mv=self.vc1_predict_p_mv(&mut br,pic,seq,r,c,0,(0,0),true,false)?;self.vc1_mc_single(frame,r,c,&reference,mv,pic,seq,None);continue;}
+                let md=self.vc1_read_mvdata(&mut br,pic,quarter)?;let mv=self.vc1_predict_p_mv(&mut br,pic,seq,r,c,0,(md.dx,md.dy),true,md.intra)?;let mut mquant=pic.pquant as i32;let mut cbp=0u8;let mut acpred=false;
+                if md.intra&&!md.has_coeffs{mquant=read_mquant(&mut br,&pic.dquant,pic.pquant as i32,c as u32,r as u32,self.width_mb,self.height_mb)?;acpred=br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 ACPRED".into()))?;}else if md.has_coeffs{if md.intra{acpred=br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 ACPRED".into()))?;}cbp=self.vc1_cbpcy[(pic.cbptab as usize).min(3)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 P CBPCY".into()))? as u8;mquant=read_mquant(&mut br,&pic.dquant,pic.pquant as i32,c as u32,r as u32,self.width_mb,self.height_mb)?;}
+                self.vc1_qscale[mbi]=mquant;if md.intra {self.vc1_intra_blocks[mbi]=[true;6];}else{self.vc1_mc_single(frame,r,c,&reference,mv,pic,seq,None);}let mut ttmb=pic.ttfrm as i32;if !pic.ttmbf&&!md.intra&&md.has_coeffs{ttmb=self.vc1_ttmb[((pic.pquant>4)as usize)+((pic.pquant>12)as usize)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 TTMB".into()))?;}
+                let mut first=true;for blk in 0..6{let coded=((cbp>>(5-blk))&1)!=0;if md.intra{let mut co=self.vc1_decode_intra_coeffs(&mut br,pic,seq,r,c,blk,coded,mquant,acpred,false,if blk<4{intra_set}else{Self::vc1_coding_sets(pic).1})?;apply_idct(&mut co,TT_8X8);write_intra_block(frame,r as u32,c as u32,blk,&co);}else if coded{let(co,_)=self.vc1_decode_p_residual(&mut br,pic,seq,mquant,ttmb,first)?;add_residual_block(frame,r as u32,c as u32,blk,&co);if !pic.ttmbf&&ttmb<8{ttmb=-1;}first=false;}}
+            } else {
+                if skipped {let mut mvs=[(0,0);4];for i in 0..4{mvs[i]=self.vc1_predict_p_mv(&mut br,pic,seq,r,c,i,(0,0),false,false)?;}self.vc1_current_mvs[mbi]=mvs[0];self.vc1_mc_4mv_chroma(frame,r,c,&reference,mvs,[false;4],pic,seq);continue;}
+                let cbp0=self.vc1_cbpcy[(pic.cbptab as usize).min(3)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 4MV CBPCY".into()))? as u8;let mut intra=[false;4];let mut coded=[false;6];let mut mvs=[(0,0);4];for i in 0..4{let present=((cbp0>>(5-i))&1)!=0;let md=if present{self.vc1_read_mvdata(&mut br,pic,quarter)?}else{Vc1MvData::default()};intra[i]=md.intra;coded[i]=if present{md.has_coeffs}else{false};mvs[i]=self.vc1_predict_p_mv(&mut br,pic,seq,r,c,i,(md.dx,md.dy),false,md.intra)?;}coded[4]=(cbp0&2)!=0;coded[5]=(cbp0&1)!=0;let ni=intra.iter().filter(|x|**x).count();let chroma_intra=ni>=3;self.vc1_intra_blocks[mbi]=[intra[0],intra[1],intra[2],intra[3],chroma_intra,chroma_intra];let coded_inter=(0..4).any(|i|coded[i]&&!intra[i])||(!chroma_intra&&(coded[4]||coded[5]));let mut mquant=pic.pquant as i32;if ni>0||coded_inter{mquant=read_mquant(&mut br,&pic.dquant,pic.pquant as i32,c as u32,r as u32,self.width_mb,self.height_mb)?;}self.vc1_qscale[mbi]=mquant;let need_acpred=self.vc1_intra_blocks[mbi].iter().enumerate().any(|(i,v)|*v&&(self.vc1_intra_neighbour(r,c,i,true).map(|(mi,b)|self.vc1_intra_blocks[mi][b]).unwrap_or(false)||self.vc1_intra_neighbour(r,c,i,false).map(|(mi,b)|self.vc1_intra_blocks[mi][b]).unwrap_or(false)));let acpred=if need_acpred{br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 4MV ACPRED".into()))?}else{false};let mut ttmb=pic.ttfrm as i32;if !pic.ttmbf&&coded_inter{ttmb=self.vc1_ttmb[((pic.pquant>4)as usize)+((pic.pquant>12)as usize)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 4MV TTMB".into()))?;}self.vc1_mc_4mv_chroma(frame,r,c,&reference,mvs,intra,pic,seq);let mut first=true;for blk in 0..6{let is_intra=if blk<4{intra[blk]}else{chroma_intra};if is_intra{let mut co=self.vc1_decode_intra_coeffs(&mut br,pic,seq,r,c,blk,coded[blk],mquant,acpred,false,if blk<4{intra_set}else{Self::vc1_coding_sets(pic).1})?;apply_idct(&mut co,TT_8X8);write_intra_block(frame,r as u32,c as u32,blk,&co);}else if coded[blk]{let(co,_)=self.vc1_decode_p_residual(&mut br,pic,seq,mquant,ttmb,first)?;add_residual_block(frame,r as u32,c as u32,blk,&co);if !pic.ttmbf&&ttmb<8{ttmb=-1;}first=false;}}self.vc1_current_mvs[mbi]=mvs[0];
             }
-        }
-        Ok(())
+        }}Ok(())
     }
 
-    // ─── B frame ─────────────────────────────────────────────────────────────
-    // SMPTE 421M §8.4.
-    // Each MB can be: direct (interpolated from fwd+bwd), forward, backward,
-    // bidirectional, or intra.  We decode the MB type and both MV differentials
-    // then blend fwd and bwd MC results.
-
-    fn decode_b(
-        &mut self,
-        payload: &[u8],
-        pic_hdr: &PictureHeader,
-        seq: &SequenceHeader,
-        frame: &mut YuvFrame,
-    ) -> Result<()> {
-        let fwd = match &self.fwd_ref {
-            Some(f) => f.clone(),
-            None => return Ok(()), // no anchor yet
-        };
-        let bwd = match &self.bwd_ref {
-            Some(f) => f.clone(),
-            None => return Ok(()), // no backward anchor
-        };
-
-        let mut br = BitReader::new_at(payload, pic_hdr.header_bits);
-        let pquant = pic_hdr.pquant as i32;
-        let halfqp = pic_hdr.halfqp;
-        let uniform = pic_hdr.pqual_mode != 0;
-        let mv_vlc = &self.mv_vlc[(pic_hdr.mvtab as usize).min(3)];
-        let mv_scale = 1i32 << (pic_hdr.mvrange as i32 + 1);
-
-        let fw = self.width as usize;
-        let fh = self.height as usize;
-        let mb_w = self.width_mb as usize;
-        let mb_h = self.height_mb as usize;
-        self.mv_pred = MvPredictor::new(mb_w, mb_h);
-
-        // Direct-mode and skip bitplanes
-        let direct_plane = pic_hdr.directmb_plane.clone().unwrap_or_default();
-        let skip_plane = pic_hdr.skipmb_plane.clone().unwrap_or_default();
-
-        // Temporal MV scaling from BFRACTION (SMPTE 421M §8.4.1.3).
-        let direct_scale_num = pic_hdr.bfrac_num;
-        let direct_scale_den = pic_hdr.bfrac_den;
-
-        for mb_row in 0..self.height_mb {
-            for mb_col in 0..self.width_mb {
-                if br.is_empty() {
-                    return Ok(());
-                }
-
-                let mb_idx = mb_row as usize * mb_w + mb_col as usize;
-                let is_direct = if pic_hdr.directmb_raw {
-                    br.read_bit().unwrap_or(false)
-                } else {
-                    direct_plane.get(mb_idx).copied().unwrap_or(0) != 0
-                };
-                let is_skip = if pic_hdr.skipmb_raw {
-                    br.read_bit().unwrap_or(false)
-                } else {
-                    skip_plane.get(mb_idx).copied().unwrap_or(0) != 0
-                };
-
-                if is_skip || is_direct {
-                    // Direct / skip: interpolate fwd + bwd with equal weight
-                    let (pvx, pvy) = self.mv_pred.predict(mb_row as usize, mb_col as usize);
-                    // Scale fwd MV and derive bwd MV
-                    let fvx = pvx * direct_scale_num / direct_scale_den;
-                    let fvy = pvy * direct_scale_num / direct_scale_den;
-                    let bvx = fvx - pvx;
-                    let bvy = fvy - pvy;
-
-                    self.mc_blend_mb(
-                        frame, mb_row, mb_col, &fwd, &bwd, fvx, fvy, bvx, bvy, fw, fh,
-                    );
-                    self.mv_pred
-                        .store(mb_row as usize, mb_col as usize, (pvx, pvy), is_skip);
-                    continue;
-                }
-
-                // Read MB type: 2 bits
-                // 00=intra, 01=backward, 10=forward, 11=bidirectional
-                let mb_type = br.read_bits(2).unwrap_or(2);
-
-                if mb_type == 0 {
-                    // Intra MB in B-frame (rare)
-                    let cbp = self.cbpcy_i.decode(&mut br).unwrap_or(0) as u8;
-                    let mb_mquant = read_mquant(
-                    &mut br,
-                    &pic_hdr.dquant,
-                    pquant,
-                    mb_col,
-                    mb_row,
-                    self.width_mb,
-                    self.height_mb,
-                );
-                let mb_pquant = mb_mquant.abs();
-                let mb_halfqp = halfqp && mb_mquant >= 0;
-                    let mb_tt = if seq.vstransform {
-                        self.ttmb.decode(&mut br).unwrap_or(0) as u8
-                    } else {
-                        0
-                    };
-                    for blk in 0..6usize {
-                        let coded = (cbp >> (5 - blk)) & 1 != 0;
-                        if coded {
-                            let blk_tt = if mb_tt == 6 {
-                                self.ttblk.decode(&mut br).unwrap_or(0) as u8
-                            } else {
-                                mb_tt
-                            };
-                            let mut coeff = decode_block(
-                                &mut br,
-                                true,
-                                blk < 4,
-                                mb_pquant,
-                                mb_halfqp,
-                                uniform,
-                                blk_tt,
-                                &self.dc_luma,
-                                &self.dc_chroma,
-                                &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
-                                &self.ac_inter[(pic_hdr.transacfrm as usize).min(3)],
-                            );
-                            apply_idct(&mut coeff, blk_tt);
-                            write_intra_block(frame, mb_row, mb_col, blk, &coeff);
-                        }
-                    }
-                    self.mv_pred
-                        .store(mb_row as usize, mb_col as usize, (0, 0), false);
-                    continue;
-                }
-
-                // Motion vectors
-                let use_fwd = mb_type == 2 || mb_type == 3;
-                let use_bwd = mb_type == 1 || mb_type == 3;
-
-                let (pvx, pvy) = self.mv_pred.predict(mb_row as usize, mb_col as usize);
-
-                let (fvx, fvy) = if use_fwd {
-                    let dx = Self::read_mv_diff(&mut br, mv_vlc, mv_scale);
-                    let dy = Self::read_mv_diff(&mut br, mv_vlc, mv_scale);
-                    (pvx + dx, pvy + dy)
-                } else {
-                    (0, 0)
-                };
-
-                let (bvx, bvy) = if use_bwd {
-                    let dx = Self::read_mv_diff(&mut br, mv_vlc, mv_scale);
-                    let dy = Self::read_mv_diff(&mut br, mv_vlc, mv_scale);
-                    (pvx + dx, pvy + dy)
-                } else {
-                    (0, 0)
-                };
-
-                self.mv_pred.store(
-                    mb_row as usize,
-                    mb_col as usize,
-                    if use_fwd { (fvx, fvy) } else { (bvx, bvy) },
-                    false,
-                );
-
-                if use_fwd && use_bwd {
-                    self.mc_blend_mb(
-                        frame, mb_row, mb_col, &fwd, &bwd, fvx, fvy, bvx, bvy, fw, fh,
-                    );
-                } else if use_fwd {
-                    self.mc_single_mb(frame, mb_row, mb_col, &fwd, fvx, fvy, fw, fh);
-                } else {
-                    self.mc_single_mb(frame, mb_row, mb_col, &bwd, bvx, bvy, fw, fh);
-                }
-
-                // Residual
-                let cbp = self.cbpcy_p[(pic_hdr.cbptab as usize).min(1)]
-                    .decode(&mut br)
-                    .unwrap_or(0) as u8;
-                let mb_mquant = read_mquant(
-                    &mut br,
-                    &pic_hdr.dquant,
-                    pquant,
-                    mb_col,
-                    mb_row,
-                    self.width_mb,
-                    self.height_mb,
-                );
-                let mb_pquant = mb_mquant.abs();
-                let mb_halfqp = halfqp && mb_mquant >= 0;
-                let mb_tt = if seq.vstransform {
-                    self.ttmb.decode(&mut br).unwrap_or(0) as u8
-                } else {
-                    0
-                };
-                for blk in 0..6usize {
-                    if (cbp >> (5 - blk)) & 1 == 0 {
-                        continue;
-                    }
-                    let blk_tt = if mb_tt == 6 {
-                        self.ttblk.decode(&mut br).unwrap_or(0) as u8
-                    } else {
-                        mb_tt
-                    };
-                    let mut coeff = decode_block(
-                        &mut br,
-                        false,
-                        blk < 4,
-                        mb_pquant,
-                        mb_halfqp,
-                        uniform,
-                        blk_tt,
-                        &self.dc_luma,
-                        &self.dc_chroma,
-                        &self.ac_intra[(pic_hdr.transacfrm2 as usize).min(3)],
-                        &self.ac_inter[(pic_hdr.transacfrm as usize).min(3)],
-                    );
-                    apply_idct(&mut coeff, blk_tt);
-                    add_residual_block(frame, mb_row as u32, mb_col as u32, blk, &coeff);
-                }
-            }
-        }
-        Ok(())
+    fn decode_b(&mut self,payload:&[u8],pic:&PictureHeader,seq:&SequenceHeader,frame:&mut YuvFrame)->Result<()> {
+        let fwd=match self.fwd_ref.clone(){Some(v)=>v,None=>return Ok(())};let bwd=match self.bwd_ref.clone(){Some(v)=>v,None=>return Ok(())};let mut br=BitReader::new_at(payload,pic.header_bits);self.vc1_reset_picture_state();let(intra_set,_)=Self::vc1_coding_sets(pic);let(quarter,_,_,_,_,_)=self.vc1_mv_params(pic);let nmb=self.width_mb as usize*self.height_mb as usize;let mut fhist=vec![(0,0);nmb];let mut bhist=vec![(0,0);nmb];
+        for r in 0..self.height_mb as usize {for c in 0..self.width_mb as usize {let idx=r*self.width_mb as usize+c;let direct=if pic.directmb_raw{br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 DIRECTMB".into()))?}else{pic.directmb_plane.as_ref().and_then(|p|p.get(idx)).copied().unwrap_or(0)!=0};let skipped=if pic.skipmb_raw{br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 B SKIPMB".into()))?}else{pic.skipmb_plane.as_ref().and_then(|p|p.get(idx)).copied().unwrap_or(0)!=0};let mut dmv=[(0,0);2];let mut md=Vc1MvData::default();if !direct&&!skipped{md=self.vc1_read_mvdata(&mut br,pic,quarter)?;dmv[0]=(md.dx,md.dy);dmv[1]=dmv[0];}let mut mode=1u8;if !direct&&(skipped||!md.intra){let t=vc1_decode012_bits(&mut br)?;mode=match t{0=>if pic.bfrac_num*2>=pic.bfrac_den{1}else{0},1=>if pic.bfrac_num*2>=pic.bfrac_den{0}else{1},_=>{dmv[0]=(0,0);2}};}if skipped{if direct{mode=2;}let mv=self.vc1_b_predict(r,c,dmv,direct,mode,false,pic,&fhist,&bhist);fhist[idx]=mv[0];bhist[idx]=mv[1];if direct||mode==2{self.vc1_mc_blend(frame,r,c,&fwd,&bwd,mv[0],mv[1],pic,seq);}else if mode==0{self.vc1_mc_single(frame,r,c,&fwd,mv[0],pic,seq,None);}else{self.vc1_mc_single(frame,r,c,&bwd,mv[1],pic,seq,None);}continue;}
+            let mut cbp=0u8;let mut mquant=pic.pquant as i32;let mut acpred=false;let mut ttmb=pic.ttfrm as i32;let mv;if direct{cbp=self.vc1_cbpcy[(pic.cbptab as usize).min(3)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 direct CBPCY".into()))? as u8;mquant=read_mquant(&mut br,&pic.dquant,pic.pquant as i32,c as u32,r as u32,self.width_mb,self.height_mb)?;if !pic.ttmbf{ttmb=self.vc1_ttmb[((pic.pquant>4)as usize)+((pic.pquant>12)as usize)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 B TTMB".into()))?;}dmv=[(0,0);2];mv=self.vc1_b_predict(r,c,dmv,true,2,false,pic,&fhist,&bhist);self.vc1_mc_blend(frame,r,c,&fwd,&bwd,mv[0],mv[1],pic,seq);}else if !md.has_coeffs&&!md.intra{mv=self.vc1_b_predict(r,c,dmv,false,mode,md.intra,pic,&fhist,&bhist);if mode==2{self.vc1_mc_blend(frame,r,c,&fwd,&bwd,mv[0],mv[1],pic,seq);}else if mode==0{self.vc1_mc_single(frame,r,c,&fwd,mv[0],pic,seq,None);}else{self.vc1_mc_single(frame,r,c,&bwd,mv[1],pic,seq,None);}fhist[idx]=mv[0];bhist[idx]=mv[1];continue;}else if md.intra&&!md.has_coeffs{mquant=read_mquant(&mut br,&pic.dquant,pic.pquant as i32,c as u32,r as u32,self.width_mb,self.height_mb)?;acpred=br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 B ACPRED".into()))?;mv=self.vc1_b_predict(r,c,dmv,false,mode,md.intra,pic,&fhist,&bhist);}else{if mode==2{let md2=self.vc1_read_mvdata(&mut br,pic,quarter)?;dmv[0]=(md2.dx,md2.dy);if !md2.has_coeffs{let mv2=self.vc1_b_predict(r,c,dmv,false,mode,md2.intra,pic,&fhist,&bhist);self.vc1_mc_blend(frame,r,c,&fwd,&bwd,mv2[0],mv2[1],pic,seq);fhist[idx]=mv2[0];bhist[idx]=mv2[1];continue;}md.has_coeffs=md2.has_coeffs;md.intra=md2.intra;}mv=self.vc1_b_predict(r,c,dmv,false,mode,md.intra,pic,&fhist,&bhist);if !md.intra{if mode==2{self.vc1_mc_blend(frame,r,c,&fwd,&bwd,mv[0],mv[1],pic,seq);}else if mode==0{self.vc1_mc_single(frame,r,c,&fwd,mv[0],pic,seq,None);}else{self.vc1_mc_single(frame,r,c,&bwd,mv[1],pic,seq,None);}}if md.intra{acpred=br.read_bit().ok_or_else(||DecoderError::InvalidData("truncated WMV3 B ACPRED".into()))?;}cbp=self.vc1_cbpcy[(pic.cbptab as usize).min(3)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 B CBPCY".into()))? as u8;mquant=read_mquant(&mut br,&pic.dquant,pic.pquant as i32,c as u32,r as u32,self.width_mb,self.height_mb)?;if !pic.ttmbf&&!md.intra&&md.has_coeffs{ttmb=self.vc1_ttmb[((pic.pquant>4)as usize)+((pic.pquant>12)as usize)].decode(&mut br).ok_or_else(||DecoderError::InvalidData("invalid WMV3 B TTMB".into()))?;}}
+            self.vc1_qscale[idx]=mquant;fhist[idx]=mv[0];bhist[idx]=mv[1];let mut first=true;for blk in 0..6{let coded=((cbp>>(5-blk))&1)!=0;if md.intra{self.vc1_intra_blocks[idx][blk]=true;let mut co=self.vc1_decode_intra_coeffs(&mut br,pic,seq,r,c,blk,coded,mquant,acpred,false,if blk<4{intra_set}else{Self::vc1_coding_sets(pic).1})?;apply_idct(&mut co,TT_8X8);write_intra_block(frame,r as u32,c as u32,blk,&co);}else if coded{let(co,_)=self.vc1_decode_p_residual(&mut br,pic,seq,mquant,ttmb,first)?;add_residual_block(frame,r as u32,c as u32,blk,&co);if !pic.ttmbf&&ttmb<8{ttmb=-1;}first=false;}}
+        }}Ok(())
     }
 
-    /// Copy one 16×16 luma + 8×8 chroma macroblock from ref with given MV.
-    fn mc_single_mb(
+    fn vc1_mc_blend(
         &self,
         frame: &mut YuvFrame,
-        mb_row: u32,
-        mb_col: u32,
-        refp: &YuvFrame,
-        mvx: i32,
-        mvy: i32,
-        fw: usize,
-        fh: usize,
-    ) {
-        let dst_x = (mb_col * 16) as usize;
-        let dst_y = (mb_row * 16) as usize;
-        let src_x = dst_x as i32 * 2 + mvx;
-        let src_y = dst_y as i32 * 2 + mvy;
-        let mut tmp = [0u8; 256];
-        mc_luma(&mut tmp, 16, &refp.y, fw, fw, fh, src_x, src_y, 16, 16);
-        let dst = &mut frame.y[dst_y * fw + dst_x..];
-        for r in 0..16 {
-            dst[r * fw..r * fw + 16].copy_from_slice(&tmp[r * 16..r * 16 + 16]);
-        }
-
-        let cw = fw / 2;
-        let ch = fh / 2;
-        let cdst_x = (mb_col * 8) as usize;
-        let cdst_y = (mb_row * 8) as usize;
-        let csrc_x = cdst_x as i32 * 2 + mvx / 2;
-        let csrc_y = cdst_y as i32 * 2 + mvy / 2;
-        let mut tmp_cb = [0u8; 64];
-        let mut tmp_cr = [0u8; 64];
-        mc_luma(&mut tmp_cb, 8, &refp.cb, cw, cw, ch, csrc_x, csrc_y, 8, 8);
-        mc_luma(&mut tmp_cr, 8, &refp.cr, cw, cw, ch, csrc_x, csrc_y, 8, 8);
-        let dcb = &mut frame.cb[cdst_y * cw + cdst_x..];
-        let dcr = &mut frame.cr[cdst_y * cw + cdst_x..];
-        for r in 0..8 {
-            dcb[r * cw..r * cw + 8].copy_from_slice(&tmp_cb[r * 8..r * 8 + 8]);
-            dcr[r * cw..r * cw + 8].copy_from_slice(&tmp_cr[r * 8..r * 8 + 8]);
-        }
-    }
-
-    /// Bidirectional blend: average of forward and backward MC.
-    fn mc_blend_mb(
-        &self,
-        frame: &mut YuvFrame,
-        mb_row: u32,
-        mb_col: u32,
+        r: usize,
+        c: usize,
         fwd: &YuvFrame,
         bwd: &YuvFrame,
-        fvx: i32,
-        fvy: i32,
-        bvx: i32,
-        bvy: i32,
-        fw: usize,
-        fh: usize,
+        fmv: (i32, i32),
+        bmv: (i32, i32),
+        pic: &PictureHeader,
+        seq: &SequenceHeader,
     ) {
-        let dst_x = (mb_col * 16) as usize;
-        let dst_y = (mb_row * 16) as usize;
-        let fsrc_x = dst_x as i32 * 2 + fvx;
-        let fsrc_y = dst_y as i32 * 2 + fvy;
-        let bsrc_x = dst_x as i32 * 2 + bvx;
-        let bsrc_y = dst_y as i32 * 2 + bvy;
+        // Produce the forward prediction directly into the destination and keep
+        // only this macroblock, then overwrite with the backward prediction and
+        // average.  The old code allocated two full-resolution YUV frames for
+        // every B-picture macroblock.
+        self.vc1_mc_single(frame, r, c, fwd, fmv, pic, seq, None);
 
-        let mut ftmp = [0u8; 256];
-        let mut btmp = [0u8; 256];
-        mc_luma(&mut ftmp, 16, &fwd.y, fw, fw, fh, fsrc_x, fsrc_y, 16, 16);
-        mc_luma(&mut btmp, 16, &bwd.y, fw, fw, fh, bsrc_x, bsrc_y, 16, 16);
-        let dst = &mut frame.y[dst_y * fw + dst_x..];
-        for r in 0..16 {
-            for c in 0..16 {
-                dst[r * fw + c] =
-                    ((ftmp[r * 16 + c] as u16 + btmp[r * 16 + c] as u16 + 1) >> 1) as u8;
+        let x0 = c * 16;
+        let y0 = r * 16;
+        let mut fy = [0u8; 16 * 16];
+        for y in 0..16 {
+            let py = y0 + y;
+            if py >= self.height as usize { break; }
+            for x in 0..16 {
+                let px = x0 + x;
+                if px >= self.width as usize { break; }
+                fy[y * 16 + x] = frame.y[py * self.width as usize + px];
             }
         }
 
-        let cw = fw / 2;
-        let ch = fh / 2;
-        let cdst_x = (mb_col * 8) as usize;
-        let cdst_y = (mb_row * 8) as usize;
-        let cfsrc_x = cdst_x as i32 * 2 + fvx / 2;
-        let cfsrc_y = cdst_y as i32 * 2 + fvy / 2;
-        let cbsrc_x = cdst_x as i32 * 2 + bvx / 2;
-        let cbsrc_y = cdst_y as i32 * 2 + bvy / 2;
-        let mut fcb = [0u8; 64];
-        let mut fcrb = [0u8; 64];
-        let mut bcb = [0u8; 64];
-        let mut bcrb = [0u8; 64];
-        mc_luma(&mut fcb, 8, &fwd.cb, cw, cw, ch, cfsrc_x, cfsrc_y, 8, 8);
-        mc_luma(&mut fcrb, 8, &fwd.cr, cw, cw, ch, cfsrc_x, cfsrc_y, 8, 8);
-        mc_luma(&mut bcb, 8, &bwd.cb, cw, cw, ch, cbsrc_x, cbsrc_y, 8, 8);
-        mc_luma(&mut bcrb, 8, &bwd.cr, cw, cw, ch, cbsrc_x, cbsrc_y, 8, 8);
-        let dcb = &mut frame.cb[cdst_y * cw + cdst_x..];
-        let dcr = &mut frame.cr[cdst_y * cw + cdst_x..];
-        for r in 0..8 {
-            for c in 0..8 {
-                dcb[r * cw + c] = ((fcb[r * 8 + c] as u16 + bcb[r * 8 + c] as u16 + 1) >> 1) as u8;
-                dcr[r * cw + c] =
-                    ((fcrb[r * 8 + c] as u16 + bcrb[r * 8 + c] as u16 + 1) >> 1) as u8;
+        let cw = self.width as usize / 2;
+        let ch = self.height as usize / 2;
+        let cx0 = c * 8;
+        let cy0 = r * 8;
+        let mut fu = [0u8; 8 * 8];
+        let mut fv = [0u8; 8 * 8];
+        for y in 0..8 {
+            let py = cy0 + y;
+            if py >= ch { break; }
+            for x in 0..8 {
+                let px = cx0 + x;
+                if px >= cw { break; }
+                let i = py * cw + px;
+                fu[y * 8 + x] = frame.cb[i];
+                fv[y * 8 + x] = frame.cr[i];
+            }
+        }
+
+        self.vc1_mc_single(frame, r, c, bwd, bmv, pic, seq, None);
+
+        for y in 0..16 {
+            let py = y0 + y;
+            if py >= self.height as usize { break; }
+            for x in 0..16 {
+                let px = x0 + x;
+                if px >= self.width as usize { break; }
+                let i = py * self.width as usize + px;
+                let sum = fy[y * 16 + x] as u16 + frame.y[i] as u16;
+                frame.y[i] = ((sum + if self.vc1_rnd { 0 } else { 1 }) >> 1) as u8;
+            }
+        }
+        for y in 0..8 {
+            let py = cy0 + y;
+            if py >= ch { break; }
+            for x in 0..8 {
+                let px = cx0 + x;
+                if px >= cw { break; }
+                let i = py * cw + px;
+                let us = fu[y * 8 + x] as u16 + frame.cb[i] as u16;
+                let vs = fv[y * 8 + x] as u16 + frame.cr[i] as u16;
+                let round = if self.vc1_rnd { 0 } else { 1 };
+                frame.cb[i] = ((us + round) >> 1) as u8;
+                frame.cr[i] = ((vs + round) >> 1) as u8;
             }
         }
     }
 
-    fn read_mv_diff(br: &mut BitReader<'_>, mv_vlc: &VlcTable, scale: i32) -> i32 {
-        let sym = mv_vlc.decode(br).unwrap_or(0);
-        if sym == i32::MIN {
-            // Fixed-length escape
-            br.read_bits_signed(17).unwrap_or(0)
-        } else {
-            sym * scale / 4 // convert to quarter-pel
-        }
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
