@@ -138,6 +138,21 @@ fn dump_map_objects(vm: &SceneVm<'static>) {
             }
             None => println!("  [stage] stage={stage_idx} no slot_use entry"),
         }
+        let emb = st
+            .embedded_object_slots_by_stage
+            .get(&stage_idx)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        println!(
+            "  [stage] stage={stage_idx} embedded_slots={emb} is_embedded(77)={} is_embedded(0)={}",
+            st.is_embedded_object_slot(stage_idx, 77),
+            st.is_embedded_object_slot(stage_idx, 0)
+        );
+        if let Some(name) = vm.current_scene_name() {
+            let _ = name;
+        }
+        {
+        }
     }
     for stage_idx in stages {
         let objs = &st.object_lists[&stage_idx];
@@ -183,11 +198,17 @@ fn dump_map_objects(vm: &SceneVm<'static>) {
             if obj.object_type == 0 && kids == 0 && obj.file_name.is_none() {
                 continue;
             }
+            let odisp = obj
+                .lookup_int_prop(&vm.ctx.ids, vm.ctx.ids.obj_disp)
+                .unwrap_or(-999);
+            let oslot = obj.runtime_slot_or(idx);
             println!(
-                "  [stage]   object[{idx}] type={} file={:?} children={kids} backend={:?}",
+                "  [stage]   object[{idx}] type={} file={:?} children={kids} backend={:?} base.disp={} prop.disp={odisp} gfx.disp={:?}",
                 obj.object_type,
                 obj.file_name.as_deref().unwrap_or(""),
-                obj.backend
+                obj.backend,
+                obj.base.disp,
+                vm.ctx.gfx.object_peek_disp(stage_idx, oslot as i64)
             );
             for ci in 90..=104usize {
                 let Some(child) = obj.runtime.child_objects.get(ci) else {
@@ -207,14 +228,15 @@ fn dump_map_objects(vm: &SceneVm<'static>) {
                     let layer = vm.ctx.layers.layer(lid)?;
                     let s = layer.sprite(sid)?;
                     Some(format!(
-                        "visible={} alpha={} image={:?} pos=({},{})",
-                        s.visible, s.alpha, s.image_id, s.x, s.y
+                        "visible={} alpha={} tr={} image={:?} pos=({},{})",
+                        s.visible, s.alpha, s.tr, s.image_id, s.x, s.y
                     ))
                 });
                 println!(
-                    "  [stage]     child[{ci}] file={:?} objstate.disp={} gfx.disp={gfx_disp:?} slot={slot} binding={binding:?}",
+                    "  [stage]     child[{ci}] file={:?} prop.disp={} base.disp={} gfx.disp={gfx_disp:?} slot={slot} binding={binding:?}",
                     child.file_name.as_deref().unwrap_or(""),
                     disp,
+                    child.base.disp,
                 );
                 println!("  [stage]       sprite: {sprite_state:?}");
             }
@@ -224,6 +246,45 @@ fn dump_map_objects(vm: &SceneVm<'static>) {
     // Message windows are what the map/menu actually draws through.
     let mwnd_cnt = st.mwnd_lists.values().map(Vec::len).sum::<usize>();
     println!("  [stage] mwnd_lists={mwnd_cnt} total");
+}
+
+/// `OBJECT.TR` is co-backed by `ObjectState.base.tr` and the `tr` IntEvent:
+/// `set_int_prop(obj_tr, v)` writes BOTH, and `effective_object_info` reads the
+/// *event* whenever `ids.obj_tr_eve != 0`. Print both sides so a mismatch
+/// between "what the script set" and "what the renderer reads" is visible.
+fn tr_state_line(vm: &SceneVm<'static>, stage_idx: i64, idx: usize) -> Option<String> {
+    let ids = &vm.ctx.ids;
+    let st = vm.ctx.globals.stage_forms.get(&ids.form_global_stage)?;
+    let obj = st.object_lists.get(&stage_idx)?.get(idx)?;
+    let ev = &obj.runtime.prop_events.tr;
+    Some(format!(
+        "[tr] stage={stage_idx} object[{idx}] file={:?} base.tr={} explicit={} | ev value={} cur={} start={} end={} cur_time={} end_time={} loop={} speed={} active={} | lookup(obj_tr)={:?}",
+        obj.file_name.as_deref().unwrap_or("-"),
+        obj.base.tr,
+        obj.has_int_prop(ids.obj_tr),
+        ev.value,
+        ev.cur_value,
+        ev.start_value,
+        ev.end_value,
+        ev.cur_time,
+        ev.end_time,
+        ev.loop_type,
+        ev.speed_type,
+        ev.check_event(),
+        obj.lookup_int_prop(ids, ids.obj_tr),
+    ))
+}
+
+fn dump_tr_states(vm: &SceneVm<'static>, slots: &[usize]) {
+    println!(
+        "  [tr] ids.obj_tr={} ids.obj_tr_eve={} ids.obj_disp={}",
+        vm.ctx.ids.obj_tr, vm.ctx.ids.obj_tr_eve, vm.ctx.ids.obj_disp
+    );
+    for &idx in slots {
+        if let Some(line) = tr_state_line(vm, 1, idx) {
+            println!("  {line}");
+        }
+    }
 }
 
 fn dump_render(vm: &mut SceneVm<'static>) {
@@ -319,6 +380,41 @@ fn run_probe() -> Result<()> {
 
     let mut vm = make_vm(&project, &boot_scene, 0)?;
     println!("--- boot ok: {} ---", state(&mut vm));
+
+    // `SAVE_PROBE_SKIP_LOAD` boots a scene and lets it run without restoring a
+    // save. Booting `sys40_mp40` this way exercises the map dispatcher's own
+    // `#z0` prologue (mp30#z0 reset -> mp40#z20 -> mp50#z0 -> mp30#z2, which
+    // sets d[651]=0 and makes sys40_mp20 fade the map container in). That is the
+    // control experiment for the "map container tr stays 0" defect: the loaded
+    // save resumes `sys40_mp40#z0` *inside* its main loop, so the prologue is
+    // skipped and `d[651]` keeps the saved value 1.
+    if std::env::var_os("SAVE_PROBE_SKIP_LOAD").is_some() {
+        println!("stage right after boot:");
+        dump_map_objects(&vm);
+        dump_tr_states(&vm, &[0, 77]);
+        println!();
+        println!("--- fresh-entry run: {frames_after} frames on {boot_scene} ---");
+        for frame in 0..frames_after {
+            if vm.ctx.wait.waiting_for_key() {
+                vm.ctx.on_key_down(VmKey::Enter);
+                vm.ctx.on_key_up(VmKey::Enter);
+            }
+            let _ = step(&mut vm)?;
+            if frame % trace_every == 0 {
+                println!("f{frame:<5} {} | {}", state(&mut vm), input_state(&mut vm));
+                if let Some(line) = tr_state_line(&vm, 1, 77) {
+                    println!("        {line}");
+                }
+            }
+        }
+        println!();
+        println!("--- final (fresh entry) ---");
+        println!("{} | {}", state(&mut vm), input_state(&mut vm));
+        dump_tr_states(&vm, &[0, 77]);
+        dump_render(&mut vm);
+        return Ok(());
+    }
+
     println!("stage right after boot (title):");
     dump_map_objects(&vm);
 
@@ -334,6 +430,7 @@ fn run_probe() -> Result<()> {
     println!("--- render list on the TITLE (control) ---");
     dump_render(&mut vm);
     dump_map_objects(&vm);
+    dump_tr_states(&vm, &[0, 77]);
     println!();
     println!("--- phase 2: load save {save_no} ---");
     syscom::menu_load_slot(&mut vm.ctx, false, save_no);
@@ -352,6 +449,10 @@ fn run_probe() -> Result<()> {
     println!("load applied at +{f}: {}", state(&mut vm));
     println!("stage right after load:");
     dump_map_objects(&vm);
+    dump_tr_states(&vm, &[0, 77]);
+    let watch = std::env::var("SAVE_PROBE_TR_WATCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok());
 
     println!();
     println!("--- phase 3: {frames_after} frames after load ---");
@@ -375,6 +476,11 @@ fn run_probe() -> Result<()> {
             last_scene = scene.clone();
         } else if frame % trace_every == 0 {
             println!("f{frame:<5} {} | {}", state(&mut vm), input_state(&mut vm));
+            if let Some(slot) = watch {
+                if let Some(line) = tr_state_line(&vm, 1, slot) {
+                    println!("        {line}");
+                }
+            }
         }
 
         if !injected && scene == "sys40_mp20" && frame > 60 {
@@ -390,7 +496,30 @@ fn run_probe() -> Result<()> {
             let _ = step(&mut vm)?;
             println!("after click : {}", input_state(&mut vm));
             dump_map_objects(&vm);
+            dump_tr_states(&vm, &[0, 77]);
             dump_render(&mut vm);
+
+            // Optional proof step (`SAVE_PROBE_TR_SET`): the map UI container carries
+            // tr=0, and `visible = parent_visible && info.disp && local_tr > 0`
+            // suppresses the whole descendant subtree. Forcing tr to 255 should make
+            // the map sprites reach the submitted frame.
+            if let Ok(tr) = std::env::var("SAVE_PROBE_TR_SET") {
+                if let Ok(tr) = tr.trim().parse::<i64>() {
+                    let form_id = vm.ctx.ids.form_global_stage;
+                    let slot = env_usize("SAVE_PROBE_TR_OBJ", 77);
+                    if let Some(st) = vm.ctx.globals.stage_forms.get_mut(&form_id) {
+                        if let Some(objs) = st.object_lists.get_mut(&1) {
+                            if let Some(container) = objs.get_mut(slot) {
+                                let before =
+                                    container.lookup_int_prop(&vm.ctx.ids, vm.ctx.ids.obj_tr);
+                                container.set_int_prop(&vm.ctx.ids, vm.ctx.ids.obj_tr, tr);
+                                println!("  [proof] object[{slot}].tr {before:?} -> {tr}");
+                            }
+                        }
+                    }
+                    dump_render(&mut vm);
+                }
+            }
             println!("=== end injection ===");
             println!();
         }

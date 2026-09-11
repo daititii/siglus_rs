@@ -373,7 +373,16 @@ impl SiglusHost {
             return Ok(false);
         }
         if self.script_needs_pump || self.vm.ctx.wait.needs_runtime_poll() {
-            self.pump_vm()?;
+            // A script-side failure (unbalanced stack, unmodelled element, ...)
+            // must not end the Activity. `parse_bool_exit` maps `Err` onto the
+            // same `1` it maps a normal end-of-script onto, so letting the error
+            // escape `step()` used to close the Android activity on any
+            // transient VM hiccup — the user sees a crash-to-desktop with no
+            // message. Log it (rate limited so a per-frame failure cannot flood
+            // logcat) and keep the frame loop alive instead.
+            if let Err(e) = self.pump_vm() {
+                Self::report_pump_error(&e);
+            }
         }
         self.redraw()?;
         let exit_now = should_exit_host_frame(
@@ -394,6 +403,24 @@ impl SiglusHost {
             );
         }
         Ok(exit_now)
+    }
+
+    /// Rate-limited reporting for a recovered `pump_vm` failure.
+    ///
+    /// A script bug that fires every frame would otherwise flood logcat; the
+    /// first few occurrences plus every 300th afterwards are enough to identify
+    /// the site without burying everything else.
+    fn report_pump_error(e: &anyhow::Error) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 3 || n % 300 == 0 {
+            log::error!(
+                "[SG_VM_SCRIPT_ERROR] recovered, host kept alive: count={} err={:#}",
+                n,
+                e
+            );
+        }
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {

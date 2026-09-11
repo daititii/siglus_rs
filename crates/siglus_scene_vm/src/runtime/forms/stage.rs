@@ -3437,9 +3437,31 @@ fn ensure_btnselitem(
     }
 }
 
+/// Hide the standalone gfx sprite of an object that its owning form draws itself.
+///
+/// This is only correct for MWND/embedded slots. `ObjectState::nested_runtime_slot`
+/// marks *both* MWND-owned objects and plain `OBJECT.CHILD` descendants
+/// (see the field comment in globals.rs), but only the former are registered in
+/// `StageFormState::embedded_object_slots_by_stage`. A CHILD descendant owns its
+/// own render node, so hiding it removes that node from the submitted frame:
+/// `build_render_list_pre_wipe` ends with
+/// `list.retain(render_sprite_visible_for_submit)`, which requires
+/// `sprite.visible`, and `GfxRuntime::sync_object_sprite` derives that from the
+/// object's `disp`. Every Rewrite+ map/title menu entry is an
+/// `object[..].child[..]` tree, which is why those screens never appeared.
 fn hide_embedded_gfx_backing(ctx: &mut CommandContext, stage_idx: i64, runtime_slot: usize) {
+    if !is_embedded_render_slot(ctx, stage_idx, runtime_slot) {
+        return;
+    }
     let (gfx, images, layers) = (&mut ctx.gfx, &mut ctx.images, &mut ctx.layers);
     let _ = gfx.object_set_disp(images, layers, stage_idx, runtime_slot as i64, 0);
+}
+
+fn is_embedded_render_slot(ctx: &CommandContext, stage_idx: i64, runtime_slot: usize) -> bool {
+    ctx.globals
+        .stage_forms
+        .values()
+        .any(|st| st.is_embedded_object_slot(stage_idx, runtime_slot))
 }
 
 fn next_embedded_object_slot(st: &mut StageFormState, stage_idx: i64, key: &str) -> usize {
@@ -12110,10 +12132,55 @@ fn dispatch_object_state_op(
             true
         }
         ObjectOpKind::Unknown => {
-            panic!(
-                "unsupported OBJECT op {} tail={:?} al_id={:?}",
-                op, tail, al_id
-            );
+            // Unhandled OBJECT elements must not abort the host process. The
+            // runtime already treats undispatchable element chains as
+            // "warn once, count, skip" (see the `unknown_forms` note in vm.rs);
+            // panicking here turned one unmodelled Rewrite+ element
+            // (`OBJECT.___IAPP_DUMMY`, element code 173, reached from the map
+            // screen) into a `panic in a function that cannot unwind` ->
+            // SIGABRT that killed the Android activity. Report once per element
+            // code with enough context to identify the call site, then continue
+            // as a no-op so the rest of the frame still runs.
+            static REPORTED: OnceLock<std::sync::Mutex<std::collections::BTreeMap<i32, u32>>> =
+                OnceLock::new();
+            let reported = REPORTED.get_or_init(|| std::sync::Mutex::new(Default::default()));
+            let seen = reported
+                .lock()
+                .map(|mut m| {
+                    let e = m.entry(op).or_insert(0);
+                    *e += 1;
+                    *e
+                })
+                .unwrap_or(u32::MAX);
+            if seen <= 3 {
+                let scene = ctx.current_scene_name.as_deref().unwrap_or("<none>");
+                // `log::warn!` rather than `eprintln!`: on Android stderr is not
+                // wired into logcat, and this diagnostic is the only way to see
+                // which script site uses an unmodelled element. The element chain
+                // is included because `obj_u` is the *outer* object index for
+                // child dispatches, so `obj` alone does not identify the target.
+                log::warn!(
+                    "[SG_UNSUPPORTED_OBJECT_OP] n={} scene={} line={} stage={} obj={} op={} tail={:?} al_id={:?} ret_form={:?} args={:?} rhs={:?} chain={:?} current={:?}",
+                    seen,
+                    scene,
+                    ctx.current_line_no,
+                    stage_idx,
+                    obj_u,
+                    op,
+                    tail,
+                    al_id,
+                    ret_form,
+                    script_args,
+                    rhs,
+                    ctx.globals.current_object_chain,
+                    ctx.globals.current_stage_object
+                );
+            }
+            match ret_form {
+                Some(rf) => ctx.stack.push(default_for_ret_form(rf)),
+                None => ctx.stack.push(Value::Int(0)),
+            }
+            true
         }
         _ => false,
     }
