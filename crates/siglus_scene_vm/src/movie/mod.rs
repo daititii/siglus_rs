@@ -2028,7 +2028,32 @@ fn drain_wmv_stream_state(
     target_timer_ms: u64,
 ) -> Result<()> {
     state.decoded_any_this_poll = false;
+
+    // Keep the game path bounded in exactly the same sense as
+    // `wmv-player-wgpu`: the receiver-side presentation queue is part of the
+    // decode-ahead bound.  Draining a bounded channel into an effectively
+    // unbounded local queue defeats backpressure and lets the decoder race
+    // arbitrarily far ahead of the movie/audio clock.  The previous game path
+    // then "fixed" that growth by dropping the oldest presentation frames,
+    // which can discard the very PTS range the renderer currently needs.
+    //
+    // First retire frames that are genuinely stale for the current clock. This
+    // makes room for new decode output without ever deleting future frames just
+    // because the decoder is faster than presentation.
+    if let Some(origin_ms) = state.timeline_origin_ms {
+        discard_wmv_stream_frames(state, origin_ms.saturating_add(target_timer_ms));
+    }
+
+    let mut video_budget = WMV_STREAM_FRAME_KEEP.saturating_sub(state.frames.len());
     for _ in 0..WMV_STREAM_MAX_DRAIN_EVENTS {
+        // Once the presentation queue is full, stop receiving Video events and
+        // let the bounded mpsc channel block the decoder thread.  This mirrors
+        // the standalone player's `MAX_PENDING_VIDEO` policy.  Info is always
+        // sent before Video, and Done cannot be queued ahead of undrained Video,
+        // so breaking here cannot hide control events that are actionable now.
+        if video_budget == 0 {
+            break;
+        }
         match state.rx.try_recv() {
             Ok(Ok(WmvStreamEvent::Info { width, height })) => {
                 state.width = (width > 0).then_some(width).or(state.width);
@@ -2060,6 +2085,7 @@ fn drain_wmv_stream_state(
                     .position(|queued| queued.source_pts_ms > decoded.source_pts_ms)
                     .unwrap_or(state.frames.len());
                 state.frames.insert(insert_at, decoded);
+                video_budget = video_budget.saturating_sub(1);
 
                 // Derive cadence only from adjacent presentation-order PTS. Decode-order
                 // deltas are invalid whenever B pictures reorder around a future anchor.
@@ -2103,8 +2129,9 @@ fn drain_wmv_stream_state(
     }
 
     // Do not discard against a movie-local timer until the consumer has chosen
-    // a presentation origin from the PTS-sorted queue. This function may run
-    // while the first decode batch is still being reordered.
+    // a presentation origin from the PTS-sorted queue. This second pass handles
+    // frames inserted during this drain that are already stale for a clock which
+    // advanced while decoding.
     if let Some(origin_ms) = state.timeline_origin_ms {
         discard_wmv_stream_frames(state, origin_ms.saturating_add(target_timer_ms));
     }
@@ -2123,9 +2150,9 @@ fn discard_wmv_stream_frames(state: &mut WmvStreamState, target_source_pts_ms: u
         }
         state.frames.pop_front();
     }
-    while state.frames.len() > WMV_STREAM_FRAME_KEEP {
-        state.frames.pop_front();
-    }
+    // Do not impose the queue bound by dropping the front here.  Future frames
+    // are valid presentation data; the bound is enforced by receiver
+    // backpressure in `drain_wmv_stream_state`.
 }
 
 fn select_wmv_stream_frame<'a>(
@@ -3974,27 +4001,86 @@ fn decode_wmv_audio_for_path(
     path: &Path,
     cancel: &AtomicBool,
 ) -> Result<Option<MovieAudio>> {
-    // Match the already validated standalone WMV player at the codec boundary:
-    // open one AsfWmaDecoder at the beginning of the ASF stream and call next_frame()
-    // sequentially until EOF.  The engine's Kira streaming adapter is a different path
-    // from the standalone player and is where the reported decode failure appears, so
-    // do not use that adapter for WMV playback here.
-    //
-    // This work runs on the existing WMV audio worker thread. Video is not blocked
-    // while PCM is materialized, and when the track becomes ready start_audio() seeks
-    // only in decoded PCM, never in the compressed WMA bitstream.
+    // Native WMV playback must become ready after a bounded head probe, not after
+    // decoding the whole WMA soundtrack. `WmvMovieAudioDecoder` already provides
+    // the forward-only Kira streaming path; this probe supplies only the metadata
+    // and A/V timeline alignment it needs. MPEG uses its own independent probe and
+    // decoder path and is intentionally untouched here.
     let timeline_origin_ms = probe_wmv_first_video_pts_ms(path)?.unwrap_or(0);
     if cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
+
     let file = fs::File::open(path)
         .with_context(|| format!("open WMV audio source: {}", path.display()))?;
-    decode_wmv_audio_full_from_reader(
-        BufReader::new(file),
-        cancel,
+    let Some(mut decoder) = open_wmv_wma_decoder(BufReader::new(file))? else {
+        return Ok(None);
+    };
+    let channels = decoder.channels();
+    let sample_rate = decoder.sample_rate();
+    if channels == 0 || sample_rate == 0 {
+        return Ok(None);
+    }
+
+    // Decode only until the first PCM frame. Besides validating that the selected
+    // WMA stream can start, its ASF PTS determines whether the movie timeline needs
+    // leading silence or source-frame skipping. The streaming decoder later reopens
+    // the file from byte zero and consumes every compressed media object in order.
+    let first = decoder
+        .next_frame()
+        .with_context(|| format!("probe first WMA frame: {}", path.display()))?;
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let first_audio_pts_ms = first.pts_ms as u64;
+    let (initial_silence_frames, source_skip_frames) = wmv_audio_alignment_frames(
+        first_audio_pts_ms,
         timeline_origin_ms,
-    )
-    .with_context(|| format!("decode WMA audio: {}", path.display()))
+        sample_rate,
+    );
+
+    // ASF File Properties carries the finite movie duration. Rebase it to the same
+    // local timeline used by `poll_wmv_stream_frame_for_path` (whose zero is the first
+    // presented video PTS), then let Kira request decoded WMA frames incrementally.
+    let duration_ms = decoder
+        .duration_ms()
+        .and_then(|duration| wmv_rebase_duration_ms(duration, timeline_origin_ms));
+
+    let Some(duration_ms) = duration_ms.filter(|duration| *duration > 0) else {
+        // Rare malformed/streaming ASF files may omit a usable play duration. Keep
+        // the old static fallback for that case because Kira requires a finite
+        // `num_frames`; normal WMV files never take this full-decode path.
+        let file = fs::File::open(path)
+            .with_context(|| format!("reopen WMV audio fallback: {}", path.display()))?;
+        return decode_wmv_audio_full_from_reader(
+            BufReader::new(file),
+            cancel,
+            timeline_origin_ms,
+        )
+        .with_context(|| format!("decode WMA audio fallback: {}", path.display()));
+    };
+
+    let num_frames = (((duration_ms as u128) * sample_rate as u128 + 999) / 1000)
+        .max(1)
+        .min(usize::MAX as u128) as usize;
+
+    Ok(Some(MovieAudio {
+        samples: Arc::new(Vec::new()),
+        mpeg_stream: None,
+        wmv_stream: Some(WmvStreamAudio {
+            path: Arc::new(path.to_path_buf()),
+            num_frames,
+            initial_silence_frames,
+            source_skip_frames,
+        }),
+        channels,
+        sample_rate,
+        start_ms: 0,
+        duration_ms: Some(duration_ms),
+    }))
 }
 
 fn decode_mpeg2_audio_for_path(

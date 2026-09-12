@@ -452,6 +452,12 @@ pub struct AsfWmaDecoder<R: Read + Seek> {
     audio_block_align: u16,
     decoder: AudioCodecDecoder,
     assembler: FrameAssembler,
+    /// Completed ASF media objects already returned by `AsfFile::read_packet`
+    /// but not yet consumed by `next_frame`. As with WMV video, one ASF packet
+    /// can contain multiple WMA media objects. Returning one decoded PCM frame
+    /// must not discard the remaining objects because WMA superframes / bit
+    /// reservoir state depends on consuming the stream strictly in order.
+    pending_payloads: VecDeque<AsfPayload>,
     last_pts_ms: u32,
     flushed_eof: bool,
 }
@@ -491,6 +497,7 @@ impl<R: Read + Seek> AsfWmaDecoder<R> {
             audio_block_align: audio_info.block_align,
             decoder,
             assembler: FrameAssembler::default(),
+            pending_payloads: VecDeque::new(),
             last_pts_ms: 0,
             flushed_eof: false,
         })
@@ -513,52 +520,66 @@ impl<R: Read + Seek> AsfWmaDecoder<R> {
     /// Returns `Ok(None)` on end-of-stream.
     pub fn next_frame(&mut self) -> Result<Option<DecodedAudioFrame>> {
         loop {
-            let payloads = match self.asf.read_packet(&mut self.reader) {
-                Ok(p) => p,
-                Err(DecoderError::EndOfStream) => {
-                    if self.flushed_eof {
+            // `AsfFile::read_packet` can complete multiple WMA media objects in
+            // one ASF packet. `next_frame` returns only one PCM frame, so keep
+            // the packet tail across calls exactly like `AsfWmv2Decoder`.
+            // Dropping those objects desynchronizes stateful WMA superframes /
+            // bit reservoir and eventually produces frame-length/bitstream
+            // overflow errors even though the ASF stream itself is valid.
+            let payload = if let Some(payload) = self.pending_payloads.pop_front() {
+                payload
+            } else {
+                let payloads = match self.asf.read_packet(&mut self.reader) {
+                    Ok(p) => p,
+                    Err(DecoderError::EndOfStream) => {
+                        if self.flushed_eof {
+                            return Ok(None);
+                        }
+                        self.flushed_eof = true;
+                        if let Some(frame) = self.decoder.decode_packet(&[], self.last_pts_ms)? {
+                            return Ok(Some(DecodedAudioFrame {
+                                pts_ms: frame.pts_ms,
+                                frame,
+                            }));
+                        }
                         return Ok(None);
                     }
-                    self.flushed_eof = true;
-                    if let Some(frame) = self.decoder.decode_packet(&[], self.last_pts_ms)? {
-                        return Ok(Some(DecodedAudioFrame {
-                            pts_ms: frame.pts_ms,
-                            frame,
-                        }));
-                    }
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            };
-
-            for payload in payloads {
-                if payload.stream_number != self.audio_stream_number {
-                    continue;
-                }
-                let Some((pts_ms, _is_key, data)) = self.assembler.push(payload) else {
+                    Err(e) => return Err(e),
+                };
+                self.pending_payloads.extend(
+                    payloads
+                        .into_iter()
+                        .filter(|payload| payload.stream_number == self.audio_stream_number),
+                );
+                let Some(payload) = self.pending_payloads.pop_front() else {
                     continue;
                 };
-                self.last_pts_ms = pts_ms;
-                let audio_format_tag = self.audio_format_tag;
-                let audio_block_align = self.audio_block_align;
-                let media_object_len = data.len();
-                let frame = self.decoder.decode_packet(&data, pts_ms).map_err(|err| {
-                    let context = format!(
-                        "WMA tag=0x{audio_format_tag:04x} block_align={audio_block_align} media_object_len={media_object_len} pts_ms={pts_ms}",
-                    );
-                    match err {
-                        DecoderError::InvalidData(message) => {
-                            DecoderError::InvalidData(format!("{context}: {message}"))
-                        }
-                        DecoderError::Unsupported(message) => {
-                            DecoderError::Unsupported(format!("{context}: {message}"))
-                        }
-                        other => other,
+                payload
+            };
+
+            let Some((pts_ms, _is_key, data)) = self.assembler.push(payload) else {
+                continue;
+            };
+            self.last_pts_ms = pts_ms;
+            let audio_format_tag = self.audio_format_tag;
+            let audio_block_align = self.audio_block_align;
+            let media_object_len = data.len();
+            let frame = self.decoder.decode_packet(&data, pts_ms).map_err(|err| {
+                let context = format!(
+                    "WMA tag=0x{audio_format_tag:04x} block_align={audio_block_align} media_object_len={media_object_len} pts_ms={pts_ms}",
+                );
+                match err {
+                    DecoderError::InvalidData(message) => {
+                        DecoderError::InvalidData(format!("{context}: {message}"))
                     }
-                })?;
-                if let Some(frame) = frame {
-                    return Ok(Some(DecodedAudioFrame { pts_ms, frame }));
+                    DecoderError::Unsupported(message) => {
+                        DecoderError::Unsupported(format!("{context}: {message}"))
+                    }
+                    other => other,
                 }
+            })?;
+            if let Some(frame) = frame {
+                return Ok(Some(DecodedAudioFrame { pts_ms, frame }));
             }
         }
     }
