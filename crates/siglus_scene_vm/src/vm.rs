@@ -1,5 +1,7 @@
 //! Scene VM
 
+mod early_save;
+
 use anyhow::{anyhow, bail, Result};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -8185,6 +8187,9 @@ impl<'a> SceneVm<'a> {
         rd: &mut crate::original_save::OriginalStreamReader<'_>,
         has_font: bool,
     ) -> Result<()> {
+        if rd.early_local_layout {
+            return self.read_early_local_data_pod(rd);
+        }
         let script = &mut self.ctx.globals.script;
 
         script.cur_koe_no = rd.i32()? as i64;
@@ -8964,6 +8969,9 @@ impl<'a> SceneVm<'a> {
     }
 
     fn read_cpp_object(rd: &mut crate::original_save::OriginalStreamReader<'_>) -> Result<runtime::globals::ObjectState> {
+        if rd.early_local_layout {
+            return Self::read_early_object(rd);
+        }
         let mut obj = runtime::globals::ObjectState::default();
         obj.object_type = rd.i32()? as i64;
         obj.base.wipe_copy = rd.i32()? as i64;
@@ -9159,6 +9167,9 @@ impl<'a> SceneVm<'a> {
     fn read_cpp_mwnd_glyph(
         rd: &mut crate::original_save::OriginalStreamReader<'_>,
     ) -> Result<runtime::globals::MwndGlyphState> {
+        if rd.early_local_layout {
+            return Self::read_early_mwnd_glyph(rd);
+        }
         let moji_type = rd.i32()?;
         let code = rd.i32()?;
         let size = rd.i32()? as i64;
@@ -9293,6 +9304,9 @@ impl<'a> SceneVm<'a> {
         rd: &mut crate::original_save::OriginalStreamReader<'_>,
         m: &mut runtime::globals::MwndState,
     ) -> Result<runtime::globals::MwndMessagePageState> {
+        if rd.early_local_layout {
+            return Self::read_early_mwnd_message(rd, m);
+        }
         let cnt_x = rd.i32()? as i64;
         let cnt_y = rd.i32()? as i64;
         let pos_x = rd.i32()? as i64;
@@ -9513,6 +9527,9 @@ impl<'a> SceneVm<'a> {
         rd: &mut crate::original_save::OriginalStreamReader<'_>,
         m: &mut runtime::globals::MwndState,
     ) -> Result<()> {
+        if rd.early_local_layout {
+            return Self::read_early_mwnd_name(rd, m);
+        }
         let _template_no = rd.i32()?;
         let pos_x = rd.i32()? as i64;
         let pos_y = rd.i32()? as i64;
@@ -9588,6 +9605,9 @@ impl<'a> SceneVm<'a> {
         rd: &mut crate::original_save::OriginalStreamReader<'_>,
         m: &mut runtime::globals::MwndState,
     ) -> Result<()> {
+        if rd.early_local_layout {
+            return Self::read_early_mwnd_selection(rd, m);
+        }
         let _template = rd.i32()?;
         for _ in 0..10 {
             let _ = rd.i32()?;
@@ -9846,6 +9866,9 @@ impl<'a> SceneVm<'a> {
     }
 
     fn read_cpp_world(rd: &mut crate::original_save::OriginalStreamReader<'_>, world_no: i32) -> Result<runtime::globals::WorldState> {
+        if rd.early_local_layout {
+            return Self::read_early_world(rd, world_no);
+        }
         let mut world = runtime::globals::WorldState::new(world_no);
         world.mode = rd.i32()?;
         world.camera_eye_x = Self::read_cpp_int_event_raw(rd)?;
@@ -10115,6 +10138,9 @@ impl<'a> SceneVm<'a> {
     fn read_cpp_btn_select(
         rd: &mut crate::original_save::OriginalStreamReader<'_>,
     ) -> Result<runtime::globals::BtnSelectRuntimeState> {
+        if rd.early_local_layout {
+            return Self::read_early_btn_select(rd);
+        }
         let template_no = rd.i32()? as i64;
         let mut param = [0i64; 28];
         for value in &mut param {
@@ -10236,6 +10262,9 @@ impl<'a> SceneVm<'a> {
         runtime::globals::StageFormState,
         runtime::globals::BtnSelectRuntimeState,
     )> {
+        if rd.early_local_layout {
+            return Self::read_early_stage(rd, stage_idx);
+        }
         let mut st = runtime::globals::StageFormState::default();
         st.initialized_from_gameexe = true;
         st.group_lists.insert(stage_idx, rd.fixed_items(|rd| Self::read_cpp_group(rd))?);
@@ -10541,6 +10570,9 @@ impl<'a> SceneVm<'a> {
     }
 
     fn read_cpp_msg_back(rd: &mut crate::original_save::OriginalStreamReader<'_>) -> Result<runtime::globals::MsgBackState> {
+        if rd.early_local_layout {
+            return Self::read_early_msg_back(rd);
+        }
         let cnt = rd.i32()?.max(0) as usize;
         let mut st = runtime::globals::MsgBackState::default();
         st.history.clear();
@@ -10623,6 +10655,17 @@ impl<'a> SceneVm<'a> {
         }
 
         let mut st = runtime::globals::StageFormState::default();
+        // Early engines saved one global world list before both stages.
+        if rd.early_local_layout {
+            let mut world_no = 0;
+            let worlds = rd.fixed_items(|rd| {
+                let world = Self::read_cpp_world(rd, world_no);
+                world_no += 1;
+                world
+            })?;
+            st.world_lists.insert(0, worlds.clone());
+            st.world_lists.insert(1, worlds);
+        }
         let (back, back_btn_select) = Self::read_cpp_stage(rd, 0)?;
         let (front, front_btn_select) = Self::read_cpp_stage(rd, 1)?;
         st.initialized_from_gameexe = true;
@@ -11133,10 +11176,11 @@ impl<'a> SceneVm<'a> {
         let last_mwnd = rd.element()?;
         self.apply_saved_current_mwnd_elements(&cur_mwnd, &cur_sel_mwnd, &last_mwnd);
         self.ctx.globals.syscom.current_save_scene_title = rd.string()?;
-        self.ctx.globals.syscom.current_save_full_message = rd.string()?;
+        let btn_cnt = self.mwnd_waku_btn_count();
+        rd.detect_early_local_layout(btn_cnt);
+        self.ctx.globals.syscom.current_save_full_message = if rd.early_local_layout { String::new() } else { rd.string()? };
         self.ctx.globals.syscom.current_save_message.clear();
 
-        let btn_cnt = self.mwnd_waku_btn_count();
         self.ctx.globals.syscom.mwnd_btn_disable.clear();
         for idx in 0..btn_cnt {
             if rd.bool()? {
@@ -12745,6 +12789,81 @@ mod command_dispatch_tests {
     }
 
     #[test]
+    fn early_object_record_preserves_animation_and_next_record_boundary() {
+        use crate::original_save::OriginalStreamReader;
+        // Native fixed object POD, empty variable lists/strings, full GAN work,
+        // and no children. This layout predates compact SAVE_EVENT records.
+        let mut bytes = vec![0u8; 2115];
+        for (offset, value) in [
+            (0, 1i32), (364, 1), (372, 7), // Image, visible, pattern value.
+            (412, 50), (416, 2), (420, -1), // Draw order, layer, world.
+            (432, 120), (472, 200), (476, 240), // X/Y event values.
+            (480, 30), (484, 60), (492, 100), (496, 170), (500, 240),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&42i32.to_le_bytes());
+        let mut rd = OriginalStreamReader::new(&bytes);
+        rd.early_local_layout = true;
+        rd.legacy_local_layout = true;
+        let obj = SceneVm::read_cpp_object(&mut rd).unwrap();
+        assert_eq!(obj.object_type, 1);
+        assert_eq!(obj.runtime.prop_events.patno.value, 7);
+        assert_eq!((obj.base.order, obj.base.layer), (50, 2));
+        assert!(!obj.button.enabled);
+        assert_eq!(obj.runtime.prop_events.x.value, 120);
+        assert_eq!(obj.runtime.prop_events.y.value, 240);
+        assert_eq!(obj.runtime.prop_events.y.cur_value, 170);
+        assert_eq!((obj.runtime.prop_events.y.cur_time, obj.runtime.prop_events.y.end_time), (30, 60));
+        assert!(obj.runtime.child_objects.is_empty());
+        assert_eq!(rd.i32().unwrap(), 42);
+    }
+
+    #[test]
+    fn early_message_page_restores_packed_flags_and_glyphs_without_outline_fields() {
+        use crate::original_save::{OriginalStreamReader, OriginalStreamWriter};
+        let mut w = OriginalStreamWriter::new();
+        for value in [24, 3, 20, 40, 0, 0, 34, -1, 16, 2, 1, 12, 2, 38, 0, 0, 0, 0, 0, 0] {
+            w.push_i32(value);
+        }
+        for value in [3, 1, 16] { w.push_i32(value); } // Character colors, indent.
+        w.push_raw(&('「' as u16).to_le_bytes());
+        w.push_i32(1);
+        w.push_i32(0);
+        w.push_bool(true); // Type decided, then line head before ruby position.
+        w.push_bool(false);
+        w.push_i32(50);
+        w.push_i32(60);
+        w.push_bool(true);
+        w.push_i32(1);
+        w.push_i32(0);
+        w.push_str("A");
+        w.push_str("ruby");
+        w.push_i32(1);
+        for value in [0, 'A' as i32, 34, 2, 1, 20, 40] { w.push_i32(value); }
+        w.push_bool(true);
+        w.push_bool(false);
+        w.push_i32(42);
+        let bytes = w.into_inner();
+        let mut rd = OriginalStreamReader::new(&bytes);
+        rd.early_local_layout = true;
+        let mut m = runtime::globals::MwndState::default();
+        let page = SceneVm::read_cpp_mwnd_message(&mut rd, &mut m).unwrap();
+        assert_eq!(page.msg_text, "A");
+        assert_eq!(page.cursor_pos, (20, 40));
+        assert_eq!(page.indent_moji, Some('「'));
+        assert!(page.cur_msg_type_decided && page.ruby_start_ready);
+        assert!(!page.line_head);
+        assert_eq!(page.ruby_start_pos, (50, 60));
+        assert_eq!(page.glyphs[0].x, 20);
+        assert_eq!(page.glyphs[0].y, 40);
+        assert!(page.glyphs[0].appeared);
+        assert!(!page.glyphs[0].fuchi);
+        assert_eq!(page.msgbtn, None);
+        assert_eq!(rd.i32().unwrap(), 42);
+    }
+
+    #[test]
     fn legacy_local_pod_restores_flags_without_consuming_stack_data() {
         use crate::original_save::OriginalStreamReader;
         let mut bytes = vec![0u8; 344];
@@ -12803,33 +12922,37 @@ mod command_dispatch_tests {
     #[test]
     fn legacy_backlog_entries_do_not_have_save_id_check_bytes() {
         use crate::original_save::{OriginalStreamReader, OriginalStreamWriter};
-        let mut w = OriginalStreamWriter::new();
-        w.push_i32(2);
-        for message in ["first", "second"] {
-            w.push_bool(false);
-            w.push_str(message);
-            w.push_str("name");
-            w.push_str("display name");
-            for value in [0, 0, 1, 123, 1, 2, 0] { w.push_i32(value); }
-            w.push_str("");
-            w.push_i32(36);
-            w.push_i32(29);
-            w.push_tid_zero();
+        for early in [false, true] {
+            let mut w = OriginalStreamWriter::new();
+            w.push_i32(2);
+            for message in ["first", "second"] {
+                w.push_bool(false);
+                w.push_str(message);
+                w.push_str("name");
+                w.push_str("display name");
+                for value in [0, 0, 1, 123, 1, 2, 0] { w.push_i32(value); }
+                w.push_str("");
+                w.push_i32(36);
+                w.push_i32(29);
+                if !early { w.push_tid_zero(); }
+            }
+            for value in [0, 1, 2] { w.push_i32(value); }
+            if early { w.push_bool(true); } else { w.push_i32(1); }
+            w.push_i32(42);
+            let bytes = w.into_inner();
+            let mut rd = OriginalStreamReader::new(&bytes);
+            rd.legacy_local_layout = true;
+            rd.early_local_layout = early;
+            let backlog = SceneVm::read_cpp_msg_back(&mut rd).unwrap();
+            assert_eq!(backlog.history_cnt, 2);
+            assert_eq!(backlog.history[0].msg_str, "first");
+            assert_eq!(backlog.history[1].msg_str, "second");
+            assert_eq!(backlog.history[1].koe_no_list, vec![123]);
+            assert_eq!(backlog.history[1].chr_no_list, vec![2]);
+            assert_eq!(backlog.history_insert_pos, 2);
+            assert!(backlog.new_msg_flag);
+            assert_eq!(rd.i32().unwrap(), 42);
         }
-        for value in [0, 1, 2, 1] { w.push_i32(value); }
-        w.push_i32(42);
-        let bytes = w.into_inner();
-        let mut rd = OriginalStreamReader::new(&bytes);
-        rd.legacy_local_layout = true;
-        let backlog = SceneVm::read_cpp_msg_back(&mut rd).unwrap();
-        assert_eq!(backlog.history_cnt, 2);
-        assert_eq!(backlog.history[0].msg_str, "first");
-        assert_eq!(backlog.history[1].msg_str, "second");
-        assert_eq!(backlog.history[1].koe_no_list, vec![123]);
-        assert_eq!(backlog.history[1].chr_no_list, vec![2]);
-        assert_eq!(backlog.history_insert_pos, 2);
-        assert!(backlog.new_msg_flag);
-        assert_eq!(rd.i32().unwrap(), 42);
     }
 
     #[test]
