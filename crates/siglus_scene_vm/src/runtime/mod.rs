@@ -5771,6 +5771,34 @@ impl CommandContext {
         self.ui.set_sys_overlay(false, String::new());
     }
 
+    fn replay_msg_back_koe(&mut self, history_index: usize) {
+        let Some(entry) = self.globals.msgbk_forms
+            .get_mut(&self.ids.form_global_msgbk)
+            .and_then(|state| state.history.get_mut(history_index))
+        else {
+            return;
+        };
+        if entry.koe_no_list.is_empty() {
+            return;
+        }
+        // C_elm_msg_back::button_proc cycles through voices on repeated clicks.
+        let index = usize::try_from(entry.koe_play_no)
+            .ok().filter(|index| *index < entry.koe_no_list.len()).unwrap_or(0);
+        let koe_no = entry.koe_no_list[index];
+        let chara_no = entry.chr_no_list.get(index).copied().unwrap_or(-1);
+        entry.koe_play_no = index as i64 + 1;
+
+        // Backlog playback is EXKOE in the original engine: route the selected
+        // character's volume without changing the ongoing message's voice.
+        forms::global::remember_global_koe(self, koe_no, chara_no, true);
+        let jitan_rate = self.koe_jitan_rate(None, true);
+        if let Err(err) = self.koe.play_koe_no_with_rate(
+            &mut self.audio, koe_no, &self.globals.append_dir, jitan_rate,
+        ) {
+            log::error!("MSGBK voice replay failed koe_no={koe_no} chara_no={chara_no}: {err:#}");
+        }
+    }
+
     fn handle_msg_back_key(&mut self, k: input::VmKey) -> bool {
         if !self.globals.syscom.msg_back_open {
             return false;
@@ -5813,6 +5841,7 @@ impl CommandContext {
                     Some(ui::MsgBackHitAction::Close) => self.close_msg_back_proc(),
                     Some(ui::MsgBackHitAction::Up) => self.msg_back_target_up(),
                     Some(ui::MsgBackHitAction::Down) => self.msg_back_target_down(),
+                    Some(ui::MsgBackHitAction::ReplayKoe(index)) => self.replay_msg_back_koe(index),
                     Some(ui::MsgBackHitAction::Slider) => {
                         self.globals.syscom.msg_back_slider_dragging = true;
                         self.globals.syscom.msg_back_slider_drag_start_mouse = self.input.mouse_y;
@@ -16403,5 +16432,87 @@ mod movie_menu_wait_tests {
         ctx.wait.wait_object_movie(form, 1, 0, true, true);
         assert!(!ctx.wait_poll());
         assert_eq!(ctx.stack.pop().and_then(|v| v.as_i64()), Some(0));
+    }
+}
+
+
+#[cfg(test)]
+mod msg_back_voice_tests {
+    use super::*;
+
+    fn backlog_with_button(project: PathBuf, voices: &[(i64, i64)]) -> CommandContext {
+        let mut ctx = CommandContext::new(project);
+        let mut history = globals::MsgBackState::default();
+        for &(voice, character) in voices {
+            history.add_koe(voice, character, 0, 0);
+        }
+        history.add_msg("Backlog voice", "", 0, 0);
+        ctx.globals.msgbk_forms.insert(ctx.ids.form_global_msgbk, history);
+        ctx.globals.syscom.msg_back_open = true;
+        let mut projection = ctx.build_msg_back_projection().unwrap();
+        projection.window_x = 100;
+        projection.window_y = 50;
+        projection.window_w = 320;
+        projection.window_h = 200;
+        projection.disp_margin = (10, 10, 10, 10);
+        projection.koe_buttons = vec![ui::MsgBackEntryButtonProjection {
+            history_index: 0, file: None, x: 30, y: 5,
+        }];
+        ctx.ui.set_msg_back_projection(Some(projection));
+        let image = ctx.images.solid_rgba((255, 255, 255, 255));
+        ctx.ui.msg_back.koe_buttons = vec![ui::MsgBackButtonRuntime {
+            image: Some(image), size: Some((20, 20)), center: Some((4, 3)),
+            ..Default::default()
+        }];
+        ctx
+    }
+
+    #[test]
+    fn backlog_voice_click_cycles_clips_and_preserves_message_voice() {
+        let mut ctx = backlog_with_button(std::env::temp_dir().join("siglus-backlog-click-test"), &[(10, 2), (11, 3)]);
+        ctx.globals.script.cur_koe_no = 99;
+        ctx.globals.script.cur_chr_no = 7;
+        ctx.globals.syscom.replay_koe = Some((99, 7));
+        assert_eq!(ctx.ui.msg_back_hit_action(128, 55), None, "clipped part of icon");
+        assert_eq!(ctx.ui.msg_back_hit_action(128, 62), Some(ui::MsgBackHitAction::ReplayKoe(0)));
+        for (voice, character, next) in [(10, 2, 1), (11, 3, 2), (10, 2, 1)] {
+            ctx.on_mouse_move(128, 62);
+            ctx.on_mouse_down(input::VmMouseButton::Left);
+            ctx.on_mouse_up(input::VmMouseButton::Left);
+            assert!(ctx.koe.is_playing_any(), "click must request voice decoding");
+            assert_eq!(ctx.globals.sound_routing.koe_chara_no, character);
+            assert!(ctx.globals.sound_routing.koe_ex_flag);
+            assert_eq!(ctx.globals.int_props[&(constants::fm::GLOBAL as u32)]
+                [&constants::elm_value::GLOBAL_KOE_CHECK_GET_KOE_NO], voice);
+            assert_eq!(ctx.msg_back_state().unwrap().history[0].koe_play_no, next);
+            assert_eq!(ctx.globals.script.cur_koe_no, 99);
+            assert_eq!(ctx.globals.script.cur_chr_no, 7);
+            assert_eq!(ctx.globals.syscom.replay_koe, Some((99, 7)));
+            assert!(!ctx.globals.syscom.msg_back_content_dragging);
+        }
+        // A scrolled-out entry can retain its cached texture but not its hit area.
+        ctx.ui.msg_back.projection.as_mut().unwrap().koe_buttons.clear();
+        assert_eq!(ctx.ui.msg_back_hit_action(128, 62), None);
+    }
+
+    #[test]
+    #[ignore = "requires audio output, SIGLUS_BACKLOG_TEST_GAME and SIGLUS_BACKLOG_TEST_KOE"]
+    fn backlog_voice_click_reaches_audio_output() {
+        let project = PathBuf::from(std::env::var("SIGLUS_BACKLOG_TEST_GAME").unwrap());
+        let voice: i64 = std::env::var("SIGLUS_BACKLOG_TEST_KOE").unwrap().parse().unwrap();
+        let mut ctx = backlog_with_button(project, &[(voice, 2)]);
+        ctx.on_mouse_move(128, 62);
+        ctx.on_mouse_down(input::VmMouseButton::Left);
+        ctx.on_mouse_up(input::VmMouseButton::Left);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ctx.koe.current_koe_no() != voice && std::time::Instant::now() < deadline {
+            ctx.koe.tick(&mut ctx.audio);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(ctx.koe.current_koe_no(), voice, "voice must decode and start");
+        assert!(ctx.audio.is_enabled(), "requires a working audio output device");
+        assert!(ctx.koe.is_playing_any());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(ctx.koe.current_play_pos_ms() > 0, "audio playback must advance");
     }
 }

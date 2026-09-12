@@ -319,6 +319,7 @@ pub enum MsgBackHitAction {
     Up,
     Down,
     Slider,
+    ReplayKoe(usize),
 }
 
 #[derive(Debug, Default)]
@@ -3622,6 +3623,24 @@ impl UiRuntime {
             MsgBackHitAction::Down,
         ) {
             return Some(action);
+        }
+        // Entry buttons scroll with the text and use the same clipping rectangle
+        // as their sprites. Cached buttons outside the current projection must
+        // not remain clickable after scrolling.
+        let (dl, dt, dr, db) = projection.disp_margin;
+        if x >= projection.window_x + dl as i32
+            && x < projection.window_x + projection.window_w as i32 - dr as i32
+            && y >= projection.window_y + dt as i32
+            && y < projection.window_y + projection.window_h as i32 - db as i32
+        {
+            for (entry, button) in projection.koe_buttons.iter().zip(&self.msg_back.koe_buttons) {
+                if let Some(action) = Self::msg_back_button_hit(
+                    projection, button, (entry.x, entry.y), x, y,
+                    MsgBackHitAction::ReplayKoe(entry.history_index),
+                ) {
+                    return Some(action);
+                }
+            }
         }
         None
     }
