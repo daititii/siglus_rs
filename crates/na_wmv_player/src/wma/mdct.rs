@@ -29,7 +29,7 @@ impl MdctNaive {
         if let Some(plan) = self
             .plan
             .as_ref()
-            .filter(|plan| plan.phase.len() == self.len)
+            .filter(|plan| plan.phase.len() * 2 == self.len)
         {
             plan.imdct_half(dst, src, self.scale);
             return;
@@ -109,47 +109,53 @@ impl Complex {
 
 struct FftPlan {
     phase: Vec<Complex>,
-    output_phase: Vec<Complex>,
     twiddles: Vec<Complex>,
     bit_reversed: Vec<usize>,
 }
 
 impl FftPlan {
     fn new(len: usize) -> Self {
-        let fft_len = 2 * len;
-        let phase_step = -PI / fft_len as f64;
+        let fft_len = len / 2;
+        let phase_step = -PI / len as f64;
         Self {
-            phase: (0..len)
-                .map(|i| Complex::rotation(phase_step * i as f64))
+            // Split the constant quarter-sample phase equally between the
+            // input and output rotations so they can share one table.
+            phase: (0..fft_len)
+                .map(|i| Complex::rotation(phase_step * (i as f64 + 0.125)))
                 .collect(),
-            output_phase: (0..len)
-                .map(|i| Complex::rotation(phase_step * (i as f64 + 0.5)))
-                .collect(),
-            twiddles: (0..len)
+            twiddles: (0..fft_len / 2)
                 .map(|i| Complex::rotation(-2.0 * PI * i as f64 / fft_len as f64))
                 .collect(),
             bit_reversed: (0..fft_len)
-                .map(|i| i.reverse_bits() >> (usize::BITS - fft_len.trailing_zeros()))
+                .map(|i| {
+                    if fft_len == 1 {
+                        0
+                    } else {
+                        i.reverse_bits() >> (usize::BITS - fft_len.trailing_zeros())
+                    }
+                })
                 .collect(),
         }
     }
 
     fn imdct_half(&self, dst: &mut [f32], src: &[f32], scale: f64) {
-        let len = self.phase.len();
-        let fft_len = 2 * len;
+        let fft_len = self.phase.len();
+        let len = 2 * fft_len;
         let mut work = vec![Complex::default(); fft_len];
 
         // The required half IMDCT is the reversed DCT-IV:
         // D[k] = sum_j x[j] cos(pi/N * (j + 1/2) * (k + 1/2)).
-        // Premodulate N inputs, zero-pad to 2N, FFT, then postmodulate.
-        // Write directly in bit-reversed order for the radix-2 FFT.
-        for j in 0..len {
-            let phase = self.phase[j];
-            let value = src[j] as f64;
+        // Pack z[j] = x[2j] + i*x[N-1-2j], j = 0..N/2, and rotate
+        // by exp(-i*pi/N * (j + 1/8)). After an N/2-point forward FFT
+        // and the same rotation at index k, the real part is D[2k]
+        // and the imaginary part is -D[N-1-2k]. Both components are
+        // useful; no zero padding or redundant FFT outputs are needed.
+        for j in 0..fft_len {
             work[self.bit_reversed[j]] = Complex {
-                re: value * phase.re,
-                im: value * phase.im,
-            };
+                re: src[2 * j] as f64,
+                im: src[len - 1 - 2 * j] as f64,
+            }
+            .mul(self.phase[j]);
         }
 
         let mut width = 2;
@@ -173,8 +179,10 @@ impl FftPlan {
             width *= 2;
         }
 
-        for k in 0..len {
-            dst[len - 1 - k] = (work[k].mul(self.output_phase[k]).re * scale) as f32;
+        for k in 0..fft_len {
+            let value = work[k].mul(self.phase[k]);
+            dst[len - 1 - 2 * k] = (value.re * scale) as f32;
+            dst[2 * k] = (-value.im * scale) as f32;
         }
     }
 }
@@ -182,6 +190,32 @@ impl FftPlan {
 #[cfg(test)]
 mod tests {
     use super::MdctNaive;
+
+    #[test]
+    fn packed_imdct_preserves_each_coefficient_and_scale() {
+        // Exercise both members of every complex pair, including the N=2
+        // case whose one-point FFT has no butterfly stages.
+        for len in [2, 4, 8, 16, 32] {
+            for coefficient in 0..len {
+                let mut input = vec![0.0; len];
+                input[coefficient] = 1.0;
+                for scale in [1.0, -0.25, 0.0] {
+                    let transform = MdctNaive::new(len, scale);
+                    let mut expected = vec![0.0; len];
+                    transform.imdct_half_naive(&mut expected, &input);
+                    let mut actual = vec![123.0; len + 3];
+                    transform.imdct_half(&mut actual, &input);
+                    for i in 0..len {
+                        assert!(
+                            (actual[i] - expected[i]).abs() < 1e-7,
+                            "N={len} coefficient={coefficient} scale={scale} i={i}"
+                        );
+                    }
+                    assert_eq!(&actual[len..], &[123.0; 3]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn fft_matches_reference_half_and_full_imdct() {
