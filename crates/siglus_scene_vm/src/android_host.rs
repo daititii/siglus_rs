@@ -258,10 +258,12 @@ pub unsafe extern "C" fn siglus_android_touch(
     let (lw, lh) = host.logical_size();
     let vm_x = ((x_px - vx as f64) / vw.max(1) as f64 * lw as f64).clamp(0.0, lw as f64);
     let vm_y = ((y_px - vy as f64) / vh.max(1) as f64 * lh as f64).clamp(0.0, lh as f64);
-    log::warn!(
-        "[SG_INPUT_DEBUG] touch phase={} px=({:.1},{:.1}) viewport=({},{} {}x{}) logical={}x{} vm=({:.1},{:.1})",
-        phase, x_px, y_px, vx, vy, vw, vh, lw, lh, vm_x, vm_y
-    );
+    if crate::host::sg_input_trace() {
+        log::warn!(
+            "[SG_INPUT_DEBUG] touch phase={} px=({:.1},{:.1}) viewport=({},{} {}x{}) logical={}x{} vm=({:.1},{:.1})",
+            phase, x_px, y_px, vx, vy, vw, vh, lw, lh, vm_x, vm_y
+        );
+    }
     host.touch(phase, vm_x, vm_y);
 }
 

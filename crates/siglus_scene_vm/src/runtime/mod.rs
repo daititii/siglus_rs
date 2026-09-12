@@ -7515,11 +7515,15 @@ impl CommandContext {
     }
 
     fn sync_global_movie(&mut self) {
+        // Every movie diagnostic is opt-in (`SG_MOVIE_TRACE=1`). The state probe
+        // below is periodic, and it must not add per-frame logcat traffic on a
+        // device unless someone explicitly asked for a movie trace.
+        let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
         // Periodic state probe: with no movie playing this is the cheapest per-frame hook
         // that still reports the wait/scene state on a device where env vars cannot be set.
         static SG_SYNC_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let polls = SG_SYNC_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if polls % 300 == 0 {
+        if trace && polls % 300 == 0 {
             log::warn!(
                 "[SG_MOV_STATE] playing={} file={:?} reveal={} key={} runtime_poll={} continuous={}",
                 self.globals.mov.playing,
@@ -7534,7 +7538,6 @@ impl CommandContext {
         /// unplayable. Generous on purpose: a working decoder presents its first frame long
         /// before this, so a healthy movie is never cut short.
         const MOVIE_NO_FRAME_WATCHDOG_POLLS: u32 = 600;
-        let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
         let file_name = self.globals.mov.file_name.clone();
 
         if !self.globals.mov.playing || file_name.as_deref().unwrap_or("").is_empty() {
@@ -7625,7 +7628,7 @@ impl CommandContext {
                 // movie layer.
                 self.globals.mov.polls_without_frame =
                     self.globals.mov.polls_without_frame.saturating_add(1);
-                if self.globals.mov.polls_without_frame % 300 == 1 {
+                if trace && self.globals.mov.polls_without_frame % 300 == 1 {
                     log::warn!(
                         "[SG_MOV] waiting for first frame: file={} polls={} audio_id={} audio_tried={} total_ms={:?} timer_ms={}",
                         file_name,

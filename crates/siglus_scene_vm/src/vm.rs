@@ -80,6 +80,15 @@ thread_local! {
     // Per-call/per-return tracing needs its own opt-in: in a map frame loop it emits
     // hundreds of thousands of lines and produced a 350 MB log in a single run.
     static SG_RET_TRACE_ON: bool = std::env::var_os("SG_VM_RET_TRACE").is_some();
+    /// Scene-transition tracing (`[SG-DIAG-6/7/13]`). Opt-in: the map dispatcher
+    /// re-enters its scenes per object per frame, which measured 600-950 logcat
+    /// lines/s on device and rotated the crash buffer out from under us.
+    static SG_SCENE_TRACE_ON: bool = std::env::var_os("SG_SCENE_TRACE").is_some();
+}
+
+#[inline]
+fn sg_scene_trace() -> bool {
+    SG_SCENE_TRACE_ON.with(|on| *on)
 }
 
 #[inline]
@@ -4128,16 +4137,18 @@ impl<'a> SceneVm<'a> {
             return Ok(false);
         }
         if self.current_scene_no != self.diag_last_scene_no {
-            log::warn!(
-                "[SG-DIAG-13] scene ctx: scene={:?} no={:?} line={} pc=0x{:x} call_depth={} scene_stack={} (prev={:?})",
-                self.current_scene_name,
-                self.current_scene_no,
-                self.current_line_no,
-                self.stream.get_prg_cntr(),
-                self.call_stack.len(),
-                self.scene_stack.len(),
-                self.diag_last_scene_no
-            );
+            if sg_scene_trace() {
+                log::warn!(
+                    "[SG-DIAG-13] scene ctx: scene={:?} no={:?} line={} pc=0x{:x} call_depth={} scene_stack={} (prev={:?})",
+                    self.current_scene_name,
+                    self.current_scene_no,
+                    self.current_line_no,
+                    self.stream.get_prg_cntr(),
+                    self.call_stack.len(),
+                    self.scene_stack.len(),
+                    self.diag_last_scene_no
+                );
+            }
             self.diag_last_scene_no = self.current_scene_no;
         }
 
@@ -11971,15 +11982,17 @@ impl<'a> SceneVm<'a> {
 
     fn jump_to_scene_name(&mut self, scene_name: &str, z_no: i32) -> Result<()> {
         sg_omv_trace!(self, "scene_jump target={} z={}", scene_name, z_no);
-        log::warn!(
-            "[SG-DIAG-6] scene_jump target={} z={} caller={:?} caller_line={} call_depth={} scene_stack={}",
-            scene_name,
-            z_no,
-            self.current_scene_name,
-            self.current_line_no,
-            self.call_stack.len(),
-            self.scene_stack.len()
-        );
+        if sg_scene_trace() {
+            log::warn!(
+                "[SG-DIAG-6] scene_jump target={} z={} caller={:?} caller_line={} call_depth={} scene_stack={}",
+                scene_name,
+                z_no,
+                self.current_scene_name,
+                self.current_line_no,
+                self.call_stack.len(),
+                self.scene_stack.len()
+            );
+        }
         let (stream, scene_no) = self.load_scene_stream(scene_name, z_no)?;
         self.stash_current_scene_user_props();
         self.stream = stream;
@@ -12016,17 +12029,19 @@ impl<'a> SceneVm<'a> {
             ex_call_proc,
             scratch_source_args.len()
         );
-        log::warn!(
-            "[SG-DIAG-7] scene_farcall target={} z={} ret_form={} ex_call_proc={} caller={:?} caller_line={} call_depth={} scene_stack={}",
-            scene_name,
-            z_no,
-            ret_form,
-            ex_call_proc,
-            self.current_scene_name,
-            self.current_line_no,
-            self.call_stack.len(),
-            self.scene_stack.len()
-        );
+        if sg_scene_trace() {
+            log::warn!(
+                "[SG-DIAG-7] scene_farcall target={} z={} ret_form={} ex_call_proc={} caller={:?} caller_line={} call_depth={} scene_stack={}",
+                scene_name,
+                z_no,
+                ret_form,
+                ex_call_proc,
+                self.current_scene_name,
+                self.current_line_no,
+                self.call_stack.len(),
+                self.scene_stack.len()
+            );
+        }
         self.trace_cf_branch_farcall(
             self.stream.get_prg_cntr(),
             scene_name,

@@ -41,6 +41,13 @@ fn should_exit_host_frame(
         || (vm_halted && flow_empty && !legacy_saved_active_only)
 }
 
+/// Input tracing (`[SG_INPUT_DEBUG]`) is off by default: on device every touch
+/// emits a line, and logcat traffic lands on the frame that handles the input.
+pub(crate) fn sg_input_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SG_INPUT_DEBUG").is_some())
+}
+
 /// What the host does when the script proc flow is empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmptyFlowAction {
@@ -456,34 +463,38 @@ impl SiglusHost {
     pub fn mouse_down(&mut self, button: VmMouseButton) {
         if self.native_messagebox_pending() { return; }
         self.vm.ctx.on_mouse_down(button);
-        log::warn!(
-            "[SG_INPUT_DEBUG] down={:?} scene={:?} line={} msg_waiting={} visible={}/{} wait_key={} flow={:?}",
-            button,
-            self.vm.current_scene_name(),
-            self.vm.current_line_no(),
-            self.vm.ctx.ui.message_waiting(),
-            self.vm.ctx.ui.message_visible_chars(),
-            self.vm.ctx.ui.message_wait_message_len(),
-            self.vm.ctx.wait.waiting_for_key(),
-            self.flow.stack
-        );
+        if sg_input_trace() {
+            log::warn!(
+                "[SG_INPUT_DEBUG] down={:?} scene={:?} line={} msg_waiting={} visible={}/{} wait_key={} flow={:?}",
+                button,
+                self.vm.current_scene_name(),
+                self.vm.current_line_no(),
+                self.vm.ctx.ui.message_waiting(),
+                self.vm.ctx.ui.message_visible_chars(),
+                self.vm.ctx.ui.message_wait_message_len(),
+                self.vm.ctx.wait.waiting_for_key(),
+                self.flow.stack
+            );
+        }
         self.script_needs_pump = true;
     }
 
     pub fn mouse_up(&mut self, button: VmMouseButton) {
         if self.native_messagebox_pending() { return; }
         self.vm.ctx.on_mouse_up(button);
-        log::warn!(
-            "[SG_INPUT_DEBUG] up={:?} scene={:?} line={} msg_waiting={} visible={}/{} wait_key={} flow={:?}",
-            button,
-            self.vm.current_scene_name(),
-            self.vm.current_line_no(),
-            self.vm.ctx.ui.message_waiting(),
-            self.vm.ctx.ui.message_visible_chars(),
-            self.vm.ctx.ui.message_wait_message_len(),
-            self.vm.ctx.wait.waiting_for_key(),
-            self.flow.stack
-        );
+        if sg_input_trace() {
+            log::warn!(
+                "[SG_INPUT_DEBUG] up={:?} scene={:?} line={} msg_waiting={} visible={}/{} wait_key={} flow={:?}",
+                button,
+                self.vm.current_scene_name(),
+                self.vm.current_line_no(),
+                self.vm.ctx.ui.message_waiting(),
+                self.vm.ctx.ui.message_visible_chars(),
+                self.vm.ctx.ui.message_wait_message_len(),
+                self.vm.ctx.wait.waiting_for_key(),
+                self.flow.stack
+            );
+        }
         self.script_needs_pump = true;
     }
 
