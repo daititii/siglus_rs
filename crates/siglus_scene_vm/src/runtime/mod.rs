@@ -11822,22 +11822,29 @@ fn sync_movie_object_recursive(
                         layers, images, obj, stage_idx, obj_idx, file, frame_idx, frame, trace,
                     );
                 }
-                let waiting_for_movie_audio_start =
-                    obj.movie.audio_id.is_none() && polled.audio.is_none() && !polled.audio_ready;
+                // Keep OBJECT movie video on the same independent media clock as
+                // GLOBAL.MOV while ASF/WMA audio is still being decoded.  The old
+                // path forced timer_ms back to zero until `polled.audio` became
+                // ready, freezing WMV video on its first/preview frame for the
+                // entire background audio decode.  When audio becomes available,
+                // start it at the current movie time; from then on the audio handle
+                // becomes the master clock through audio_playback_position_ms().
                 if obj.movie.playing && obj.movie.audio_id.is_none() {
                     if let Some(track) = polled.audio.as_ref() {
-                        if let Ok(id) = movie_mgr.start_audio(audio, track, obj.movie.timer_ms, obj.movie.loop_flag) {
+                        if let Ok(id) = movie_mgr.start_audio(
+                            audio,
+                            track,
+                            obj.movie.timer_ms,
+                            obj.movie.loop_flag,
+                        ) {
                             obj.movie.audio_id = Some(id);
                             obj.movie.audio_started_once = true;
                         }
+                    } else if polled.audio_ready {
+                        // No soundtrack (or audio decode failed): do not retry a
+                        // completed probe forever, and never hold video at t=0.
+                        obj.movie.audio_started_once = true;
                     }
-                }
-                if waiting_for_movie_audio_start
-                    && obj.movie.audio_id.is_none()
-                    && !obj.movie.audio_started_once
-                {
-                    obj.movie.timer_ms = 0;
-                    obj.movie.last_tick = Some(crate::platform_time::Instant::now());
                 }
             }
         }

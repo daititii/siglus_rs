@@ -147,7 +147,6 @@ enum WmvStreamEvent {
     Video {
         frame_idx: usize,
         source_pts_ms: u64,
-        timeline_ms: u64,
         frame: Arc<RgbaImage>,
     },
     Done,
@@ -156,7 +155,11 @@ enum WmvStreamEvent {
 #[derive(Clone)]
 struct WmvDecodedFrame {
     frame_idx: usize,
-    timeline_ms: u64,
+    /// ASF presentation timestamp, after ASF preroll handling but before
+    /// rebasing to the movie-local clock. WMV3/VC-1 decode order is not PTS
+    /// order when B pictures are present, so keep this raw until the consumer
+    /// has sorted the presentation queue.
+    source_pts_ms: u64,
     frame: Arc<RgbaImage>,
 }
 
@@ -168,7 +171,7 @@ struct WmvStreamState {
     fps: Option<f32>,
     decoded_frames: usize,
     timeline_origin_ms: Option<u64>,
-    last_video_timeline_ms: Option<u64>,
+    last_video_source_pts_ms: Option<u64>,
     last_frame_delta_ms: Option<u64>,
     total_ms_hint: Option<u64>,
     last_effective_timer_ms: u64,
@@ -831,9 +834,13 @@ impl MovieManager {
         let duration_hint = self.wmv_streams.get(&path).and_then(|state| {
             let video_total = state.total_ms_hint.or_else(|| {
                 if state.done {
-                    state.last_video_timeline_ms.map(|last| {
-                        last.saturating_add(state.last_frame_delta_ms.unwrap_or(0))
-                    })
+                    match (state.timeline_origin_ms, state.last_video_source_pts_ms) {
+                        (Some(origin), Some(last)) => Some(
+                            last.saturating_sub(origin)
+                                .saturating_add(state.last_frame_delta_ms.unwrap_or(0)),
+                        ),
+                        _ => None,
+                    }
                 } else {
                     None
                 }
@@ -883,14 +890,37 @@ impl MovieManager {
         state.request_ms.store(request_ms, Ordering::Release);
         drain_wmv_stream_state(path.as_path(), state, effective_timer_ms)?;
 
-        let Some(chosen) = select_wmv_stream_frame(&state.frames, effective_timer_ms).cloned() else {
+        // Match wmv-player-wgpu: the decode thread must never choose the movie
+        // clock origin. WMV3 B pictures are emitted in coded order, so first
+        // sort by ASF PTS and only then establish the presentation origin from
+        // the earliest queued presentation frame.
+        if state.timeline_origin_ms.is_none() {
+            if let Some(first) = state.frames.front() {
+                let origin = first.source_pts_ms;
+                state.timeline_origin_ms = Some(origin);
+                state.total_ms_hint = state
+                    .total_ms_hint
+                    .and_then(|total| wmv_rebase_duration_ms(total, origin));
+            }
+        }
+        let Some(origin_ms) = state.timeline_origin_ms else {
+            return Ok(None);
+        };
+        let presentation_pts_ms = origin_ms.saturating_add(effective_timer_ms);
+
+        // Now that the presentation origin is known, stale-frame trimming can
+        // use the same absolute PTS domain as selection.
+        discard_wmv_stream_frames(state, presentation_pts_ms);
+
+        let Some(chosen) = select_wmv_stream_frame(&state.frames, presentation_pts_ms).cloned() else {
             return Ok(None);
         };
 
         let video_total_ms = state.total_ms_hint.or_else(|| {
             if state.done {
-                state.last_video_timeline_ms.map(|last| {
-                    last.saturating_add(state.last_frame_delta_ms.unwrap_or(0))
+                state.last_video_source_pts_ms.map(|last| {
+                    last.saturating_sub(origin_ms)
+                        .saturating_add(state.last_frame_delta_ms.unwrap_or(0))
                 })
             } else {
                 None
@@ -1904,7 +1934,7 @@ fn spawn_wmv_stream_state(
         fps: None,
         decoded_frames: 0,
         timeline_origin_ms: None,
-        last_video_timeline_ms: None,
+        last_video_source_pts_ms: None,
         last_frame_delta_ms: None,
         total_ms_hint: info.duration_ms(),
         last_effective_timer_ms: target_ms,
@@ -1946,7 +1976,6 @@ fn stream_wmv_video_worker(
     }
 
     let mut frame_idx = 0usize;
-    let mut timeline_origin_ms = None::<u64>;
     loop {
         // The bounded channel is the decode-ahead/backpressure mechanism.  Do
         // not gate decoding on the current presentation clock here: WMV3/VC-1
@@ -1967,13 +1996,11 @@ fn stream_wmv_video_worker(
             break;
         };
         let source_pts_ms = decoded.pts_ms as u64;
-        let origin_ms = *timeline_origin_ms.get_or_insert(source_pts_ms);
-        let timeline_ms = source_pts_ms.saturating_sub(origin_ms);
 
         if trace && (frame_idx < 5 || frame_idx % 60 == 0) {
             eprintln!(
-                "[SG_MOVIE_TRACE][WMV] decoded idx={} pts={} timeline={}",
-                frame_idx, source_pts_ms, timeline_ms
+                "[SG_MOVIE_TRACE][WMV] decoded idx={} pts={}",
+                frame_idx, source_pts_ms
             );
         }
 
@@ -1982,7 +2009,6 @@ fn stream_wmv_video_worker(
             .send(Ok(WmvStreamEvent::Video {
                 frame_idx,
                 source_pts_ms,
-                timeline_ms,
                 frame,
             }))
             .is_err()
@@ -2011,44 +2037,50 @@ fn drain_wmv_stream_state(
             Ok(Ok(WmvStreamEvent::Video {
                 frame_idx,
                 source_pts_ms,
-                timeline_ms,
                 frame,
             })) => {
-                if state.timeline_origin_ms.is_none() {
-                    state.timeline_origin_ms = Some(source_pts_ms);
-                    state.total_ms_hint = state
-                        .total_ms_hint
-                        .and_then(|total| wmv_rebase_duration_ms(total, source_pts_ms));
-                }
-                if let Some(last) = state.last_video_timeline_ms {
-                    let delta = timeline_ms.saturating_sub(last);
+                state.last_video_source_pts_ms = Some(
+                    state
+                        .last_video_source_pts_ms
+                        .map(|last| last.max(source_pts_ms))
+                        .unwrap_or(source_pts_ms),
+                );
+                state.decoded_frames = state.decoded_frames.max(frame_idx.saturating_add(1));
+                let decoded = WmvDecodedFrame {
+                    frame_idx,
+                    source_pts_ms,
+                    frame,
+                };
+                // WMV3/VC-1 with B pictures is decoded in coded order, while ASF PTS
+                // is presentation order. Keep raw PTS here and sort before selecting
+                // the presentation origin, exactly like wmv-player-wgpu.
+                let insert_at = state
+                    .frames
+                    .iter()
+                    .position(|queued| queued.source_pts_ms > decoded.source_pts_ms)
+                    .unwrap_or(state.frames.len());
+                state.frames.insert(insert_at, decoded);
+
+                // Derive cadence only from adjacent presentation-order PTS. Decode-order
+                // deltas are invalid whenever B pictures reorder around a future anchor.
+                if insert_at > 0 {
+                    let prev = state.frames[insert_at - 1].source_pts_ms;
+                    let cur = state.frames[insert_at].source_pts_ms;
+                    let delta = cur.saturating_sub(prev);
                     if (2..=1_000).contains(&delta) {
                         state.last_frame_delta_ms = Some(delta);
                         state.fps = Some(1000.0 / delta as f32);
                     }
                 }
-                state.last_video_timeline_ms = Some(
-                    state
-                        .last_video_timeline_ms
-                        .map(|last| last.max(timeline_ms))
-                        .unwrap_or(timeline_ms),
-                );
-                state.decoded_frames = state.decoded_frames.max(frame_idx.saturating_add(1));
-                let decoded = WmvDecodedFrame {
-                    frame_idx,
-                    timeline_ms,
-                    frame,
-                };
-                // WMV3/VC-1 with B pictures is decoded in coded order, while ASF PTS
-                // is presentation order.  Keep the engine queue in presentation order,
-                // matching the standalone WMV player.  select_wmv_stream_frame() and
-                // the discard logic both rely on monotonically ordered timeline_ms.
-                let insert_at = state
-                    .frames
-                    .iter()
-                    .position(|queued| queued.timeline_ms > decoded.timeline_ms)
-                    .unwrap_or(state.frames.len());
-                state.frames.insert(insert_at, decoded);
+                if insert_at + 1 < state.frames.len() {
+                    let cur = state.frames[insert_at].source_pts_ms;
+                    let next = state.frames[insert_at + 1].source_pts_ms;
+                    let delta = next.saturating_sub(cur);
+                    if (2..=1_000).contains(&delta) {
+                        state.last_frame_delta_ms = Some(delta);
+                        state.fps = Some(1000.0 / delta as f32);
+                    }
+                }
                 state.decoded_any_this_poll = true;
             }
             Ok(Ok(WmvStreamEvent::Done)) => {
@@ -2070,11 +2102,21 @@ fn drain_wmv_stream_state(
         }
     }
 
+    // Do not discard against a movie-local timer until the consumer has chosen
+    // a presentation origin from the PTS-sorted queue. This function may run
+    // while the first decode batch is still being reordered.
+    if let Some(origin_ms) = state.timeline_origin_ms {
+        discard_wmv_stream_frames(state, origin_ms.saturating_add(target_timer_ms));
+    }
+    Ok(())
+}
+
+fn discard_wmv_stream_frames(state: &mut WmvStreamState, target_source_pts_ms: u64) {
     while state.frames.len() > 2 {
         let discard = state
             .frames
             .get(1)
-            .map(|frame| frame.timeline_ms.saturating_add(100) < target_timer_ms)
+            .map(|frame| frame.source_pts_ms.saturating_add(100) < target_source_pts_ms)
             .unwrap_or(false);
         if !discard {
             break;
@@ -2084,21 +2126,19 @@ fn drain_wmv_stream_state(
     while state.frames.len() > WMV_STREAM_FRAME_KEEP {
         state.frames.pop_front();
     }
-    Ok(())
 }
 
 fn select_wmv_stream_frame<'a>(
     frames: &'a VecDeque<WmvDecodedFrame>,
-    target_ms: u64,
+    target_source_pts_ms: u64,
 ) -> Option<&'a WmvDecodedFrame> {
     // Presentation is PTS-driven. Never expose a frame whose PTS is still in
-    // the future merely because decoding has run ahead. The queue keeps the
-    // most recent due frame at its front while discard_wmv_stream_state() trims
-    // older history, so returning None here means the first frame is genuinely
-    // not due yet.
+    // the future merely because decoding has run ahead. The target is kept in
+    // the same absolute ASF PTS domain as queued frames; rebasing happens only
+    // at the presentation clock boundary, not in the decoder thread.
     let mut before = None;
     for frame in frames {
-        if frame.timeline_ms <= target_ms {
+        if frame.source_pts_ms <= target_source_pts_ms {
             before = Some(frame);
         } else {
             break;
@@ -5063,7 +5103,7 @@ mod wmv_movie_adapter_tests {
     fn frame(index: usize, pts_ms: u64) -> WmvDecodedFrame {
         WmvDecodedFrame {
             frame_idx: index,
-            timeline_ms: pts_ms,
+            source_pts_ms: pts_ms,
             frame: Arc::new(RgbaImage {
                 width: 1,
                 height: 1,
@@ -5098,18 +5138,40 @@ mod wmv_movie_adapter_tests {
 
     #[test]
     fn frame_selection_follows_asf_pts() {
-        let frames = VecDeque::from([frame(0, 0), frame(1, 40), frame(2, 120)]);
-        let selected = select_wmv_stream_frame(&frames, 80).expect("selected frame");
+        let frames = VecDeque::from([frame(0, 3_000), frame(1, 3_040), frame(2, 3_120)]);
+        let selected = select_wmv_stream_frame(&frames, 3_080).expect("selected frame");
         assert_eq!(selected.frame_idx, 1);
     }
 
     #[test]
     fn frame_selection_never_presents_future_pts() {
-        let frames = VecDeque::from([frame(7, 40), frame(8, 80)]);
-        assert!(select_wmv_stream_frame(&frames, 20).is_none());
+        let frames = VecDeque::from([frame(7, 3_040), frame(8, 3_080)]);
+        assert!(select_wmv_stream_frame(&frames, 3_020).is_none());
         assert_eq!(
-            select_wmv_stream_frame(&frames, 40).map(|frame| frame.frame_idx),
+            select_wmv_stream_frame(&frames, 3_040).map(|frame| frame.frame_idx),
             Some(7)
+        );
+    }
+
+    #[test]
+    fn b_picture_decode_order_does_not_choose_clock_origin() {
+        let mut frames = VecDeque::new();
+        for decoded in [frame(0, 3_000), frame(1, 3_120), frame(2, 3_040), frame(3, 3_080)] {
+            let pos = frames
+                .iter()
+                .position(|queued: &WmvDecodedFrame| queued.source_pts_ms > decoded.source_pts_ms)
+                .unwrap_or(frames.len());
+            frames.insert(pos, decoded);
+        }
+        assert_eq!(
+            frames.iter().map(|f| f.source_pts_ms).collect::<Vec<_>>(),
+            vec![3_000, 3_040, 3_080, 3_120]
+        );
+        let origin = frames.front().expect("first presentation frame").source_pts_ms;
+        assert_eq!(origin, 3_000);
+        assert_eq!(
+            select_wmv_stream_frame(&frames, origin + 80).map(|frame| frame.frame_idx),
+            Some(3)
         );
     }
 
