@@ -27,6 +27,7 @@ use siglus_assets::gameexe::{decode_gameexe_dat_bytes, GameexeConfig};
 use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
 
 use siglus_scene_vm::image_manager::{ImageHandle, ImageKey};
+use siglus_scene_vm::layer::RenderFrame;
 use siglus_scene_vm::render::{Renderer, RendererDebugTexture};
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use siglus_scene_vm::desktop_config::{ConfigDialog, DesktopConfigAction, DesktopConfigWindow};
@@ -200,6 +201,8 @@ struct App {
     window: Option<&'static Window>,
     window_id: Option<WindowId>,
     renderer: Option<Rc<RefCell<Renderer>>>,
+    pending_surface_size: Option<PhysicalSize<u32>>,
+    last_presented_frame: Option<RenderFrame>,
     hud_window: Option<&'static Window>,
     hud_window_id: Option<WindowId>,
     hud_renderer: Option<Renderer>,
@@ -235,6 +238,8 @@ struct App {
     desktop_config_window: Option<DesktopConfigWindow>,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     desktop_config_request: Option<ConfigDialog>,
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    desktop_config_previous_dialog: Option<ConfigDialog>,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     desktop_config_open: bool,
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -417,6 +422,8 @@ impl App {
             window: None,
             window_id: None,
             renderer: None,
+            pending_surface_size: None,
+            last_presented_frame: None,
             hud_window: None,
             hud_window_id: None,
             hud_renderer: None,
@@ -447,6 +454,8 @@ impl App {
             desktop_config_window: None,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             desktop_config_request: None,
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            desktop_config_previous_dialog: None,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             desktop_config_open: false,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -2587,10 +2596,27 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
-        // Native Windows-style message boxes are synchronous in the original
-        // engine.  While one owns the UI thread, no script/frame processing
-        // occurs behind it.
+        if let Some(size) = self.pending_surface_size.take() {
+            if let Some(renderer) = self.renderer.as_ref() {
+                Self::configure_main_renderer(
+                    &mut renderer.borrow_mut(),
+                    size.width,
+                    size.height,
+                    self.game_size.0,
+                    self.game_size.1,
+                );
+            }
+        }
+        // A modal dialog freezes script/frame evaluation, but the compositor
+        // still needs a presented buffer to complete a resize (notably Wayland).
         if self.native_messagebox_pending() {
+            if let (Some(vm), Some(renderer), Some(frame)) = (
+                self.vm.as_ref(),
+                self.renderer.as_ref(),
+                self.last_presented_frame.as_ref(),
+            ) {
+                renderer.borrow_mut().render_frame(&vm.ctx.images, frame)?;
+            }
             return Ok(());
         }
         if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
@@ -2674,6 +2700,7 @@ impl App {
                 };
                 renderer.borrow_mut().render_frame(&vm.ctx.images, &frame)?;
             }
+            self.last_presented_frame = Some(frame);
         }
 
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -2793,9 +2820,17 @@ impl App {
             .unwrap_or(default)
     }
 
+    fn syscom_window_config(ctx: &CommandContext) -> (i64, i64) {
+        use siglus_scene_vm::runtime::forms::codes::syscom_op::{
+            GET_WINDOW_MODE, GET_WINDOW_MODE_SIZE,
+        };
+        (
+            Self::syscom_int(ctx, GET_WINDOW_MODE, 0),
+            Self::syscom_int(ctx, GET_WINDOW_MODE_SIZE, 100),
+        )
+    }
+
     fn apply_syscom_window_config(&mut self) {
-        const GET_WINDOW_MODE: i32 = 172;
-        const GET_WINDOW_MODE_SIZE: i32 = 175;
         const GET_MOUSE_CURSOR_HIDE_ONOFF: i32 =
             siglus_scene_vm::runtime::forms::codes::syscom_op::GET_MOUSE_CURSOR_HIDE_ONOFF;
         const GET_MOUSE_CURSOR_HIDE_TIME: i32 =
@@ -2809,10 +2844,7 @@ impl App {
             let Some(vm) = self.vm.as_ref() else {
                 return;
             };
-            (
-                Self::syscom_int(&vm.ctx, GET_WINDOW_MODE, 0),
-                Self::syscom_int(&vm.ctx, GET_WINDOW_MODE_SIZE, 100),
-            )
+            Self::syscom_window_config(&vm.ctx)
         };
 
         if self.last_window_mode != Some(mode) {
@@ -2820,6 +2852,8 @@ impl App {
                 w.set_fullscreen(None);
             } else {
                 w.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                // Reapply the selected client size when returning to windowed mode.
+                self.last_window_size = None;
             }
             self.last_window_mode = Some(mode);
         }
@@ -2827,8 +2861,16 @@ impl App {
         if self.last_window_size != Some(size_mode) && mode == 0 {
             let (w0, h0) = self.initial_size;
             let scale = size_mode.clamp(25, 400) as u32;
-            let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(
-                w0.saturating_mul(scale) / 100, h0.saturating_mul(scale) / 100));
+            if let Some(size) = w.request_inner_size(winit::dpi::PhysicalSize::new(
+                w0.saturating_mul(scale) / 100, h0.saturating_mul(scale) / 100))
+            {
+                // Wayland applies client-requested sizes synchronously and may
+                // not send Resized. Present a buffer using the returned size.
+                if size.width > 0 && size.height > 0 {
+                    self.pending_surface_size = Some(size);
+                }
+            }
+            w.request_redraw();
             self.last_window_size = Some(size_mode);
         }
 
@@ -2915,6 +2957,13 @@ impl App {
         }
     }
 
+    fn modal_owner_event_allowed(event: &WindowEvent) -> bool {
+        matches!(event,
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::RedrawRequested
+        )
+    }
+
     fn native_messagebox_pending(&self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         if self.desktop_config_open { return true; }
@@ -2927,10 +2976,9 @@ impl App {
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     fn pump_desktop_config_request(&mut self, elwt: &ActiveEventLoop) {
-        let Some(dialog) = self.desktop_config_request.take() else { return; };
-        if let Some(window) = self.desktop_config_window.as_mut() {
-            window.reopen(dialog);
-            return;
+        let Some(mut dialog) = self.desktop_config_request.take() else { return; };
+        if let Some(previous) = self.desktop_config_previous_dialog.as_ref() {
+            dialog.remember_tab_from(previous);
         }
         match DesktopConfigWindow::new(elwt, dialog) {
             Ok(window) => self.desktop_config_window = Some(window),
@@ -2961,8 +3009,12 @@ impl App {
             }
         }
         if matches!(action, DesktopConfigAction::Close) {
-            window.hide();
+            self.desktop_config_previous_dialog = self.desktop_config_window.take()
+                .map(DesktopConfigWindow::into_dialog);
             self.desktop_config_open = false;
+            if let Some(window) = self.window.as_ref() {
+                window.focus_window();
+            }
             self.wake_for_input();
         }
         self.apply_syscom_window_config();
@@ -3297,7 +3349,7 @@ impl ApplicationHandler for App {
             return;
         }
         if is_main && self.native_messagebox_pending()
-            && !matches!(&event, WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. })
+            && !Self::modal_owner_event_allowed(&event)
         {
             // The original owner window is disabled for the duration of the
             // blocking MessageBox call; do not queue input for later VM frames.
@@ -3334,15 +3386,9 @@ impl ApplicationHandler for App {
                         w.request_redraw();
                     }
                 } else {
-                    if let Some(renderer) = self.renderer.as_ref() {
-                        let mut renderer_ref = renderer.borrow_mut();
-                        Self::configure_main_renderer(
-                            &mut renderer_ref,
-                            size.width,
-                            size.height,
-                            self.game_size.0,
-                            self.game_size.1,
-                        );
+                    if size.width > 0 && size.height > 0 {
+                        // Configure once for the latest size at the next redraw.
+                        self.pending_surface_size = Some(size);
                     }
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
@@ -3783,6 +3829,182 @@ fn run_headless_capture(args: Args) -> Result<()> {
 #[cfg(test)]
 mod desktop_coordinate_tests {
     use super::App;
+
+    #[test]
+    fn modal_owner_allows_presentation_but_blocks_game_input() {
+        use winit::event::{ElementState, MouseButton, WindowEvent};
+        assert!(App::modal_owner_event_allowed(
+            &WindowEvent::RedrawRequested
+        ));
+        assert!(App::modal_owner_event_allowed(&WindowEvent::Resized(
+            winit::dpi::PhysicalSize::new(1280, 720),
+        )));
+        assert!(!App::modal_owner_event_allowed(
+            &WindowEvent::CloseRequested
+        ));
+        assert!(!App::modal_owner_event_allowed(&WindowEvent::MouseInput {
+            device_id: winit::event::DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a desktop/GPU and SIGLUS_CONFIG_TEST_GAME pointing to a disposable game copy"]
+    fn modal_window_can_shrink_and_grow_repeatedly() {
+        use super::*;
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        const SCALES: [u32; 6] = [50, 100, 75, 125, 50, 100];
+        const TOTAL_STEPS: usize = SCALES.len() * 10;
+
+        struct Probe {
+            app: App,
+            step: usize,
+            deadline: Instant,
+            presented: bool,
+        }
+        impl Probe {
+            fn resize(&mut self) {
+                let state = &mut self
+                    .app
+                    .desktop_config_window
+                    .as_mut()
+                    .unwrap()
+                    .dialog
+                    .state;
+                state.screen_size_mode = 0;
+                let scale = i64::from(SCALES[self.step % SCALES.len()]);
+                state.screen_size_scale = (scale, scale);
+                syscom::apply_config_dialog_state(
+                    &mut self.app.vm.as_mut().unwrap().ctx,
+                    state.clone(),
+                );
+                self.app.apply_syscom_window_config();
+                self.presented = false;
+                self.deadline = Instant::now() + std::time::Duration::from_secs(10);
+            }
+        }
+        impl ApplicationHandler for Probe {
+            fn resumed(&mut self, elwt: &ActiveEventLoop) {
+                let size = self.app.initial_size;
+                let window: &'static Window = Box::leak(Box::new(
+                    elwt.create_window(
+                        WindowAttributes::default()
+                            .with_title("Siglus resize regression")
+                            .with_inner_size(PhysicalSize::new(size.0, size.1)),
+                    )
+                    .unwrap(),
+                ));
+                self.app.window = Some(window);
+                self.app.window_id = Some(window.id());
+                let mut renderer = pollster::block_on(Renderer::new(window)).unwrap();
+                App::configure_main_renderer(&mut renderer, size.0, size.1, size.0, size.1);
+                self.app.renderer = Some(Rc::new(RefCell::new(renderer)));
+                self.app.vm = Some(self.app.init_vm().unwrap());
+                self.app.last_presented_frame = Some(RenderFrame::ordinary(Vec::new()));
+                self.app.desktop_config_open = true;
+                self.app.redraw().unwrap();
+                self.app.desktop_config_request =
+                    Some(ConfigDialog::new(&self.app.vm.as_ref().unwrap().ctx));
+                self.app.pump_desktop_config_request(elwt);
+                self.resize();
+            }
+
+            fn window_event(&mut self, elwt: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+                if self.app.window_id == Some(id) && matches!(event, WindowEvent::RedrawRequested) {
+                    self.presented = true;
+                }
+                self.app.window_event(elwt, id, event);
+            }
+
+            fn about_to_wait(&mut self, elwt: &ActiveEventLoop) {
+                let scale = SCALES[self.step % SCALES.len()];
+                let size = self.app.window.unwrap().inner_size();
+                let expected = PhysicalSize::new(
+                    self.app.initial_size.0 * scale / 100,
+                    self.app.initial_size.1 * scale / 100,
+                );
+                let rendered = self.app.renderer.as_ref().unwrap().borrow();
+                let ready = self.presented
+                    && size == expected
+                    && (rendered.config.width, rendered.config.height)
+                        == (expected.width, expected.height);
+                drop(rendered);
+                assert!(
+                    Instant::now() < self.deadline,
+                    "resize to {scale}% stalled at {size:?}"
+                );
+                if ready {
+                    assert_eq!(
+                        self.app.redraw_count, 0,
+                        "modal redraw advanced the VM frame"
+                    );
+                    eprintln!(
+                        "modal resize {scale}%: {}x{} presented",
+                        size.width, size.height
+                    );
+                    self.step += 1;
+                    if self.step == TOTAL_STEPS {
+                        self.app
+                            .handle_desktop_config_event(WindowEvent::CloseRequested);
+                        assert!(self.app.desktop_config_window.is_none());
+                        elwt.exit();
+                        return;
+                    }
+                    self.resize();
+                }
+                elwt.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + std::time::Duration::from_millis(20),
+                ));
+            }
+        }
+
+        let project =
+            std::env::var("SIGLUS_CONFIG_TEST_GAME").expect("set SIGLUS_CONFIG_TEST_GAME");
+        let app = App::new(Args::parse_from([
+            "siglus_engine",
+            "--project-dir",
+            &project,
+            "--scene",
+            "_menu",
+        ]));
+        let mut probe = Probe {
+            app,
+            step: 0,
+            deadline: Instant::now(),
+            presented: false,
+        };
+        EventLoop::builder()
+            .with_any_thread(true)
+            .build()
+            .unwrap()
+            .run_app(&mut probe)
+            .unwrap();
+    }
+
+    #[test]
+    fn desktop_window_config_reads_live_dialog_and_script_settings() {
+        use siglus_scene_vm::desktop_config::ConfigDialog;
+        use siglus_scene_vm::runtime::CommandContext;
+        use siglus_scene_vm::runtime::forms::{codes::syscom_op::*, syscom};
+
+        let mut ctx = CommandContext::new(std::env::temp_dir().join("siglus-window-config-test"));
+        assert_eq!(App::syscom_window_config(&ctx), (0, 100));
+        let mut dialog = ConfigDialog::new(&ctx);
+        dialog.state.screen_size_scale = (75, 75);
+        syscom::apply_config_dialog_state(&mut ctx, dialog.state.clone());
+        assert_eq!(App::syscom_window_config(&ctx), (0, 75));
+        dialog.state.screen_size_mode = 1;
+        syscom::apply_config_dialog_state(&mut ctx, dialog.state);
+        assert_eq!(App::syscom_window_config(&ctx), (1, 75));
+        ctx.globals.syscom.config_int.insert(GET_WINDOW_MODE, 0);
+        ctx.globals
+            .syscom
+            .config_int
+            .insert(GET_WINDOW_MODE_SIZE, 150);
+        assert_eq!(App::syscom_window_config(&ctx), (0, 150));
+    }
 
     #[test]
     fn aspect_fit_16_inch_retina_surface_keeps_1920x1080_ratio() {

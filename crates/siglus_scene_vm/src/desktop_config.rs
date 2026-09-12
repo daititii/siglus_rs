@@ -8,6 +8,7 @@ use crate::runtime::globals::OriginalConfigRuntimeState;
 use crate::runtime::CommandContext;
 use anyhow::{Context, Result};
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
+use std::sync::Arc;
 use std::time::Instant;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -40,7 +41,7 @@ pub enum DesktopConfigAction {
 }
 
 pub struct DesktopConfigWindow {
-    window: &'static Window,
+    window: Arc<Window>,
     window_id: WindowId,
     renderer: Renderer,
     egui_renderer: EguiRenderer,
@@ -62,9 +63,9 @@ impl DesktopConfigWindow {
                     .with_min_inner_size(LogicalSize::new(640.0, 440.0)),
             )
             .context("create configuration window")?;
-        let window: &'static Window = Box::leak(Box::new(window));
+        let window = Arc::new(window);
         window.set_ime_allowed(true);
-        let renderer = pollster::block_on(Renderer::new(window)).context("config renderer init")?;
+        let renderer = pollster::block_on(Renderer::new(window.clone())).context("config renderer init")?;
         let egui_renderer = EguiRenderer::new(&renderer.device, renderer.config.format, None, 1);
         let egui_ctx = egui::Context::default();
         configure_egui_default_font(&egui_ctx);
@@ -86,20 +87,10 @@ impl DesktopConfigWindow {
     pub fn window_id(&self) -> WindowId {
         self.window_id
     }
-    pub fn hide(&self) {
-        self.window.set_visible(false);
-    }
-    pub fn reopen(&mut self, mut dialog: ConfigDialog) {
-        if dialog.remember_tab && dialog.tabs.contains(&self.dialog.tab) {
-            dialog.tab = self.dialog.tab;
-        }
-        self.dialog = dialog;
-        self.input_events.clear();
-        self.modifiers = egui::Modifiers::default();
-        self.egui_ctx.memory_mut(|m| *m = egui::Memory::default());
-        self.window.set_visible(true);
-        self.window.focus_window();
-        self.window.request_redraw();
+    pub fn into_dialog(self) -> ConfigDialog {
+        // Dropping the renderer releases the surface's Arc, then the native
+        // window closes even on backends that cannot hide windows (Wayland).
+        self.dialog
     }
     pub fn handle_window_event(&mut self, event: WindowEvent) -> Option<DesktopConfigAction> {
         match event {
@@ -401,6 +392,12 @@ pub struct ConfigDialog {
 }
 
 impl ConfigDialog {
+    pub fn remember_tab_from(&mut self, previous: &Self) {
+        if self.remember_tab && self.tabs.contains(&previous.tab) {
+            self.tab = previous.tab;
+        }
+    }
+
     pub fn new(ctx: &CommandContext) -> Self {
         use crate::runtime::forms::codes::syscom_op::*;
         let gameexe = ctx.tables.gameexe.clone().unwrap_or_default();
@@ -907,6 +904,64 @@ fn configured_checkbox(
 mod tests {
     use super::*;
     use crate::runtime::forms::codes::syscom_op::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a desktop session and GPU"]
+    fn native_config_close_releases_window_and_surface() {
+        use winit::application::ApplicationHandler;
+        use winit::event_loop::EventLoop;
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+
+        struct Probe;
+        impl ApplicationHandler for Probe {
+            fn resumed(&mut self, elwt: &ActiveEventLoop) {
+                let ctx = CommandContext::new(std::env::temp_dir().join("siglus-config-close-test"));
+                let mut dialog = ConfigDialog::new(&ctx);
+                for _ in 0..2 {
+                    let mut window = DesktopConfigWindow::new(elwt, dialog).unwrap();
+                    let weak = Arc::downgrade(&window.window);
+                    window.render().unwrap();
+                    assert!(matches!(
+                        window.handle_window_event(WindowEvent::CloseRequested),
+                        Some(DesktopConfigAction::Close)
+                    ));
+                    dialog = window.into_dialog();
+                    assert!(weak.upgrade().is_none(), "native window or surface leaked");
+                }
+                elwt.exit();
+            }
+
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+
+        let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+        event_loop.run_app(&mut Probe).unwrap();
+    }
+
+    #[test]
+    fn recreated_dialog_remembers_tab_without_reusing_stale_settings() {
+        let mut ctx = CommandContext::new(std::env::temp_dir().join("siglus-config-reopen-test"));
+        ctx.globals.syscom.last_menu_call = CALL_CONFIG_MENU;
+        let mut previous = ConfigDialog::new(&ctx);
+        previous.tab = Tab::Volume;
+        ctx.globals.syscom.config_int.insert(GET_WINDOW_MODE_SIZE, 75);
+        let mut reopened = ConfigDialog::new(&ctx);
+        reopened.remember_tab_from(&previous);
+        assert_eq!(reopened.tab, Tab::Volume);
+        assert_eq!(reopened.state.screen_size_scale, (75, 75));
+
+        ctx.globals.syscom.last_menu_call = CALL_CONFIG_WINDOW_MODE_MENU;
+        let mut requested = ConfigDialog::new(&ctx);
+        requested.remember_tab_from(&previous);
+        assert_eq!(requested.tab, Tab::Screen);
+
+        ctx.globals.syscom.last_menu_call = CALL_CONFIG_MENU;
+        ctx.tables.gameexe = Some(GameexeConfig::from_text("#DIALOG_TAB_EXIST.VOLUME=0"));
+        let mut hidden = ConfigDialog::new(&ctx);
+        hidden.remember_tab_from(&previous);
+        assert_eq!(hidden.tab, Tab::Screen);
+    }
 
     #[test]
     fn game_definitions_control_tabs_voice_names_and_reset_scope() {
