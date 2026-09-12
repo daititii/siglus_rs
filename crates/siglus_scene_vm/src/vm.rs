@@ -7507,6 +7507,21 @@ impl<'a> SceneVm<'a> {
             return None;
         }
 
+        // EXCALL.STAGE[index] starts with [65, 0, ARRAY, index], which also
+        // matches the compact OBJECT.Z_EVE layout. Preserve the explicit
+        // EXCALL chain so menu objects and button groups use its private stage.
+        if elm.len() >= 4
+            && constants::matches_form_id(
+                elm[0] as u32,
+                self.ctx.ids.form_global_excall,
+                constants::global_form::EXCALL,
+            )
+            && elm[1] == crate::runtime::forms::codes::ELM_EXCALL_STAGE
+            && (elm[2] == elm_array || elm[2] == crate::runtime::forms::codes::ELM_ARRAY)
+        {
+            return None;
+        }
+
         // Original command dispatch receives the complete element chain.  The
         // only compact form we keep for an ambient object context is the
         // explicit child shorthand used after an already-resolved OBJECT.  Do
@@ -13344,6 +13359,117 @@ mod command_dispatch_tests {
     }
 
     #[test]
+    fn excall_indexed_stage_creates_menu_objects_and_preserves_properties() {
+        use crate::runtime::forms::{codes, excall};
+
+        let mut vm = test_vm();
+        vm.exec_command(
+            vec![codes::ELM_GLOBAL_EXCALL, codes::ELM_EXCALL_ALLOC],
+            0, vm.cfg.fm_void, &mut vec![],
+        ).unwrap();
+        let stage_form = excall::tick_targets(&vm.ctx).stage_form_id;
+        for stage_idx in 0..3 {
+            let mut object = vec![
+                codes::ELM_GLOBAL_EXCALL, codes::ELM_EXCALL_STAGE, ELM_ARRAY, stage_idx,
+                codes::ELM_STAGE_OBJECT, ELM_ARRAY, 10,
+            ];
+            object.push(codes::ELM_OBJECT_CREATE_RECT);
+            vm.exec_command(
+                object.clone(), 0, vm.cfg.fm_void,
+                &mut [0, 0, 100, 80, 255, 255, 255, 255, 1]
+                    .into_iter().map(Value::Int).collect(),
+            ).unwrap();
+            assert!(vm.ctx.globals.stage_forms[&stage_form].object_lists[&(stage_idx as i64)][10].used);
+
+            *object.last_mut().unwrap() = codes::ELM_OBJECT_X;
+            vm.exec_assign(object.clone(), 1, Value::Int(123 + stage_idx as i64)).unwrap();
+            vm.exec_property(object).unwrap();
+            assert_eq!(vm.pop_int().unwrap(), 123 + stage_idx);
+        }
+        assert!(!vm.ctx.render_list_with_effects().is_empty(), "menu objects must be drawable");
+    }
+
+    #[test]
+    fn excall_indexed_stage_button_group_accepts_right_click_cancel() {
+        use crate::runtime::forms::codes;
+        use crate::runtime::input::VmMouseButton;
+
+        let mut vm = test_vm();
+        vm.exec_command(
+            vec![codes::ELM_GLOBAL_EXCALL, codes::ELM_EXCALL_ALLOC],
+            0, vm.cfg.fm_void, &mut vec![],
+        ).unwrap();
+        vm.ctx.excall_state.ex_call_flag = true;
+        let mut group = vec![
+            codes::ELM_GLOBAL_EXCALL, codes::ELM_EXCALL_STAGE, ELM_ARRAY, 1,
+            codes::STAGE_ELM_OBJBTNGROUP, ELM_ARRAY, 2, constants::GROUP_INIT,
+        ];
+        vm.exec_command(group.clone(), 0, vm.cfg.fm_void, &mut vec![]).unwrap();
+        *group.last_mut().unwrap() = constants::GROUP_START_CANCEL;
+        vm.exec_command(group.clone(), 0, vm.cfg.fm_void, &mut vec![]).unwrap();
+        *group.last_mut().unwrap() = constants::GROUP_GET_DECIDED_NO;
+        vm.exec_command(group.clone(), 0, vm.cfg.fm_int, &mut vec![]).unwrap();
+        assert_eq!(vm.pop_int().unwrap(), -2);
+        vm.ctx.on_mouse_down(VmMouseButton::Right);
+        vm.ctx.on_mouse_up(VmMouseButton::Right);
+        vm.exec_command(group, 0, vm.cfg.fm_int, &mut vec![]).unwrap();
+        assert_eq!(vm.pop_int().unwrap(), -1);
+    }
+
+    #[test]
+    fn dialog_child_buttons_inherit_parent_layer_for_hover_and_click() {
+        use crate::runtime::forms::{codes, excall};
+        use crate::runtime::input::VmMouseButton;
+
+        for group_no in [-1, 8] {
+            let mut vm = test_vm();
+            vm.exec_command(
+                vec![codes::ELM_GLOBAL_EXCALL, codes::ELM_EXCALL_ALLOC],
+                0, vm.cfg.fm_void, &mut vec![],
+            ).unwrap();
+            vm.ctx.excall_state.ex_call_flag = true;
+            let root = vec![codes::ELM_GLOBAL_EXCALL, codes::ELM_EXCALL_FRONT,
+                codes::ELM_STAGE_OBJECT, ELM_ARRAY, 69];
+            let mut child = root.clone();
+            child.extend([codes::ELM_OBJECT_CHILD, ELM_ARRAY, 1]);
+            for (object, rect, button_no, layer) in [
+                (&root, [0, 0, 400, 200, 255, 255, 255, 255, 1, 100, 200], 111, 300),
+                (&child, [0, 0, 80, 40, 255, 255, 255, 255, 1, 20, 30], 1, 0),
+            ] {
+                let mut command = object.clone();
+                command.push(codes::ELM_OBJECT_CREATE_RECT);
+                vm.exec_command(command, 2, vm.cfg.fm_void,
+                    &mut rect.into_iter().map(Value::Int).collect()).unwrap();
+                let mut property = object.clone();
+                property.push(codes::ELM_OBJECT_LAYER);
+                vm.exec_assign(property, 1, Value::Int(layer)).unwrap();
+                let mut command = object.clone();
+                command.push(codes::ELM_OBJECT_SET_BUTTON);
+                vm.exec_command(command, 2, vm.cfg.fm_void,
+                    &mut [button_no, group_no, 1, -1].into_iter().map(Value::Int).collect()).unwrap();
+            }
+            if group_no >= 0 {
+                vm.exec_command(vec![codes::ELM_GLOBAL_EXCALL, codes::ELM_EXCALL_FRONT,
+                    codes::STAGE_ELM_OBJBTNGROUP, ELM_ARRAY, group_no as i32,
+                    constants::GROUP_START_CANCEL], 0, vm.cfg.fm_void, &mut vec![]).unwrap();
+            }
+            let form = excall::tick_targets(&vm.ctx).stage_form_id;
+            vm.ctx.on_mouse_move(140, 245);
+            let obj = &vm.ctx.globals.stage_forms[&form].object_lists[&1][69];
+            assert!(obj.runtime.child_objects[1].button.hit, "child must win over the dialog background");
+            assert!(!obj.button.hit);
+            vm.ctx.on_mouse_down(VmMouseButton::Left);
+            assert!(vm.ctx.globals.stage_forms[&form].object_lists[&1][69]
+                .runtime.child_objects[1].button.pushed);
+            vm.ctx.on_mouse_up(VmMouseButton::Left);
+            if group_no >= 0 {
+                assert_eq!(vm.ctx.globals.stage_forms[&form].group_lists[&1][group_no as usize]
+                    .decided_button_no, 1);
+            }
+        }
+    }
+
+    #[test]
     fn op_seen_flag_reads_and_writes_the_persistent_global_list() {
         use crate::runtime::forms::codes::ELM_GLOBAL_G;
         let mut vm = test_vm();
@@ -13357,6 +13483,57 @@ mod command_dispatch_tests {
         vm.ctx.reset_for_scene_restart();
         vm.exec_property(elm).unwrap();
         assert_eq!(vm.pop_int().unwrap(), 2);
+    }
+
+    #[test]
+    fn wait_wipe_without_active_transition_returns_zero_each_time() {
+        let mut vm = test_vm();
+        for _ in 0..2 {
+            vm.exec_command(
+                vec![constants::elm_value::GLOBAL_WAIT_WIPE],
+                0,
+                vm.cfg.fm_int,
+                &mut vec![],
+            ).expect("WAIT_WIPE after the transition has finished");
+            assert_eq!(vm.pop_int().unwrap(), 0);
+            assert!(!vm.ctx.wait_poll());
+            assert!(vm.ctx.stack.is_empty(), "return is delivered only once");
+        }
+    }
+
+    #[test]
+    fn wait_wipe_returns_completion_result_but_inline_wipe_wait_is_void() {
+        for (explicit_wait, key_skip) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut vm = test_vm();
+            vm.exec_command(
+                vec![constants::elm_value::GLOBAL_WIPE],
+                0,
+                vm.cfg.fm_void,
+                &mut vec![],
+            ).unwrap();
+            if explicit_wait {
+                vm.exec_command(
+                    vec![constants::elm_value::GLOBAL_WAIT_WIPE],
+                    0,
+                    vm.cfg.fm_int,
+                    &mut vec![Value::NamedArg { id: 0, value: Box::new(Value::Int(1)) }],
+                ).unwrap();
+            } else {
+                vm.ctx.wait.wait_wipe(true);
+            }
+            assert!(vm.ctx.wait_poll());
+            if key_skip {
+                assert!(vm.ctx.wait.notify_key(&mut vm.ctx.globals, &vm.ctx.ids));
+            }
+            vm.ctx.finish_wipe_runtime();
+            assert!(!vm.ctx.wait_poll());
+            if explicit_wait {
+                assert_eq!(vm.ctx.pop().and_then(|v| v.as_i64()), Some(if key_skip { 1 } else { 0 }));
+            }
+            assert!(vm.ctx.stack.is_empty());
+            assert!(!vm.ctx.wait_poll());
+            assert!(vm.ctx.stack.is_empty());
+        }
     }
 
     #[test]
@@ -13374,6 +13551,29 @@ mod command_dispatch_tests {
     }
 
     #[test]
+    fn global_title_commands_read_and_update_the_saved_scene_title() {
+        let mut vm = test_vm();
+        vm.exec_command(
+            vec![constants::elm_value::GLOBAL_GET_TITLE], 0, vm.cfg.fm_str, &mut vec![],
+        ).unwrap();
+        assert_eq!(vm.pop_str().unwrap(), "");
+
+        for title in ["第一章", "エピローグ", ""] {
+            vm.exec_command(
+                vec![constants::elm_value::GLOBAL_SET_TITLE], 0, vm.cfg.fm_void,
+                &mut vec![Value::Str(title.into())],
+            ).unwrap();
+            vm.exec_command(
+                vec![constants::elm_value::GLOBAL_GET_TITLE], 0, vm.cfg.fm_str, &mut vec![],
+            ).unwrap();
+            assert_eq!(vm.pop_str().unwrap(), title);
+            assert!(vm.ctx.stack.is_empty());
+            vm.build_local_save_snapshot();
+            assert_eq!(vm.ctx.local_save_snapshot.as_ref().unwrap().save_scene_title, title);
+        }
+    }
+
+    #[test]
     fn global_get_scene_name_returns_active_scene_on_string_stack() {
         let mut vm = test_vm();
         for scene in ["_start", "menu", "frame_action_scene"] {
@@ -13388,6 +13588,25 @@ mod command_dispatch_tests {
             assert_eq!(vm.pop_str().unwrap(), scene);
             assert!(vm.ctx.stack.is_empty());
         }
+    }
+
+    #[test]
+    fn global_owari_yields_to_host_for_exit_without_confirmation() {
+        use crate::runtime::globals::SyscomPendingProcKind;
+
+        let mut vm = test_vm();
+        vm.ctx.globals.syscom.menu_open = true;
+        let generation = vm.ctx.proc_generation();
+        vm.exec_command(
+            vec![constants::elm_value::GLOBAL_OWARI],
+            0, vm.cfg.fm_void, &mut vec![],
+        ).expect("OWARI requests normal host shutdown");
+        let pending = vm.ctx.globals.syscom.pending_proc.as_ref().unwrap();
+        assert_eq!(pending.kind, SyscomPendingProcKind::EndGame);
+        assert!(!pending.warning && !pending.se_play && !pending.fade_out);
+        assert!(!vm.ctx.globals.syscom.menu_open);
+        assert_ne!(vm.ctx.proc_generation(), generation);
+        assert!(vm.ctx.stack.is_empty());
     }
 
     #[test]

@@ -1597,8 +1597,12 @@ fn load_config_save(ctx: &mut CommandContext) -> Result<()> {
         cfg.auto_mode_onoff = rd.bool()?;
         cfg.auto_mode_moji_wait = rd.i32()? as i64;
         cfg.auto_mode_min_wait = rd.i32()? as i64;
-        cfg.mouse_cursor_hide_onoff = rd.bool()?;
-        cfg.mouse_cursor_hide_time = rd.i32()? as i64;
+        // Version 1.1 goes directly from auto-mode waits to jitan settings.
+        // Cursor auto-hide was added in 1.2; retain Gameexe defaults for 1.1.
+        if header.minor_version >= 2 {
+            cfg.mouse_cursor_hide_onoff = rd.bool()?;
+            cfg.mouse_cursor_hide_time = rd.i32()? as i64;
+        }
         cfg.jitan_normal_onoff = rd.bool()?;
         cfg.jitan_auto_mode_onoff = rd.bool()?;
         cfg.jitan_msgbk_onoff = rd.bool()?;
@@ -1806,7 +1810,17 @@ pub fn write_global_save(ctx: &CommandContext) {
     stream.push_i32(0);
 
     let cg_flags: Vec<i64> = ctx.tables.cg_flags.iter().map(|v| *v as i64).collect();
-    stream.push_fixed_i32_list(&cg_flags, cg_flag_cnt);
+    // Without a CGTABLE_FILE, native C_tnm_cg_table::init leaves flag in
+    // its default extendable state. Its empty save contains only a count.
+    let has_cg_table = ctx.tables.cgtable.is_some()
+        || ctx.tables.gameexe.as_ref()
+            .and_then(|cfg| cfg.get_unquoted("CGTABLE_FILE"))
+            .is_some_and(|name| !name.is_empty());
+    if !has_cg_table && cg_flags.is_empty() {
+        stream.push_extend_i32_list(&[]);
+    } else {
+        stream.push_fixed_i32_list(&cg_flags, cg_flag_cnt);
+    }
 
     let bgm_flags: Vec<i64> = ctx
         .globals
@@ -1876,7 +1890,15 @@ pub fn load_global_save(ctx: &mut CommandContext) -> Result<()> {
         namae_global.resize_with(26 + 26 * 26, String::new);
         namae_global.truncate(26 + 26 * 26);
         let _dummy_check_id = rd.i32()?;
-        let cg = rd.fixed_i32_list()?;
+        // An uninitialized native CG table saves an extendable empty list:
+        // one zero count, without a fixed-array jump. A fixed-array jump at
+        // this stream position cannot be zero. Also accept fixed empty lists
+        // written by earlier Rust builds.
+        let cg = if rd.remaining().starts_with(&0i32.to_le_bytes()) {
+            rd.extend_i32_list()?
+        } else {
+            rd.fixed_i32_list()?
+        };
         let bgm = rd.fixed_i32_list()?;
         let chrkoe_cnt = rd.i32()?;
         anyhow::ensure!((0..=256).contains(&chrkoe_cnt), "invalid global.sav CHRKOE count: {chrkoe_cnt}");
@@ -6319,6 +6341,113 @@ mod global_save_init_tests {
     }
 
     #[test]
+    fn config_save_versions_preserve_settings_after_optional_fields() {
+        for minor_version in [1, 2, 3] {
+            let project_dir = test_project_dir();
+            let mut stream = original_save::OriginalStreamWriter::new();
+            stream.push_i32(0); // screen mode
+            if minor_version >= 3 {
+                stream.push_i32(1); // window mode
+            }
+            stream.push_i32(80);
+            stream.push_i32(90);
+            if minor_version >= 3 {
+                stream.push_i32(1280);
+                stream.push_i32(720);
+            }
+            stream.push_bool(false); // fullscreen resolution change
+            for value in [1, 0, 28, 27, 1920, 1080, 1, 100, 100] {
+                stream.push_i32(value);
+            }
+            stream.push_bool(true); // fullscreen scale sync
+            stream.push_i32(0);
+            stream.push_i32(0);
+            stream.push_i32(180); // master volume
+            for _ in 0..32 {
+                stream.push_i32(200);
+            }
+            for _ in 0..33 {
+                stream.push_bool(true);
+            }
+            stream.push_i32(175); // BGM fade
+            stream.push_bool(true);
+            stream.push_u32(0xe61d0818); // filter
+            stream.push_bool(false); // proportional font
+            stream.push_str("Test Font");
+            stream.push_i32(2); // font shadow
+            stream.push_bool(false); // bold
+            stream.push_i32(20); // message speed
+            stream.push_bool(false); // no wait
+            stream.push_bool(false); // auto mode
+            stream.push_i32(70);
+            stream.push_i32(300);
+            if minor_version >= 2 {
+                stream.push_bool(true); // cursor auto-hide
+                stream.push_i32(2468);
+            }
+            stream.push_bool(true); // jitan normal
+            stream.push_bool(false); // jitan auto
+            stream.push_bool(true); // jitan backlog
+            stream.push_i32(125); // jitan speed
+            stream.push_i32(1); // voice mode
+            stream.push_i32(1); // character voices
+            stream.push_bool(false);
+            stream.push_padding(3);
+            stream.push_i32(170);
+            stream.push_bool(true); // character text colors
+            for _ in 0..2 { // object and extra-switch flags
+                stream.push_i32(4);
+                for flag in [true, false, true, false] {
+                    stream.push_bool(flag);
+                }
+            }
+            stream.push_i32(4); // extra modes
+            for value in [0, 1, 2, 3] {
+                stream.push_i32(value);
+            }
+            for flag in [false, false, false, false, true, false, false, true, false] {
+                stream.push_bool(flag);
+            }
+            for path in ["screenshots", "editor", "voices", "voice-tool"] {
+                stream.push_str(path);
+            }
+            let packed = original_save::pack_buffer(&stream.into_inner());
+            let mut data = original_save::OriginalConfigSaveHeader {
+                major_version: 1,
+                minor_version,
+                config_data_size: packed.len() as i32,
+            }.to_bytes();
+            data.extend_from_slice(&packed);
+            fs::create_dir_all(project_dir.join("savedata")).unwrap();
+            fs::write(project_dir.join("savedata/config.sav"), data).unwrap();
+            let mut ctx = CommandContext::new(project_dir.clone());
+            let defaults = original_config_defaults(&ctx);
+
+            load_config_save(&mut ctx).unwrap();
+            let cfg = &ctx.globals.syscom.original_config;
+            assert_eq!(cfg.screen_size_scale, (80, 90));
+            assert_eq!(cfg.all_sound_user_volume, 180);
+            assert_eq!(cfg.font_name, "Test Font");
+            assert_eq!(cfg.auto_mode_min_wait, 300);
+            assert_eq!(cfg.mouse_cursor_hide_onoff,
+                if minor_version == 1 { defaults.mouse_cursor_hide_onoff } else { true });
+            assert_eq!(cfg.mouse_cursor_hide_time,
+                if minor_version == 1 { defaults.mouse_cursor_hide_time } else { 2468 });
+            assert!(cfg.jitan_normal_onoff && cfg.jitan_msgbk_onoff);
+            assert!(!cfg.jitan_auto_mode_onoff);
+            assert_eq!(cfg.jitan_speed, 125);
+            assert_eq!(cfg.koe_mode, 1);
+            assert!(!cfg.chrkoe[0].onoff);
+            assert_eq!(cfg.chrkoe[0].volume, 170);
+            assert_eq!(cfg.global_extra_mode_flag, [0, 1, 2, 3]);
+            assert!(cfg.saveload_alert_flag);
+            assert_eq!(cfg.ss_path, "screenshots");
+            assert_eq!(cfg.koe_tool_path, "voice-tool");
+            fs::remove_dir_all(project_dir).unwrap();
+        }
+    }
+
+    #[test]
     fn config_dialog_edits_update_script_state_and_survive_reopening() {
         let project_dir = test_project_dir();
         fs::create_dir_all(&project_dir).unwrap();
@@ -6380,6 +6509,67 @@ mod global_save_init_tests {
         assert!(load_global_save(&mut ctx).is_err());
 
         let _ = fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn global_save_with_uninitialized_cg_table_preserves_following_fields() {
+        let project_dir = test_project_dir();
+        let mut stream = original_save::OriginalStreamWriter::new();
+        stream.push_i64(61151);
+        stream.push_fixed_i32_list(&[42], 10000);
+        stream.push_fixed_i32_list(&[7], 10000);
+        stream.push_fixed_str_list(&["global".to_string()], 10000);
+        stream.push_fixed_str_list(&[], 702);
+        stream.push_i32(0);
+        stream.push_extend_i32_list(&[]);
+        stream.push_fixed_i32_list(&[1, 0, 1], 20);
+        stream.push_i32(2);
+        stream.push_str("first");
+        stream.push_bool(true);
+        stream.push_str("second");
+        stream.push_bool(false);
+        let payload = stream.into_inner();
+        original_save::write_global_save_file(&project_dir, &payload).unwrap();
+
+        let mut ctx = CommandContext::new(project_dir.clone());
+        load_global_save(&mut ctx).expect("native empty extendable CG table");
+        assert_eq!(ctx.globals.syscom.total_play_time, 61151);
+        assert_eq!(ctx.globals.int_lists[&(codes::ELM_GLOBAL_G as u32)][0], 42);
+        assert_eq!(ctx.globals.int_lists[&(codes::ELM_GLOBAL_Z as u32)][0], 7);
+        assert_eq!(ctx.globals.str_lists[&(codes::ELM_GLOBAL_M as u32)][0], "global");
+        assert!(ctx.tables.cg_flags.is_empty());
+        assert_eq!(ctx.globals.bgm_table_flags.len(), 20);
+        assert_eq!(&ctx.globals.bgm_table_flags[..3], &[true, false, true]);
+        assert_eq!(ctx.globals.syscom.chrkoe_look_flags.get("first"), Some(&true));
+        assert_eq!(ctx.globals.syscom.chrkoe_look_flags.get("second"), Some(&false));
+
+        // The alternate CG layout must not hide a truncated later field.
+        original_save::write_global_save_file(&project_dir, &payload[..payload.len() - 1]).unwrap();
+        assert!(load_global_save(&mut ctx).is_err());
+        fs::remove_dir_all(project_dir).unwrap();
+    }
+
+    #[test]
+    fn global_save_writer_uses_native_empty_cg_layout() {
+        let project_dir = test_project_dir();
+        fs::create_dir_all(&project_dir).unwrap();
+        let mut ctx = CommandContext::new(project_dir.clone());
+        ctx.tables.gameexe = Some(crate::formats::gameexe::GameexeConfig::from_text(
+            "#CGTABLE_FILE=\"\"\n#CGTABLE_FLAG_CNT=1000\n",
+        ));
+        ctx.globals.bgm_table_flags = vec![true, false, true];
+        write_global_save(&ctx);
+        let payload = original_save::read_global_save_file(&project_dir).unwrap();
+        let mut rd = original_save::OriginalStreamReader::new(&payload);
+        rd.i64().unwrap();
+        rd.fixed_i32_list().unwrap();
+        rd.fixed_i32_list().unwrap();
+        rd.fixed_str_list().unwrap();
+        rd.fixed_str_list().unwrap();
+        rd.i32().unwrap();
+        assert_eq!(rd.i32().unwrap(), 0, "CG count has no preceding jump");
+        assert_eq!(&rd.fixed_i32_list().unwrap()[..3], &[1, 0, 1]);
+        fs::remove_dir_all(project_dir).unwrap();
     }
 
     #[test]

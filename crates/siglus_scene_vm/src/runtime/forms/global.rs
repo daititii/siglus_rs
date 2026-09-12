@@ -1529,7 +1529,7 @@ fn dispatch_global_wipe_command(
                 .original_config
                 .skip_wipe_anime_flag,
         };
-        ctx.wait.wait_wipe(key_skip);
+        ctx.wait.wait_wipe_with_return(key_skip, true);
         return Ok(true);
     }
     if op == constants::elm_value::GLOBAL_CHECK_WIPE {
@@ -2009,6 +2009,24 @@ pub fn dispatch_global_form(
 ) -> Result<bool> {
     let form_id = canonical_global_form_id(ctx, form_id);
 
+    if form_id == constants::elm_value::GLOBAL_OWARI as u32 {
+        use crate::runtime::globals::{SyscomPendingProc, SyscomPendingProcKind};
+
+        // cmd_global.cpp: tnm_syscom_end_game(false, false, false).
+        ctx.globals.syscom.pending_proc = Some(SyscomPendingProc {
+            kind: SyscomPendingProcKind::EndGame,
+            warning: false,
+            se_play: false,
+            fade_out: false,
+            leave_msgbk: false,
+            save_id: 0,
+        });
+        ctx.globals.syscom.menu_open = false;
+        // Let the host save persistent state and exit before the next instruction.
+        ctx.request_proc_boundary(crate::runtime::ProcKind::Script);
+        return Ok(true);
+    }
+
     if form_id == constants::elm_value::GLOBAL_GET_SCENE_NAME as u32 {
         ctx.stack.push(Value::Str(ctx.current_scene_name.clone().unwrap_or_default()));
         return Ok(true);
@@ -2139,9 +2157,14 @@ pub fn dispatch_global_form(
         return Ok(true);
     }
     if form_id == constants::elm_value::GLOBAL_SET_TITLE as u32 {
-        // Original engine forwards this to the OS window caption.  The winit
-        // shell owns the actual window, so keep VM semantics as a successful
-        // side-effect command here.
+        // cmd_global.cpp stores Gp_local->scene_title. This is script/save
+        // state, even when the host does not update the OS window caption.
+        ctx.globals.syscom.current_save_scene_title =
+            args.first().and_then(Value::as_str).unwrap_or_default().to_string();
+        return Ok(true);
+    }
+    if form_id == constants::elm_value::GLOBAL_GET_TITLE as u32 {
+        ctx.push(Value::Str(ctx.globals.syscom.current_save_scene_title.clone()));
         return Ok(true);
     }
 

@@ -2,7 +2,7 @@
 mod desktop {
     use std::{
         collections::VecDeque,
-        io::{BufReader, Cursor},
+        io::BufReader,
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -14,7 +14,10 @@ mod desktop {
     use anyhow::{bail, Context};
     use kira::{
         manager::{backend::DefaultBackend, AudioManager, AudioManagerSettings},
-        sound::static_sound::{StaticSoundData, StaticSoundHandle},
+        sound::streaming::{
+            Decoder as KiraStreamingDecoder, StreamingSoundData, StreamingSoundHandle,
+        },
+        Frame,
     };
     use winit::{
         dpi::PhysicalSize,
@@ -76,17 +79,8 @@ mod desktop {
 
         let stop = Arc::new(AtomicBool::new(false));
         let (video_tx, video_rx) = crossbeam_channel::bounded::<VideoEvent>(8);
-        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<AudioEvent>(1);
-
-        // Kira's StaticSoundData path needs the complete PCM buffer. Do not run
-        // that full-file WMA decode concurrently with WMV3: on a 1080p movie it
-        // needlessly steals an entire CPU core from the video decoder. The
-        // window remains responsive while audio is prepared; once ready we start
-        // video and start Kira on the first decoded video frame. --video-only is
-        // available when the goal is pure WMV3 profiling.
-        let audio_predecode = audio_info.is_some() && !video_only;
-        let _audio_thread = if audio_predecode {
-            Some(spawn_audio_decode_thread(input_path.clone(), audio_tx, stop.clone()))
+        let audio_path = if audio_info.is_some() && !video_only {
+            Some(input_path.clone())
         } else {
             None
         };
@@ -95,22 +89,19 @@ mod desktop {
             renderer,
             video_tx,
             video_rx,
-            audio_rx,
             stop,
             input_path,
             video_started: false,
-            pending_audio: None,
+            audio_path,
             _audio: None,
             pending_video: VecDeque::new(),
             video_clock: None,
             presented_frames: 0,
             dropped_frames: 0,
         };
-        // Video must never wait for a full-file WMA predecode.  The previous
-        // diagnostic-player revision only started WMV decoding after the audio
-        // worker had decoded the entire movie, leaving the window blank for the
-        // whole predecode interval.  Start video immediately; audio preparation
-        // is independent and may finish later.
+        // Video decode starts immediately. Audio is opened as a Kira streaming
+        // source when the first video frame establishes the presentation clock,
+        // so WMA PCM is consumed incrementally rather than only after EOF.
         state.start_video_decode_if_needed();
 
         event_loop.run(move |event, elwt| {
@@ -128,22 +119,7 @@ mod desktop {
                         state.renderer.resize(size.width, size.height);
                     }
                     WindowEvent::RedrawRequested => {
-                        while let Ok(event) = state.audio_rx.try_recv() {
-                            match event {
-                                AudioEvent::Decoded(audio) => {
-                                    eprintln!("[audio] predecode complete");
-                                    state.pending_audio = Some(audio);
-                                    state.start_audio_if_ready();
-                                }
-                                AudioEvent::NoAudio => {
-                                    eprintln!("[audio] decoder produced no PCM frames");
-                                }
-                                AudioEvent::Error(err) => {
-                                    eprintln!("[audio] decode failed: {err:#}");
-                                }
-                            }
-                        }
-
+                        state.poll_audio_error();
                         // Present anything that is already due before receiving more
                         // decoded frames.  Otherwise a fast decoder can keep try_recv()
                         // continuously successful and starve presentation entirely.
@@ -233,11 +209,10 @@ mod desktop {
         renderer: Renderer,
         video_tx: crossbeam_channel::Sender<VideoEvent>,
         video_rx: crossbeam_channel::Receiver<VideoEvent>,
-        audio_rx: crossbeam_channel::Receiver<AudioEvent>,
         stop: Arc<AtomicBool>,
         input_path: PathBuf,
         video_started: bool,
-        pending_audio: Option<DecodedAudio>,
+        audio_path: Option<PathBuf>,
         _audio: Option<AudioPlayback>,
         pending_video: VecDeque<DecodedFrame>,
         video_clock: Option<VideoClock>,
@@ -280,17 +255,26 @@ mod desktop {
             if self._audio.is_some() || self.video_clock.is_none() {
                 return;
             }
-            let Some(audio) = self.pending_audio.take() else {
+            let Some(path) = self.audio_path.take() else {
                 return;
             };
-            match AudioPlayback::start(audio) {
+            match AudioPlayback::start(&path) {
                 Ok(playback) => {
-                    eprintln!("[audio] Kira playback started");
+                    eprintln!("[audio] Kira streaming playback started");
                     self._audio = Some(playback);
                 }
                 Err(err) => {
-                    eprintln!("[audio] Kira output init/play failed: {err:#}");
+                    eprintln!("[audio] Kira streaming init/play failed: {err:#}");
                 }
+            }
+        }
+
+        fn poll_audio_error(&mut self) {
+            let Some(audio) = self._audio.as_mut() else {
+                return;
+            };
+            if let Some(err) = audio.take_stream_error() {
+                eprintln!("[audio] streaming decode failed: {err:#}");
             }
         }
 
@@ -512,146 +496,268 @@ mod desktop {
         if data.is_empty() { (0, 0) } else { (min, max) }
     }
 
-    enum AudioEvent {
-        Decoded(DecodedAudio),
-        NoAudio,
-        Error(anyhow::Error),
+    const AUDIO_DECODE_FRAMES: usize = 4096;
+
+    #[derive(Default)]
+    struct AudioPcmStats {
+        samples: usize,
+        nonzero: usize,
+        peak: f32,
+        sum_squares: f64,
     }
 
-    fn spawn_audio_decode_thread(
-        path: PathBuf,
-        tx: crossbeam_channel::Sender<AudioEvent>,
-        stop: Arc<AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            if stop.load(Ordering::Relaxed) {
-                return;
+    impl AudioPcmStats {
+        fn observe(&mut self, samples: &[f32]) {
+            for &sample in samples {
+                let abs = sample.abs();
+                self.samples = self.samples.saturating_add(1);
+                if abs > 1.0e-12 {
+                    self.nonzero = self.nonzero.saturating_add(1);
+                }
+                self.peak = self.peak.max(abs);
+                self.sum_squares += (sample as f64) * (sample as f64);
             }
-            eprintln!("[audio] opening decoder: {}", path.display());
-            match decode_audio_stereo(&path) {
-                Ok(Some(audio)) => {
-                    let _ = tx.send(AudioEvent::Decoded(audio));
-                }
-                Ok(None) => {
-                    let _ = tx.send(AudioEvent::NoAudio);
-                }
-                Err(err) => {
-                    let _ = tx.send(AudioEvent::Error(err));
-                }
-            }
-        })
-    }
-
-    struct DecodedAudio {
-        sample_rate: u32,
-        stereo_samples: Vec<f32>,
-    }
-
-    fn decode_audio_stereo(path: &Path) -> anyhow::Result<Option<DecodedAudio>> {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("open {} for audio", path.display()))?;
-        let mut decoder = AsfWmaDecoder::open(BufReader::new(file))
-            .context("open ASF/WMA decoder")?;
-        let sample_rate = decoder.sample_rate();
-        let channels = decoder.channels() as usize;
-        if sample_rate == 0 || channels == 0 {
-            bail!("invalid audio format: {} Hz, {} channels", sample_rate, channels);
         }
 
-        let mut stereo = Vec::<f32>::new();
-        let mut first_audio_pts = None;
-        let mut frames = 0usize;
-        loop {
-            let decoded = match decoder.next_frame() {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
+        fn rms(&self) -> f64 {
+            if self.samples == 0 {
+                0.0
+            } else {
+                (self.sum_squares / self.samples as f64).sqrt()
+            }
+        }
+    }
+
+    struct DiagnosticWmaStreamingDecoder {
+        path: PathBuf,
+        decoder: AsfWmaDecoder<BufReader<std::fs::File>>,
+        sample_rate: u32,
+        channels: usize,
+        num_frames: usize,
+        pending: VecDeque<Frame>,
+        produced_frames: usize,
+        decoded_chunks: usize,
+        first_pts_ms: Option<u32>,
+        stats: AudioPcmStats,
+        eof: bool,
+    }
+
+    impl DiagnosticWmaStreamingDecoder {
+        fn new(path: &Path) -> anyhow::Result<Self> {
+            let decoder = Self::open_decoder(path)?;
+            let sample_rate = decoder.sample_rate();
+            let channels = decoder.channels() as usize;
+            if sample_rate == 0 || channels == 0 {
+                bail!("invalid WMA format: {} Hz, {} channels", sample_rate, channels);
+            }
+            let duration_ms = decoder
+                .duration_ms()
+                .context("ASF has no play duration; cannot size Kira streaming source")?;
+            let num_frames = (((duration_ms as u128) * (sample_rate as u128) + 999) / 1000)
+                .max(1) as usize;
+            eprintln!(
+                "[audio] streaming decoder opened: {} Hz, {} ch, duration={} ms, kira_frames={}",
+                sample_rate, channels, duration_ms, num_frames
+            );
+            Ok(Self {
+                path: path.to_path_buf(),
+                decoder,
+                sample_rate,
+                channels,
+                num_frames,
+                pending: VecDeque::new(),
+                produced_frames: 0,
+                decoded_chunks: 0,
+                first_pts_ms: None,
+                stats: AudioPcmStats::default(),
+                eof: false,
+            })
+        }
+
+        fn open_decoder(
+            path: &Path,
+        ) -> anyhow::Result<AsfWmaDecoder<BufReader<std::fs::File>>> {
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("open {} for audio", path.display()))?;
+            AsfWmaDecoder::open(BufReader::new(file)).context("open ASF/WMA decoder")
+        }
+
+        fn reset(&mut self) -> anyhow::Result<()> {
+            self.decoder = Self::open_decoder(&self.path)?;
+            self.pending.clear();
+            self.produced_frames = 0;
+            self.decoded_chunks = 0;
+            self.first_pts_ms = None;
+            self.stats = AudioPcmStats::default();
+            self.eof = false;
+            Ok(())
+        }
+
+        fn decode_more(&mut self) -> anyhow::Result<()> {
+            if self.eof {
+                return Ok(());
+            }
+            let decoded = match self.decoder.next_frame() {
+                Ok(Some(decoded)) => decoded,
+                Ok(None) => {
+                    self.eof = true;
+                    eprintln!(
+                        "[audio] EOF: chunks={} pcm_samples={} nonzero={} peak={:.8} rms={:.8}",
+                        self.decoded_chunks,
+                        self.stats.samples,
+                        self.stats.nonzero,
+                        self.stats.peak,
+                        self.stats.rms()
+                    );
+                    if self.stats.samples != 0 && self.stats.nonzero == 0 {
+                        eprintln!(
+                            "[audio] VERDICT: decoder produced PCM samples, but every sample is zero"
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(err) => return Err(anyhow::Error::new(err).context("decode WMA packet")),
             };
-            first_audio_pts.get_or_insert(decoded.pts_ms);
-            frames += 1;
-            append_stereo(&mut stereo, &decoded.frame.samples, channels);
-        }
 
-        if stereo.is_empty() {
-            eprintln!("[audio] decoder produced no PCM frames");
-            return Ok(None);
-        }
+            self.first_pts_ms.get_or_insert(decoded.pts_ms);
+            self.decoded_chunks = self.decoded_chunks.saturating_add(1);
+            self.stats.observe(&decoded.frame.samples);
 
-        let first_audio_pts = first_audio_pts.unwrap_or(0);
-        eprintln!(
-            "[audio] decoded {} chunks, {} Hz, {} ch -> stereo, first pts={} ms, samples={} ({:.3} s)",
-            frames,
-            sample_rate,
-            channels,
-            first_audio_pts,
-            stereo.len(),
-            stereo.len() as f64 / 2.0 / sample_rate as f64
-        );
-        Ok(Some(DecodedAudio {
-            sample_rate,
-            stereo_samples: stereo,
-        }))
+            let chunk_channels = decoded.frame.channels as usize;
+            let chunk_rate = decoded.frame.sample_rate;
+            if chunk_channels != self.channels || chunk_rate != self.sample_rate {
+                bail!(
+                    "WMA format changed mid-stream: expected {} Hz/{} ch, got {} Hz/{} ch",
+                    self.sample_rate,
+                    self.channels,
+                    chunk_rate,
+                    chunk_channels
+                );
+            }
+            append_kira_stereo_frames(
+                &mut self.pending,
+                &decoded.frame.samples,
+                chunk_channels,
+            );
+
+            if self.decoded_chunks <= 8 || self.decoded_chunks % 64 == 0 {
+                eprintln!(
+                    "[audio] chunk={} pts={} ms pcm_samples={} queued_frames={} total_nonzero={} peak={:.8} rms={:.8}",
+                    self.decoded_chunks,
+                    decoded.pts_ms,
+                    decoded.frame.samples.len(),
+                    self.pending.len(),
+                    self.stats.nonzero,
+                    self.stats.peak,
+                    self.stats.rms()
+                );
+            }
+            Ok(())
+        }
     }
 
-    fn append_stereo(dst: &mut Vec<f32>, samples: &[f32], channels: usize) {
-        if channels == 1 {
-            dst.reserve(samples.len().saturating_mul(2));
-            for &s in samples {
-                dst.push(s);
-                dst.push(s);
+    impl KiraStreamingDecoder for DiagnosticWmaStreamingDecoder {
+        type Error = anyhow::Error;
+
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn num_frames(&self) -> usize {
+            self.num_frames
+        }
+
+        fn decode(&mut self) -> Result<Vec<Frame>, Self::Error> {
+            let remaining = self.num_frames.saturating_sub(self.produced_frames);
+            if remaining == 0 {
+                return Ok(Vec::new());
             }
+            let target = remaining.min(AUDIO_DECODE_FRAMES);
+            let mut out = Vec::with_capacity(target);
+            while out.len() < target {
+                while out.len() < target {
+                    let Some(frame) = self.pending.pop_front() else {
+                        break;
+                    };
+                    out.push(frame);
+                }
+                if out.len() >= target {
+                    break;
+                }
+                if self.eof {
+                    // Keep Kira's finite source length aligned with the ASF play
+                    // duration without changing the decoder PCM statistics above.
+                    out.resize(target, Frame::ZERO);
+                    break;
+                }
+                self.decode_more()?;
+            }
+            self.produced_frames = self.produced_frames.saturating_add(out.len());
+            Ok(out)
+        }
+
+        fn seek(&mut self, index: usize) -> Result<usize, Self::Error> {
+            let target = index.min(self.num_frames.saturating_sub(1));
+            self.reset()?;
+            let mut skipped = 0usize;
+            while skipped < target && !self.eof {
+                if self.pending.is_empty() {
+                    self.decode_more()?;
+                }
+                while skipped < target {
+                    let Some(_frame) = self.pending.pop_front() else {
+                        break;
+                    };
+                    skipped = skipped.saturating_add(1);
+                }
+            }
+            self.produced_frames = skipped;
+            eprintln!("[audio] streaming seek requested={} actual={}", index, skipped);
+            Ok(skipped)
+        }
+    }
+
+    fn append_kira_stereo_frames(dst: &mut VecDeque<Frame>, samples: &[f32], channels: usize) {
+        if channels == 0 {
             return;
         }
         let frames = samples.len() / channels;
-        dst.reserve(frames.saturating_mul(2));
+        dst.reserve(frames);
         for frame in 0..frames {
             let base = frame * channels;
-            dst.push(samples[base]);
-            dst.push(samples[base + 1]);
+            let left = samples[base];
+            let right = if channels == 1 {
+                left
+            } else {
+                samples[base + 1]
+            };
+            dst.push_back(Frame::new(left, right));
         }
     }
 
-
     struct AudioPlayback {
         _manager: AudioManager<DefaultBackend>,
-        _handle: StaticSoundHandle,
+        _handle: StreamingSoundHandle<anyhow::Error>,
     }
 
     impl AudioPlayback {
-        fn start(audio: DecodedAudio) -> anyhow::Result<Self> {
-            let wav = encode_wav_stereo_i16(&audio.stereo_samples, audio.sample_rate);
-            let sound = StaticSoundData::from_cursor(Cursor::new(wav))
-                .context("Kira decode generated PCM WAV")?;
+        fn start(path: &Path) -> anyhow::Result<Self> {
+            let decoder = DiagnosticWmaStreamingDecoder::new(path)?;
+            let sound = StreamingSoundData::from_decoder(decoder);
             let mut manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
                 .context("create Kira audio manager")?;
-            let handle = manager.play(sound).context("start Kira movie audio")?;
+            let handle = manager
+                .play(sound)
+                .context("start Kira WMA streaming audio")?;
             Ok(Self {
                 _manager: manager,
                 _handle: handle,
             })
         }
-    }
 
-    fn encode_wav_stereo_i16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-        let data_len = samples.len().saturating_mul(2) as u32;
-        let mut out = Vec::with_capacity(44usize.saturating_add(data_len as usize));
-        out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&(36u32.saturating_add(data_len)).to_le_bytes());
-        out.extend_from_slice(b"WAVEfmt ");
-        out.extend_from_slice(&16u32.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&2u16.to_le_bytes());
-        out.extend_from_slice(&sample_rate.to_le_bytes());
-        out.extend_from_slice(&sample_rate.saturating_mul(4).to_le_bytes());
-        out.extend_from_slice(&4u16.to_le_bytes());
-        out.extend_from_slice(&16u16.to_le_bytes());
-        out.extend_from_slice(b"data");
-        out.extend_from_slice(&data_len.to_le_bytes());
-        for &sample in samples {
-            let s = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
-            out.extend_from_slice(&s.to_le_bytes());
+        fn take_stream_error(&mut self) -> Option<anyhow::Error> {
+            self._handle.pop_error()
         }
-        out
     }
 
     // RENDERER_START

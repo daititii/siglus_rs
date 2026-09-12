@@ -994,7 +994,7 @@ pub fn read_config_save_file(project_dir: &Path) -> Result<(OriginalConfigSaveHe
         bail!("config save file too short: {}", path.display());
     }
     let header = OriginalConfigSaveHeader::from_bytes(&data[..CONFIG_SAVE_HEADER_SIZE])?;
-    if header.major_version != 1 || header.minor_version < 2 {
+    if header.major_version != 1 || header.minor_version < 1 {
         bail!(
             "unsupported config save version {}.{}",
             header.major_version,

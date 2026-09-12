@@ -813,6 +813,7 @@ pub struct VmWait {
 
     pub wipe: bool,
     wipe_key_skip: bool,
+    wipe_return_value: bool,
 
     block_generation: u64,
 }
@@ -1193,6 +1194,10 @@ impl VmWait {
         if self.wipe {
             if globals.wipe_done() {
                 self.wipe = false;
+                if self.wipe_return_value {
+                    self.pending_value = Some(Value::Int(0));
+                }
+                self.wipe_return_value = false;
                 if self.wipe_key_skip {
                     self.wipe_key_skip = false;
                     if self.waiting_for_key {
@@ -1626,9 +1631,14 @@ impl VmWait {
     }
 
     pub fn wait_wipe(&mut self, key_skip: bool) {
+        self.wait_wipe_with_return(key_skip, false);
+    }
+
+    pub fn wait_wipe_with_return(&mut self, key_skip: bool, return_value_flag: bool) {
         self.mark_block_request();
         self.wipe = true;
         self.wipe_key_skip = key_skip;
+        self.wipe_return_value = return_value_flag;
         // C++ TNM_PROC_TYPE_WIPE_WAIT semantics (flow_proc.cpp
         // tnm_wipe_wait_proc): the wait releases when the wipe finishes by
         // time; a decide key press only *skips early*. It is never a hard
@@ -1651,6 +1661,10 @@ impl VmWait {
         if wipe_skipped {
             self.wipe = false;
             self.wipe_key_skip = false;
+            if self.wipe_return_value {
+                self.pending_value = Some(Value::Int(1));
+            }
+            self.wipe_return_value = false;
         }
 
         wipe_skipped
@@ -1805,6 +1819,7 @@ impl VmWait {
         self.system_modal = false;
         self.wipe = false;
         self.wipe_key_skip = false;
+        self.wipe_return_value = false;
     }
 }
 

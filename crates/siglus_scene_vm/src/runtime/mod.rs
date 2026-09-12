@@ -7530,15 +7530,22 @@ impl CommandContext {
         if let Some(id) = self.globals.mov.audio_id {
             if let Some(position_ms) = self.movie.audio_playback_position_ms(id) {
                 self.globals.mov.timer_ms = position_ms;
-            }
-            if self.movie.audio_playback_finished(id) {
-                self.globals.mov.audio_id = None;
-                self.globals.mov.audio_start_attempted = false;
-                if let Some(total_ms) = self.globals.mov.total_ms {
-                    self.globals.mov.timer_ms = total_ms;
+                if self.movie.audio_playback_finished(id) {
+                    self.globals.mov.audio_id = None;
+                    self.globals.mov.audio_start_attempted = false;
+                    if let Some(total_ms) = self.globals.mov.total_ms {
+                        self.globals.mov.timer_ms = total_ms;
+                    }
+                    self.globals.mov.playing = false;
+                    return;
                 }
-                self.globals.mov.playing = false;
-                return;
+            } else {
+                // A failed streaming audio decoder must not terminate MOV video.
+                // MovieManager already removed/stopped the failed handle; continue
+                // from the current video clock and do not retry the same broken
+                // stream every frame.
+                self.globals.mov.audio_id = None;
+                self.globals.mov.audio_start_attempted = true;
             }
         }
 
@@ -7610,8 +7617,10 @@ impl CommandContext {
                 self.globals.mov.playing = false;
             }
         }
-        let waiting_for_movie_audio_start =
-            need_audio && polled.audio.is_none() && !polled.audio_ready;
+        // WMV-specific startup clamping is decided inside MovieManager. It keeps
+        // only the movie media clock at zero while ASF/WMA probing completes; the
+        // VM/global frame clock continues normally, so this does not stall scripts,
+        // counters, frame actions, or rendering.
         let _ = polled.decoded_now;
 
         let frame = polled.frame.clone();
@@ -7619,9 +7628,15 @@ impl CommandContext {
 
         if need_audio {
             if let Some(track) = polled.audio.as_ref() {
+                // WMV audio is decoded to PCM on the background probe thread.  It may
+                // become ready after video presentation has already advanced, so begin
+                // static PCM playback at the current movie time instead of rewinding the
+                // movie to zero. Seeking decoded PCM is safe and does not disturb WMA
+                // packet/superframe state.
+                let audio_offset_ms = self.globals.mov.timer_ms;
                 match self
                     .movie
-                    .start_audio(&mut self.audio, track, self.globals.mov.timer_ms, false)
+                    .start_audio(&mut self.audio, track, audio_offset_ms, false)
                 {
                     Ok(id) => {
                         self.globals.mov.audio_id = Some(id);
@@ -7633,7 +7648,7 @@ impl CommandContext {
                                 track.samples.len(),
                                 track.channels,
                                 track.sample_rate,
-                                self.globals.mov.timer_ms
+                                audio_offset_ms
                             );
                         }
                     }
@@ -7646,6 +7661,9 @@ impl CommandContext {
                             track.samples.len(),
                             err
                         );
+                        // Do not let a failed audio startup prevent WMV video from
+                        // advancing, and do not retry the same stream every tick.
+                        self.globals.mov.audio_start_attempted = true;
                     }
                 }
             } else if polled.audio_ready {
@@ -7657,9 +7675,15 @@ impl CommandContext {
         }
 
         let frame_idx_changed = last_frame_idx != Some(frame_idx);
-        let small_rewind = last_frame_idx.is_some_and(|last| {
-            frame_idx < last && frame_idx.saturating_add(1) >= last
-        });
+        // WMV3/VC-1 is decoded in coded order but presented in PTS order. Its
+        // `frame_idx` can therefore legitimately go backwards (for example
+        // 0, 2, 1 with one B picture between anchors). Do not apply the generic
+        // one-step rewind suppression to that stream; MovieManager has already
+        // selected the correct frame by PTS. Keep the old behavior for MPEG/OMV.
+        let small_rewind = !polled.frame_idx_is_decode_order
+            && last_frame_idx.is_some_and(|last| {
+                frame_idx < last && frame_idx.saturating_add(1) >= last
+            });
         let show_new = frame_idx_changed && !small_rewind;
         let img_id = if image_id.is_some() && show_new {
             let id = image_id.unwrap();
@@ -7690,10 +7714,6 @@ impl CommandContext {
             sprite.tr = 255;
             sprite.alpha_blend = true;
             sprite.order = i32::MAX - 16;
-        }
-
-        if waiting_for_movie_audio_start && self.globals.mov.audio_id.is_none() {
-            self.globals.mov.timer_ms = 0;
         }
 
         if trace {
@@ -10351,8 +10371,9 @@ fn hit_test_standalone_action_button_recursive(
         }
         let cur_parent_state =
             button_parent_render_state(layers, gfx, ids, stage_idx, obj_idx, obj, parent_state);
+        let parent_sort = object_button_sort_key(ids, gfx, stage_idx, runtime_slot, obj);
         for (child_idx, child) in obj.runtime.child_objects.iter_mut().enumerate() {
-            if let Some(hit) = recurse(
+            if let Some(mut hit) = recurse(
                 images,
                 layers,
                 gfx,
@@ -10368,6 +10389,9 @@ fn hit_test_standalone_action_button_recursive(
                 Some(cur_parent_state.clone()),
                 effective_owner,
             ) {
+                // Native m_trp.sorter adds each ancestor's order and layer.
+                hit.sort_key.order = hit.sort_key.order.saturating_add(parent_sort.order);
+                hit.sort_key.layer = hit.sort_key.layer.saturating_add(parent_sort.layer);
                 merge_button_hit(&mut best, &mut tied, hit);
             }
         }
@@ -10476,8 +10500,9 @@ fn hit_test_object_button_recursive(
         }
         let cur_parent_state =
             button_parent_render_state(layers, gfx, ids, stage_idx, obj_idx, obj, parent_state);
+        let parent_sort = object_button_sort_key(ids, gfx, stage_idx, runtime_slot, obj);
         for (child_idx, child) in obj.runtime.child_objects.iter_mut().enumerate() {
-            if let Some(hit) = recurse(
+            if let Some(mut hit) = recurse(
                 images,
                 layers,
                 gfx,
@@ -10493,6 +10518,10 @@ fn hit_test_object_button_recursive(
                 Some(cur_parent_state.clone()),
                 effective_owner,
             ) {
+                // Include the dialog's layer before comparing its background
+                // button with nested YES/NO buttons, just as rendering does.
+                hit.sort_key.order = hit.sort_key.order.saturating_add(parent_sort.order);
+                hit.sort_key.layer = hit.sort_key.layer.saturating_add(parent_sort.layer);
                 merge_button_hit(&mut best, &mut tied, hit);
             }
         }
@@ -11658,16 +11687,21 @@ fn sync_movie_object_recursive(
                 if let Some(id) = obj.movie.audio_id {
                     if let Some(position_ms) = movie_mgr.audio_playback_position_ms(id) {
                         obj.movie.timer_ms = position_ms;
-                    }
-                    if movie_mgr.audio_playback_finished(id) {
-                        obj.movie.audio_id = None;
-                        if !obj.movie.loop_flag {
-                            if let Some(total_ms) = obj.movie.total_ms {
-                                obj.movie.timer_ms = total_ms;
+                        if movie_mgr.audio_playback_finished(id) {
+                            obj.movie.audio_id = None;
+                            if !obj.movie.loop_flag {
+                                if let Some(total_ms) = obj.movie.total_ms {
+                                    obj.movie.timer_ms = total_ms;
+                                }
+                                obj.movie.playing = false;
+                                obj.movie.just_finished = true;
                             }
-                            obj.movie.playing = false;
-                            obj.movie.just_finished = true;
                         }
+                    } else {
+                        // Keep object-movie video alive if only its streaming audio
+                        // decoder failed.  This mirrors GLOBAL.MOV handling above.
+                        obj.movie.audio_id = None;
+                        obj.movie.audio_started_once = true;
                     }
                 }
 

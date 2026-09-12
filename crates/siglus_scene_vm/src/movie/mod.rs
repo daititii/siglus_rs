@@ -44,7 +44,6 @@ const WMV_STREAM_CHANNEL_CAPACITY: usize = 8;
 const WMV_STREAM_MAX_DRAIN_EVENTS: usize = 16;
 const WMV_STREAM_FRAME_KEEP: usize = 12;
 const WMV_STREAM_DECODE_LEAD_MS: usize = 750;
-const WMV_STREAM_DISCARD_BEHIND_MS: u64 = 1_500;
 
 #[derive(Debug, Clone)]
 pub struct MovieInfo {
@@ -79,6 +78,10 @@ pub struct MovieStreamFrame {
     pub audio: Option<MovieAudio>,
     pub audio_ready: bool,
     pub decoded_now: bool,
+    /// True when `frame_idx` is the coded/decode-order index rather than a
+    /// monotonically increasing presentation-order index. WMV3 with B pictures
+    /// has this property even though frame selection itself is PTS ordered.
+    pub frame_idx_is_decode_order: bool,
     pub clamped_timer_ms: Option<u64>,
 }
 
@@ -626,6 +629,7 @@ impl MovieManager {
             audio: asset.audio.clone(),
             audio_ready: true,
             decoded_now,
+            frame_idx_is_decode_order: false,
             clamped_timer_ms: None,
         }))
     }
@@ -751,6 +755,7 @@ impl MovieManager {
             audio,
             audio_ready,
             decoded_now,
+            frame_idx_is_decode_order: false,
             clamped_timer_ms: None,
         }))
     }
@@ -841,6 +846,12 @@ impl MovieManager {
                 (None, None) => None,
             }
         });
+
+        // Video presentation is always driven by the movie clock. Audio probing/decoding
+        // is asynchronous and must never clamp the WMV timeline to zero: doing so freezes
+        // the picture on the first frame whenever the soundtrack is not ready yet. Once
+        // decoded PCM becomes available, audio starts at the current movie position and
+        // may then become the master clock through the normal playback-handle path.
         let effective_timer_ms = if loop_flag {
             duration_hint
                 .filter(|duration| *duration > 0)
@@ -908,6 +919,7 @@ impl MovieManager {
             audio,
             audio_ready,
             decoded_now,
+            frame_idx_is_decode_order: true,
             clamped_timer_ms: loop_flag.then_some(effective_timer_ms),
         }))
     }
@@ -1099,6 +1111,7 @@ impl MovieManager {
             audio: None,
             audio_ready: true,
             decoded_now: false,
+            frame_idx_is_decode_order: false,
             clamped_timer_ms: None,
         }))
     }
@@ -1162,15 +1175,42 @@ impl MovieManager {
                 0,
             )
         } else if let Some(stream) = track.wmv_stream.as_ref() {
-            let decoder = WmvMovieAudioDecoder::new(stream.clone(), track.sample_rate)?;
-            let mut data = StreamingSoundData::from_decoder(decoder)
-                .start_position(local_offset_ms as f64 / 1000.0);
+            let mut decoder = WmvMovieAudioDecoder::new(stream.clone(), track.sample_rate)?;
+
+            // The standalone WMV player feeds AsfWmaDecoder strictly forward and does
+            // not ask Kira to seek the stateful WMA bit reservoir before playback.
+            // Keep the engine path identical for normal (non-looping) MOV playback:
+            // advance to the requested movie offset synchronously, then hand the
+            // already-positioned decoder to Kira at source position zero.  Calling
+            // StreamingSoundData::start_position() here makes Kira drive Decoder::seek
+            // on its decode scheduler; that path was the only material difference from
+            // the standalone player and could leave WMA1/2 superframe state misaligned
+            // ("frame_len overflow") while the same file decoded correctly standalone.
+            let timeline_base_ms = if !loop_flag && local_offset_ms > 0 {
+                let requested_frames = (((local_offset_ms as u128) * track.sample_rate as u128)
+                    / 1000)
+                    .min(stream.num_frames.saturating_sub(1) as u128)
+                    as usize;
+                let actual_frames = decoder.prime_to_timeline_frame(requested_frames)?;
+                track.start_ms.saturating_add(
+                    ((actual_frames as u128) * 1000 / track.sample_rate as u128)
+                        .min(u64::MAX as u128) as u64,
+                )
+            } else {
+                track.start_ms
+            };
+
+            let mut data = StreamingSoundData::from_decoder(decoder);
             if loop_flag {
-                data = data.loop_region(..);
+                // Looping object movies still need Kira's source-relative loop/seek
+                // semantics.  Their normal restart path begins from zero.
+                data = data
+                    .start_position(local_offset_ms as f64 / 1000.0)
+                    .loop_region(..);
             }
             (
                 MoviePlaybackHandle::Streaming(audio.play_streaming(TrackKind::Mov, data)?),
-                track.start_ms,
+                timeline_base_ms,
             )
         } else {
             make_static_movie_playback(audio, track, local_offset_ms, loop_flag)?
@@ -1211,23 +1251,37 @@ impl MovieManager {
     }
 
     pub fn audio_playback_position_ms(&mut self, id: u64) -> Option<u64> {
-        let p = self.playbacks.get_mut(&id)?;
-        if let Some(err) = p.take_stream_error() {
+        let (position_ms, stream_error) = {
+            let p = self.playbacks.get_mut(&id)?;
+            (p.movie_position_ms(), p.take_stream_error())
+        };
+        if let Some(err) = stream_error {
             eprintln!("[SG_MOV] streaming audio decoder error: {err:#}");
+            if let Some(mut p) = self.playbacks.remove(&id) {
+                p.stop();
+            }
+            return None;
         }
-        Some(p.movie_position_ms())
+        Some(position_ms)
     }
 
     pub fn audio_playback_finished(&mut self, id: u64) -> bool {
-        let finished = {
+        let (finished, stream_error) = {
             let Some(p) = self.playbacks.get_mut(&id) else {
-                return true;
+                return false;
             };
-            if let Some(err) = p.take_stream_error() {
-                eprintln!("[SG_MOV] streaming audio decoder error: {err:#}");
-            }
-            p.state() == PlaybackState::Stopped
+            (p.state() == PlaybackState::Stopped, p.take_stream_error())
         };
+        if let Some(err) = stream_error {
+            // A decoder failure is not the end of the movie.  Detach the failed
+            // audio clock and let video continue on its own timer.  In particular,
+            // never turn a WMA decode error into MOV.PLAY/PLAY_WAIT completion.
+            eprintln!("[SG_MOV] streaming audio decoder error: {err:#}");
+            if let Some(mut p) = self.playbacks.remove(&id) {
+                p.stop();
+            }
+            return false;
+        }
         if finished {
             self.playbacks.remove(&id);
         }
@@ -1881,9 +1935,28 @@ fn stream_wmv_video_worker(
         return Ok(());
     }
 
+    let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
+    if trace {
+        eprintln!(
+            "[SG_MOVIE_TRACE][WMV] decoder.open path={} size={}x{}",
+            path.display(),
+            info.width,
+            info.height
+        );
+    }
+
     let mut frame_idx = 0usize;
     let mut timeline_origin_ms = None::<u64>;
     loop {
+        // The bounded channel is the decode-ahead/backpressure mechanism.  Do
+        // not gate decoding on the current presentation clock here: WMV3/VC-1
+        // B pictures are decoded in coded order, so a future P anchor can have
+        // a later PTS than B pictures which have not been decoded yet.  Waiting
+        // on that anchor's PTS before decoding the following B pictures can
+        // stall presentation.  This matches the standalone WMV player: decode
+        // continuously into a small bounded queue, then order/present by PTS on
+        // the consumer side.  request_ms is retained only as the cancellation
+        // sentinel used by WmvStreamState::drop().
         if request_ms.load(Ordering::Acquire) == usize::MAX {
             return Ok(());
         }
@@ -1897,28 +1970,11 @@ fn stream_wmv_video_worker(
         let origin_ms = *timeline_origin_ms.get_or_insert(source_pts_ms);
         let timeline_ms = source_pts_ms.saturating_sub(origin_ms);
 
-        // AsfWmv2Decoder exposes ASF presentation timestamps after container
-        // preroll removal, but the first video PTS is not required to be zero.
-        // Siglus playback time starts at zero when the movie starts.  Gate the
-        // streaming worker on the movie-relative timeline, exactly as the
-        // standalone WMV player does with (frame.pts_ms - pts0).  Gating on the
-        // absolute ASF PTS can deadlock bootstrap: the first frame waits for a
-        // clock that cannot advance until that first frame is delivered.
-        loop {
-            let requested = request_ms.load(Ordering::Acquire);
-            if requested == usize::MAX {
-                return Ok(());
-            }
-            if timeline_ms <= requested as u64 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        let requested = request_ms.load(Ordering::Acquire) as u64;
-        if timeline_ms.saturating_add(WMV_STREAM_DISCARD_BEHIND_MS) < requested {
-            frame_idx = frame_idx.saturating_add(1);
-            continue;
+        if trace && (frame_idx < 5 || frame_idx % 60 == 0) {
+            eprintln!(
+                "[SG_MOVIE_TRACE][WMV] decoded idx={} pts={} timeline={}",
+                frame_idx, source_pts_ms, timeline_ms
+            );
         }
 
         let frame = Arc::new(wmv_yuv_frame_to_rgba(&decoded.frame));
@@ -1978,11 +2034,21 @@ fn drain_wmv_stream_state(
                         .unwrap_or(timeline_ms),
                 );
                 state.decoded_frames = state.decoded_frames.max(frame_idx.saturating_add(1));
-                state.frames.push_back(WmvDecodedFrame {
+                let decoded = WmvDecodedFrame {
                     frame_idx,
                     timeline_ms,
                     frame,
-                });
+                };
+                // WMV3/VC-1 with B pictures is decoded in coded order, while ASF PTS
+                // is presentation order.  Keep the engine queue in presentation order,
+                // matching the standalone WMV player.  select_wmv_stream_frame() and
+                // the discard logic both rely on monotonically ordered timeline_ms.
+                let insert_at = state
+                    .frames
+                    .iter()
+                    .position(|queued| queued.timeline_ms > decoded.timeline_ms)
+                    .unwrap_or(state.frames.len());
+                state.frames.insert(insert_at, decoded);
                 state.decoded_any_this_poll = true;
             }
             Ok(Ok(WmvStreamEvent::Done)) => {
@@ -2025,15 +2091,20 @@ fn select_wmv_stream_frame<'a>(
     frames: &'a VecDeque<WmvDecodedFrame>,
     target_ms: u64,
 ) -> Option<&'a WmvDecodedFrame> {
+    // Presentation is PTS-driven. Never expose a frame whose PTS is still in
+    // the future merely because decoding has run ahead. The queue keeps the
+    // most recent due frame at its front while discard_wmv_stream_state() trims
+    // older history, so returning None here means the first frame is genuinely
+    // not due yet.
     let mut before = None;
     for frame in frames {
         if frame.timeline_ms <= target_ms {
             before = Some(frame);
         } else {
-            return before.or(Some(frame));
+            break;
         }
     }
-    before.or_else(|| frames.front())
+    before
 }
 
 fn wmv_yuv_frame_to_rgba(frame: &wmv_decoder::YuvFrame) -> RgbaImage {
@@ -2799,6 +2870,33 @@ impl WmvMovieAudioDecoder {
         }
         Ok(())
     }
+
+    /// Advance from the beginning of the movie timeline without invoking Kira's
+    /// streaming seek machinery.  Every compressed WMA packet is still decoded in
+    /// forward order, preserving the superframe/bit-reservoir state exactly like the
+    /// standalone WMV player.
+    fn prime_to_timeline_frame(&mut self, target: usize) -> Result<usize> {
+        let target = target.min(self.info.num_frames.saturating_sub(1));
+        let mut advanced = 0usize;
+
+        let silence = target.min(self.initial_silence_remaining);
+        self.initial_silence_remaining -= silence;
+        advanced = advanced.saturating_add(silence);
+
+        while advanced < target && !self.eof {
+            if self.pending.is_empty() {
+                self.decode_more()?;
+            }
+            while advanced < target {
+                let Some(_frame) = self.pending.pop_front() else {
+                    break;
+                };
+                advanced = advanced.saturating_add(1);
+            }
+        }
+        self.produced_frames = advanced;
+        Ok(advanced)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2852,33 +2950,8 @@ impl KiraStreamingDecoder for WmvMovieAudioDecoder {
     }
 
     fn seek(&mut self, index: usize) -> Result<usize, Self::Error> {
-        let target = index.min(self.info.num_frames.saturating_sub(1));
         self.reset()?;
-        if target < self.info.initial_silence_frames {
-            self.initial_silence_remaining = self.info.initial_silence_frames - target;
-            self.produced_frames = target;
-            return Ok(target);
-        }
-
-        self.initial_silence_remaining = 0;
-        let audio_target = target.saturating_sub(self.info.initial_silence_frames);
-        let mut skipped_audio = 0usize;
-        while skipped_audio < audio_target && !self.eof {
-            self.decode_more()?;
-            while skipped_audio < audio_target {
-                let Some(_frame) = self.pending.pop_front() else {
-                    break;
-                };
-                skipped_audio = skipped_audio.saturating_add(1);
-            }
-        }
-        let actual = self
-            .info
-            .initial_silence_frames
-            .saturating_add(skipped_audio)
-            .min(target);
-        self.produced_frames = actual;
-        Ok(actual)
+        self.prime_to_timeline_frame(index)
     }
 }
 
@@ -3883,73 +3956,27 @@ fn decode_wmv_audio_for_path(
     path: &Path,
     cancel: &AtomicBool,
 ) -> Result<Option<MovieAudio>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("open WMV audio source: {}", path.display()))?;
-    let Some(mut decoder) = open_wmv_wma_decoder(BufReader::new(file))
-        .with_context(|| format!("probe WMV audio: {}", path.display()))?
-    else {
-        return Ok(None);
-    };
+    // Match the already validated standalone WMV player at the codec boundary:
+    // open one AsfWmaDecoder at the beginning of the ASF stream and call next_frame()
+    // sequentially until EOF.  The engine's Kira streaming adapter is a different path
+    // from the standalone player and is where the reported decode failure appears, so
+    // do not use that adapter for WMV playback here.
+    //
+    // This work runs on the existing WMV audio worker thread. Video is not blocked
+    // while PCM is materialized, and when the track becomes ready start_audio() seeks
+    // only in decoded PCM, never in the compressed WMA bitstream.
+    let timeline_origin_ms = probe_wmv_first_video_pts_ms(path)?.unwrap_or(0);
     if cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
-    let channels = decoder.channels();
-    let sample_rate = decoder.sample_rate();
-    if channels == 0 || sample_rate == 0 {
-        return Ok(None);
-    }
-    let total_ms = decoder.duration_ms();
-    let first = decoder.next_frame()?;
-    let Some(first) = first else {
-        return Ok(None);
-    };
-    let first_audio_pts_ms = first.pts_ms as u64;
-    let first_frames = first.frame.samples.len() / channels as usize;
-    let first_duration_ms = ((first_frames as u128) * 1000 / sample_rate as u128)
-        .min(u64::MAX as u128) as u64;
-    let timeline_origin_ms = probe_wmv_first_video_pts_ms(path)?
-        .unwrap_or(first_audio_pts_ms);
-    let (initial_silence_frames, source_skip_frames) = wmv_audio_alignment_frames(
-        first_audio_pts_ms,
+    let file = fs::File::open(path)
+        .with_context(|| format!("open WMV audio source: {}", path.display()))?;
+    decode_wmv_audio_full_from_reader(
+        BufReader::new(file),
+        cancel,
         timeline_origin_ms,
-        sample_rate,
-    );
-
-    let Some(total_ms) = total_ms else {
-        // Rare malformed ASF files do not carry a usable play duration. Keep
-        // the compatibility path correct by materializing their WMA audio
-        // rather than inventing a finite Kira stream length.
-        let file = fs::File::open(path)
-            .with_context(|| format!("reopen WMV audio source: {}", path.display()))?;
-        return decode_wmv_audio_full_from_reader(
-            BufReader::new(file),
-            cancel,
-            timeline_origin_ms,
-        )
-        .with_context(|| format!("decode WMA audio: {}", path.display()));
-    };
-    let audio_start_ms = first_audio_pts_ms.saturating_sub(timeline_origin_ms);
-    let duration_ms = wmv_rebase_duration_ms(total_ms, timeline_origin_ms)
-        .unwrap_or(0)
-        .max(audio_start_ms.saturating_add(first_duration_ms))
-        .max(1);
-    let num_frames = (((duration_ms as u128) * sample_rate as u128 + 999) / 1000)
-        .clamp(1, usize::MAX as u128) as usize;
-
-    Ok(Some(MovieAudio {
-        samples: Arc::new(Vec::new()),
-        mpeg_stream: None,
-        wmv_stream: Some(WmvStreamAudio {
-            path: Arc::new(path.to_path_buf()),
-            num_frames,
-            initial_silence_frames,
-            source_skip_frames,
-        }),
-        channels,
-        sample_rate,
-        start_ms: 0,
-        duration_ms: Some(duration_ms),
-    }))
+    )
+    .with_context(|| format!("decode WMA audio: {}", path.display()))
 }
 
 fn decode_mpeg2_audio_for_path(
@@ -5074,6 +5101,16 @@ mod wmv_movie_adapter_tests {
         let frames = VecDeque::from([frame(0, 0), frame(1, 40), frame(2, 120)]);
         let selected = select_wmv_stream_frame(&frames, 80).expect("selected frame");
         assert_eq!(selected.frame_idx, 1);
+    }
+
+    #[test]
+    fn frame_selection_never_presents_future_pts() {
+        let frames = VecDeque::from([frame(7, 40), frame(8, 80)]);
+        assert!(select_wmv_stream_frame(&frames, 20).is_none());
+        assert_eq!(
+            select_wmv_stream_frame(&frames, 40).map(|frame| frame.frame_idx),
+            Some(7)
+        );
     }
 
     #[test]
