@@ -7515,6 +7515,21 @@ impl CommandContext {
     }
 
     fn sync_global_movie(&mut self) {
+        // Periodic state probe: with no movie playing this is the cheapest per-frame hook
+        // that still reports the wait/scene state on a device where env vars cannot be set.
+        static SG_SYNC_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let polls = SG_SYNC_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if polls % 300 == 0 {
+            log::warn!(
+                "[SG_MOV_STATE] playing={} file={:?} reveal={} key={} runtime_poll={} continuous={}",
+                self.globals.mov.playing,
+                self.globals.mov.file_name,
+                self.wait.message_reveal_waiting(),
+                self.wait.waiting_for_key(),
+                self.wait.needs_runtime_poll(),
+                self.wait.needs_continuous_frame()
+            );
+        }
         /// Polls to wait for a first video frame before treating a clock-less movie as
         /// unplayable. Generous on purpose: a working decoder presents its first frame long
         /// before this, so a healthy movie is never cut short.
@@ -7610,14 +7625,23 @@ impl CommandContext {
                 // movie layer.
                 self.globals.mov.polls_without_frame =
                     self.globals.mov.polls_without_frame.saturating_add(1);
+                if self.globals.mov.polls_without_frame % 300 == 1 {
+                    log::warn!(
+                        "[SG_MOV] waiting for first frame: file={} polls={} audio_id={} audio_tried={} total_ms={:?} timer_ms={}",
+                        file_name,
+                        self.globals.mov.polls_without_frame,
+                        self.globals.mov.audio_id.is_some(),
+                        self.globals.mov.audio_start_attempted,
+                        self.globals.mov.total_ms,
+                        self.globals.mov.timer_ms
+                    );
+                }
                 if last_frame_idx.is_none()
-                    && self.globals.mov.audio_id.is_none()
-                    && self.globals.mov.audio_start_attempted
                     && self.globals.mov.polls_without_frame >= MOVIE_NO_FRAME_WATCHDOG_POLLS
                 {
                     log::warn!(
-                        "[SG_MOV] no decodable video frame and no audio clock after {} polls; \
-                         finishing movie file={} instead of blocking the script",
+                        "[SG_MOV] no decodable video frame after {} polls; finishing movie file={} \
+                         (audio-only playback would otherwise show a blank layer for the whole clip)",
                         self.globals.mov.polls_without_frame,
                         file_name
                     );
