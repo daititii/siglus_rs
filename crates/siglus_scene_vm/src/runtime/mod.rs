@@ -14842,7 +14842,7 @@ fn apply_button_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) 
             if let Some(objs) = st.object_lists.get(&stage_idx) {
                 for (obj_idx, obj) in objs.iter().enumerate() {
                     collect_button_visuals_recursive(
-                        ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                        ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                     );
                 }
             }
@@ -14856,18 +14856,17 @@ fn apply_button_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) 
                             obj_idx,
                             obj,
                             &mut map,
-                            None,
                             Some(obj_idx),
                         );
                     }
                     for (obj_idx, obj) in m.face_list.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                     for (obj_idx, obj) in m.object_list.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                 }
@@ -14876,12 +14875,12 @@ fn apply_button_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) 
                 for item in items {
                     for (obj_idx, obj) in item.generated_objects.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                     for (obj_idx, obj) in item.object_list.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                 }
@@ -14911,12 +14910,15 @@ fn collect_button_visuals_recursive(
     obj_idx: usize,
     obj: &globals::ObjectState,
     map: &mut HashMap<(LayerId, SpriteId), ButtonVisualState>,
-    inherited_visual: Option<ButtonVisualState>,
     mwnd_button_idx: Option<usize>,
 ) {
     use globals::ObjectBackend;
 
-    let mut effective_visual = inherited_visual;
+    // C_elm_object::frame() processes children before applying this object's
+    // button action. Its texture, cut and action corrections belong only to
+    // its own sprites; passing them to children replaces glyphs and icons
+    // with copies of the parent button's image.
+    let mut effective_visual = None;
     if obj.button.enabled || obj.button.state == TNM_BTN_STATE_DISABLE {
         if !button_syscom_mode_visible(&ctx.globals.syscom, &obj.button) {
             effective_visual = None;
@@ -15026,9 +15028,102 @@ fn collect_button_visuals_recursive(
             child_idx,
             child,
             map,
-            effective_visual.clone(),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod button_visual_ownership_tests {
+    use super::*;
+
+    fn picture(sprite_id: SpriteId, file: &str) -> globals::ObjectState {
+        let mut obj = globals::ObjectState::default();
+        obj.used = true;
+        obj.file_name = Some(file.to_owned());
+        obj.backend = globals::ObjectBackend::Rect {
+            layer_id: 0,
+            sprite_id,
+            width: 360,
+            height: 48,
+        };
+        obj
+    }
+
+    fn visuals(obj: &globals::ObjectState) -> HashMap<(LayerId, SpriteId), ButtonVisualState> {
+        let ctx = CommandContext::new(PathBuf::from("."));
+        let stage = globals::StageFormState::default();
+        let mut map = HashMap::new();
+        collect_button_visuals_recursive(&ctx, &stage, 0, 0, obj, &mut map, None);
+        map
+    }
+
+    #[test]
+    fn save_slot_button_does_not_replace_child_text_digits_or_icons() {
+        let mut slot = picture(0, "_s_data");
+        slot.button.enabled = true;
+        slot.button.action_no = 9;
+
+        let mut text = globals::ObjectState::default();
+        text.used = true;
+        text.backend = globals::ObjectBackend::String {
+            layer_id: 0,
+            shadow_sprite_id: 1,
+            fuchi_sprite_id: 2,
+            sprite_id: 3,
+            shadow_image_id: None,
+            fuchi_image_id: None,
+            image_id: None,
+            glyphs: Vec::new(),
+            mwnd_layer_reps: false,
+            width: 200,
+            height: 22,
+        };
+        let mut number = globals::ObjectState::default();
+        number.used = true;
+        number.backend = globals::ObjectBackend::Number {
+            layer_id: 0,
+            sprite_ids: vec![4, 5],
+        };
+        let mut container = globals::ObjectState::default();
+        container.runtime.child_objects.push(picture(6, "_sl_new"));
+        slot.runtime.child_objects = vec![text, number, container];
+
+        for state in 0..=TNM_BTN_STATE_DISABLE {
+            slot.button.state = state;
+            slot.button.hit = state == TNM_BTN_STATE_HIT;
+            slot.button.pushed = state == TNM_BTN_STATE_PUSH;
+            let map = visuals(&slot);
+            assert_eq!(map.len(), 1, "parent button state {state}");
+            assert_eq!(map[&(0, 0)].file_name.as_deref(), Some("_s_data"));
+        }
+    }
+
+    #[test]
+    fn nested_button_keeps_its_own_action_texture_and_cut() {
+        let ctx = CommandContext::new(PathBuf::from("."));
+        let mut slot = picture(0, "_l_data");
+        slot.button.enabled = true;
+        slot.button.action_no = 9;
+        slot.button.state = TNM_BTN_STATE_DISABLE;
+
+        let mut icon = picture(1, "_sl_new");
+        icon.button.enabled = true;
+        icon.button.action_no = 2;
+        icon.button.hit = true;
+        icon.button.cut_no = 3;
+        icon.set_int_prop(&ctx.ids, ctx.ids.obj_patno, 4);
+        icon.runtime.child_objects.push(picture(2, "child_label"));
+        slot.runtime.child_objects.push(icon);
+
+        let map = visuals(&slot);
+        assert_eq!(map.len(), 2);
+        let icon_visual = &map[&(0, 1)];
+        assert_eq!(icon_visual.state, TNM_BTN_STATE_HIT);
+        assert_eq!(icon_visual.action_no, 2);
+        assert_eq!(icon_visual.file_name.as_deref(), Some("_sl_new"));
+        assert_eq!(icon_visual.base_patno, 4);
+        assert_eq!(icon_visual.cut_no, 3);
     }
 }
 
