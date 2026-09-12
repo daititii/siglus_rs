@@ -699,14 +699,16 @@ fn parse_dquant(br: &mut BitReader<'_>, dquant: u8, pquant: u8) -> Result<DQuant
             }
             _ => {}
         }
-    } else {
-        out.enabled = true;
     }
+    // DQUANT == 2 still carries PQDIFF/ABSPQ, but FFmpeg leaves
+    // dquantfrm clear. Do not turn it into per-macroblock MQUANT syntax.
     let pqdiff = need_bits(br, 3, "PQDIFF")? as u8;
     out.alt_pquant = if pqdiff == 7 {
         need_bits(br, 5, "ABSPQ")? as u8
     } else {
-        (pquant as u16 + pqdiff as u16 + 1).min(31) as u8
+        // Match vop_dquant_decoding(): ALTPQUANT is not clamped here.
+        // GET_MQUANT handles out-of-range macroblock values later.
+        pquant + pqdiff + 1
     };
     Ok(out)
 }

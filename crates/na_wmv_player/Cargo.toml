@@ -62,3 +62,8 @@ required-features = ["desktop-bins"]
 name = "wmv-player-wgpu"
 path = "src/bin/wmv_player_wgpu.rs"
 required-features = ["desktop-bins"]
+
+[[bin]]
+name = "wmv3-frame-dump"
+path = "src/bin/wmv3_frame_dump.rs"
+required-features = ["desktop-bins"]

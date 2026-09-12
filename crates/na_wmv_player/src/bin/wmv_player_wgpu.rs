@@ -28,7 +28,7 @@ mod desktop {
 
     use wmv_decoder::{
         asf::{AsfFile, AudioStreamInfo, VideoStreamInfo},
-        AsfWmaDecoder, AsfWmv2Decoder, DecodedFrame,
+        AsfWmaDecoder, AsfWmv2Decoder, DecodedFrame, VideoTransferMatrix,
     };
 
     pub fn run() -> anyhow::Result<()> {
@@ -72,9 +72,18 @@ mod desktop {
             .build(&event_loop)
             .context("create player window")?;
 
+        let transfer_matrix = VideoTransferMatrix::for_unspecified_source(video_h);
+        eprintln!(
+            "[probe] transfer_matrix={transfer_matrix:?} (Windows/DXVA unspecified fallback)"
+        );
         eprintln!("[ui] initializing wgpu");
-        let renderer = pollster::block_on(Renderer::new(window, video_w, video_h))
-            .context("initialize wgpu renderer")?;
+        let renderer = pollster::block_on(Renderer::new(
+            window,
+            video_w,
+            video_h,
+            transfer_matrix,
+        ))
+        .context("initialize wgpu renderer")?;
         eprintln!("[ui] window ready; starting codec workers");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -788,7 +797,12 @@ mod desktop {
     }
 
     impl Renderer {
-        async fn new(window: Window, video_w: u32, video_h: u32) -> anyhow::Result<Self> {
+        async fn new(
+            window: Window,
+            video_w: u32,
+            video_h: u32,
+            transfer_matrix: VideoTransferMatrix,
+        ) -> anyhow::Result<Self> {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..Default::default()
@@ -818,7 +832,42 @@ mod desktop {
                 .await?;
 
             let caps = surface.get_capabilities(&adapter);
-            let format = caps.formats[0];
+
+            // The YUV conversion below produces display-referred R'G'B' byte-space
+            // values already (the same convention used by the CPU PNG/RGBA path).
+            // Writing those values into an sRGB swapchain applies the sRGB OETF a
+            // second time and washes out the picture. Match the Siglus/D3D9 renderer
+            // and prefer a non-sRGB surface format.
+            let format = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| !f.is_srgb())
+                .unwrap_or(caps.formats[0]);
+            if format.is_srgb() {
+                eprintln!(
+                    "[wgpu] warning: adapter exposes no non-sRGB surface format; \
+                     YUV RGB values will receive an extra sRGB transfer ({format:?})"
+                );
+            }
+
+            let alpha_mode = caps
+                .alpha_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::CompositeAlphaMode::Opaque)
+                .unwrap_or(caps.alpha_modes[0]);
+            let present_mode = caps
+                .present_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::PresentMode::Fifo)
+                .unwrap_or(caps.present_modes[0]);
+
+            eprintln!(
+                "[wgpu] surface format={format:?} srgb={} alpha={alpha_mode:?} present={present_mode:?}",
+                format.is_srgb()
+            );
 
             let size = window.inner_size();
             let config = wgpu::SurfaceConfiguration {
@@ -826,8 +875,8 @@ mod desktop {
                 format,
                 width: size.width.max(1),
                 height: size.height.max(1),
-                present_mode: caps.present_modes[0],
-                alpha_mode: caps.alpha_modes[0],
+                present_mode,
+                alpha_mode,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             };
@@ -924,6 +973,10 @@ mod desktop {
                 push_constant_ranges: &[],
             });
 
+            let fragment_entry = match transfer_matrix {
+                VideoTransferMatrix::Bt601 => "fs_main_bt601",
+                VideoTransferMatrix::Bt709 => "fs_main_bt709",
+            };
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("yuv_pipe"),
                 layout: Some(&pipeline_layout),
@@ -934,7 +987,7 @@ mod desktop {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: "fs_main",
+                    entry_point: fragment_entry,
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -1173,9 +1226,7 @@ mod desktop {
     @group(0) @binding(2) var tex_v: texture_2d<f32>;
     @group(0) @binding(3) var samp: sampler;
 
-    fn yuv_to_rgb(y: f32, u: f32, v: f32) -> vec3<f32> {
-        // Match siglus_scene_vm::movie::wmv_yuv_frame_to_rgba:
-        // BT.601 limited-range YUV420 -> RGB.
+    fn yuv_to_rgb_bt601(y: f32, u: f32, v: f32) -> vec3<f32> {
         let c = max(y * 255.0 - 16.0, 0.0);
         let d = u * 255.0 - 128.0;
         let e = v * 255.0 - 128.0;
@@ -1185,12 +1236,31 @@ mod desktop {
         return vec3<f32>(r, g, b);
     }
 
+    fn yuv_to_rgb_bt709(y: f32, u: f32, v: f32) -> vec3<f32> {
+        let c = max(y * 255.0 - 16.0, 0.0);
+        let d = u * 255.0 - 128.0;
+        let e = v * 255.0 - 128.0;
+        let r = (298.0 * c + 459.0 * e + 128.0) / 256.0 / 255.0;
+        let g = (298.0 * c - 55.0 * d - 136.0 * e + 128.0) / 256.0 / 255.0;
+        let b = (298.0 * c + 541.0 * d + 128.0) / 256.0 / 255.0;
+        return vec3<f32>(r, g, b);
+    }
+
     @fragment
-    fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+    fn fs_main_bt601(in: VSOut) -> @location(0) vec4<f32> {
         let y = textureSample(tex_y, samp, in.uv).r;
         let u = textureSample(tex_u, samp, in.uv).r;
         let v = textureSample(tex_v, samp, in.uv).r;
-        let rgb = clamp(yuv_to_rgb(y, u, v), vec3<f32>(0.0), vec3<f32>(1.0));
+        let rgb = clamp(yuv_to_rgb_bt601(y, u, v), vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec4<f32>(rgb, 1.0);
+    }
+
+    @fragment
+    fn fs_main_bt709(in: VSOut) -> @location(0) vec4<f32> {
+        let y = textureSample(tex_y, samp, in.uv).r;
+        let u = textureSample(tex_u, samp, in.uv).r;
+        let v = textureSample(tex_v, samp, in.uv).r;
+        let rgb = clamp(yuv_to_rgb_bt709(y, u, v), vec3<f32>(0.0), vec3<f32>(1.0));
         return vec4<f32>(rgb, 1.0);
     }
     "#;

@@ -3,6 +3,7 @@
 
 pub mod asf;
 pub mod bitreader;
+pub mod color;
 pub mod decoder;
 pub mod error;
 pub mod na_msmpeg4_mv_tables;
@@ -25,6 +26,7 @@ pub mod api;
 #[cfg(feature = "audio")]
 pub use api::{AsfWmaDecoder, DecodedAudioFrame};
 pub use api::{AsfWmv2Decoder, DecodedFrame, Wmv2Decoder, Wmv3Decoder};
+pub use color::{yuv420p_to_rgb, yuv420p_to_rgba, yuv_limited_to_rgb, VideoTransferMatrix};
 pub use decoder::YuvFrame;
 pub use error::{DecoderError, Result};
 

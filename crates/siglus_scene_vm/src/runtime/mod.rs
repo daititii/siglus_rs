@@ -7506,13 +7506,17 @@ impl CommandContext {
             if let Some(position_ms) = self.movie.audio_playback_position_ms(id) {
                 self.globals.mov.timer_ms = position_ms;
                 if self.movie.audio_playback_finished(id) {
+                    // Audio reaching EOF is not MOV reaching EOF.  The native movie
+                    // player owns one A/V timeline, but in this port WMV audio and video
+                    // are decoded by independent workers.  A short/truncated WMA track
+                    // (or an audio stream whose coded duration is slightly shorter than
+                    // the video stream) must not tear down GLOBAL.MOV before the video
+                    // presenter reaches the container/video duration.  Detach the audio
+                    // clock and let GlobalMovieState::tick() resume the media timer from
+                    // the last Kira position; normal video-duration completion below will
+                    // close the movie.
                     self.globals.mov.audio_id = None;
-                    self.globals.mov.audio_start_attempted = false;
-                    if let Some(total_ms) = self.globals.mov.total_ms {
-                        self.globals.mov.timer_ms = total_ms;
-                    }
-                    self.globals.mov.playing = false;
-                    return;
+                    self.globals.mov.audio_start_attempted = true;
                 }
             } else {
                 // A failed streaming audio decoder must not terminate MOV video.

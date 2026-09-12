@@ -2148,37 +2148,15 @@ fn select_wmv_stream_frame<'a>(
 }
 
 fn wmv_yuv_frame_to_rgba(frame: &wmv_decoder::YuvFrame) -> RgbaImage {
-    let width = frame.width;
-    let height = frame.height;
-    let w = width as usize;
-    let h = height as usize;
-    let chroma_w = w / 2;
-    let mut rgba = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
-    for y in 0..h {
-        for x in 0..w {
-            let yv = frame.y.get(y * w + x).copied().unwrap_or(16) as i32;
-            let uv_idx = (y / 2).saturating_mul(chroma_w).saturating_add(x / 2);
-            let u = frame.cb.get(uv_idx).copied().unwrap_or(128) as i32;
-            let v = frame.cr.get(uv_idx).copied().unwrap_or(128) as i32;
-            let c = (yv - 16).max(0);
-            let d = u - 128;
-            let e = v - 128;
-            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-            let out = (y * w + x) * 4;
-            rgba[out] = r;
-            rgba[out + 1] = g;
-            rgba[out + 2] = b;
-            rgba[out + 3] = 255;
-        }
-    }
+    // The original desktop engine delegates WMV presentation to the Windows
+    // media stack. For WMV streams without explicit matrix metadata, match the
+    // Windows/DXVA fallback: BT.601 for <=576-line SD, BT.709 for HD.
     RgbaImage {
-        width,
-        height,
+        width: frame.width,
+        height: frame.height,
         center_x: 0,
         center_y: 0,
-        rgba,
+        rgba: wmv_decoder::yuv420p_to_rgba(frame),
     }
 }
 
