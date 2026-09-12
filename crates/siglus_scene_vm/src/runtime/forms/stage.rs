@@ -14126,31 +14126,6 @@ pub(crate) fn novel_clear_current_mwnd_after_wait(ctx: &mut CommandContext) {
     });
 }
 
-/// Finish a loaded story event before resuming Rewrite+'s map loop.
-///
-/// A legacy active-only save contains the front MWND state but not the native
-/// MESSAGE_KEY_WAIT proc. The restored scene can therefore return normally
-/// while the Rust UI projection still displays the last dialogue page. The
-/// original map transition closes that window; perform the same narrow cleanup
-/// at the title-specific synthetic return boundary.
-pub(crate) fn close_current_mwnd_for_scene_transition(ctx: &mut CommandContext) -> bool {
-    let (form_id, stage_idx, mwnd_idx) = current_mwnd_target(ctx);
-    with_stage_state(ctx, form_id, |ctx, st| {
-        let Some(list) = st.mwnd_lists.get_mut(&stage_idx) else {
-            return false;
-        };
-        let Some(m) = list.get_mut(mwnd_idx) else {
-            return false;
-        };
-        clear_mwnd_message_block_now(ctx, stage_idx, m);
-        m.open = false;
-        m.window_appear = false;
-        m.name_appear = false;
-        ctx.ui.begin_mwnd_close(0, 0);
-        true
-    })
-}
-
 fn mark_mwnd_clear_ready(ctx: &mut CommandContext, m: &mut MwndState) {
     // C++ tnm_msg_proc_clear_ready clears the global script-trigger skip.
     // NovelClear intentionally does not call this helper.

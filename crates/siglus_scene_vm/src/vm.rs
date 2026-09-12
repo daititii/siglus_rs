@@ -80,14 +80,6 @@ thread_local! {
     // Per-call/per-return tracing needs its own opt-in: in a map frame loop it emits
     // hundreds of thousands of lines and produced a 350 MB log in a single run.
     static SG_RET_TRACE_ON: bool = std::env::var_os("SG_VM_RET_TRACE").is_some();
-    /// Diagnostic A/B knob: skip the Rewrite+ synthesized caller-chain restore so the
-    /// no-caller fallback path can be observed directly.
-    static SG_NO_LEGACY_CHAIN: bool = std::env::var_os("SG_NO_LEGACY_CHAIN").is_some();
-}
-
-#[inline]
-fn sg_no_legacy_chain() -> bool {
-    SG_NO_LEGACY_CHAIN.with(|v| *v)
 }
 
 #[inline]
@@ -390,80 +382,6 @@ struct ResolvedUserCommand {
 
 fn siglus_name_eq(lhs: &str, rhs: &str) -> bool {
     lhs.eq_ignore_ascii_case(rhs)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LegacyRewriteCallerSpec {
-    scene_name: &'static str,
-    z_no: i32,
-    /// PC immediately after the FARCALL command that entered the next scene.
-    return_pc: usize,
-    source_line: i32,
-    int_args: &'static [i32],
-}
-
-const LEGACY_REWRITE_ROOT_ARGS: &[i32] = &[];
-const LEGACY_REWRITE_MP40_ARGS: &[i32] = &[0, 3];
-const LEGACY_REWRITE_MP50_ARGS: &[i32] = &[0, 3];
-const LEGACY_REWRITE_MP40_Z50_ARGS: &[i32] = &[0];
-
-fn matches_rewrite_plus_active_only_layout(
-    current_scene_name: &str,
-    scene0_name: Option<&str>,
-    seen_scene_no: Option<usize>,
-    mp40_scene_no: Option<usize>,
-    mp50_scene_no: Option<usize>,
-) -> bool {
-    current_scene_name.eq_ignore_ascii_case("seen01003_m00")
-        && scene0_name.is_some_and(|name| name.eq_ignore_ascii_case("__va_effect_ss_cmd_particle"))
-        && seen_scene_no == Some(10)
-        && mp40_scene_no == Some(125)
-        && mp50_scene_no == Some(127)
-}
-
-fn legacy_rewrite_plus_map_caller_specs() -> &'static [LegacyRewriteCallerSpec] {
-    // This is the exact Rewrite+ path observed in the shipped bytecode:
-    //
-    //   sys40_mp40 #z0
-    //     -> sys40_mp40 #z40 (line 77)
-    //       -> sys40_mp50_01003_m00 #z20 (line 202)
-    //         -> sys40_mp40 #z50 (line 186)
-    //           -> seen01003_m00 #z0 (line 232)
-    //
-    // The original save keeps only the active scene and cannot serialize the
-    // four caller streams. These PCs are the post-FARCALL continuation points
-    // in Rewrite+'s Scene.pck; restoring them lets normal RETURN unwind the
-    // chain instead of restarting #z0 and dispatching the same map object.
-    &[
-        LegacyRewriteCallerSpec {
-            scene_name: "sys40_mp40",
-            z_no: 0,
-            return_pc: 0x5e4,
-            source_line: 77,
-            int_args: LEGACY_REWRITE_ROOT_ARGS,
-        },
-        LegacyRewriteCallerSpec {
-            scene_name: "sys40_mp40",
-            z_no: 40,
-            return_pc: 0x2016,
-            source_line: 202,
-            int_args: LEGACY_REWRITE_MP40_ARGS,
-        },
-        LegacyRewriteCallerSpec {
-            scene_name: "sys40_mp50_01003_m00",
-            z_no: 20,
-            return_pc: 0xc71,
-            source_line: 186,
-            int_args: LEGACY_REWRITE_MP50_ARGS,
-        },
-        LegacyRewriteCallerSpec {
-            scene_name: "sys40_mp40",
-            z_no: 50,
-            return_pc: 0x2662,
-            source_line: 232,
-            int_args: LEGACY_REWRITE_MP40_Z50_ARGS,
-        },
-    ]
 }
 
 fn find_named_index(
@@ -4694,7 +4612,6 @@ impl<'a> SceneVm<'a> {
                     }
                 }
                 sg_omv_trace!(self, "RETURN argc={} args={:?} call_depth={} scene_stack={}", args.len(), args, self.call_stack.len(), self.scene_stack.len());
-                let _ = self.restore_legacy_rewrite_plus_map_call_chain()?;
                 if self.at_cross_scene_return_boundary() {
                     if self.return_from_scene(args)? {
                         return Ok(true);
@@ -4712,13 +4629,25 @@ impl<'a> SceneVm<'a> {
                     return Ok(false);
                 }
                 if self.call_stack.len() == 1 {
+                    // Only the scene base frame is left, so this RETURN has no caller
+                    // to unwind to. The original format serializes the whole
+                    // cross-scene call list, so a well-formed save always has one;
+                    // this state means the active save carried no caller frames at
+                    // all (an active-only legacy save). The orphaned continuation
+                    // cannot be reconstructed from that save, so end the scene flow
+                    // here instead of guessing a return address. Clearing
+                    // `legacy_saved_active_only` hands the wind-down to the host,
+                    // which returns to the title rather than leaving a halted VM on
+                    // screen forever.
                     log::warn!(
-                        "[SG-DIAG-9] CD_RETURN depth-1 halt: scene={:?} scene_no={:?} line={} pc=0x{:x}",
+                        "[SG_VM] cross-scene RETURN with no caller frame: scene={:?} scene_no={:?} line={} pc=0x{:x} legacy_active_only={} -> scene flow ends",
                         self.current_scene_name,
                         self.current_scene_no,
                         self.current_line_no,
-                        pc_before
+                        pc_before,
+                        self.legacy_saved_active_only
                     );
+                    self.legacy_saved_active_only = false;
                     self.halted = true;
                     return Ok(false);
                 }
@@ -11078,22 +11007,6 @@ impl<'a> SceneVm<'a> {
         Ok(call_stack)
     }
 
-    fn is_rewrite_plus_active_only_layout(&self, current_scene_name: &str) -> bool {
-        if !current_scene_name.eq_ignore_ascii_case("seen01003_m00") {
-            return false;
-        }
-        let Some(pck) = self.scene_pck_cache.as_ref() else {
-            return false;
-        };
-        matches_rewrite_plus_active_only_layout(
-            current_scene_name,
-            pck.find_scene_name(0),
-            Self::find_scene_no_by_name(pck, "seen01003_m00"),
-            Self::find_scene_no_by_name(pck, "sys40_mp40"),
-            Self::find_scene_no_by_name(pck, "sys40_mp50_01003_m00"),
-        )
-    }
-
     fn restore_saved_scene_stack(
         &mut self,
         mut frames: Vec<CallFrame>,
@@ -12054,152 +11967,6 @@ impl<'a> SceneVm<'a> {
             }
         }
         Ok((stream, scene_no))
-    }
-
-    fn restore_legacy_rewrite_plus_map_call_chain(&mut self) -> Result<bool> {
-        if sg_no_legacy_chain() {
-            return Ok(false);
-        }
-        if !self.legacy_saved_active_only
-            || !self
-                .current_scene_name
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case("seen01003_m00"))
-            || self.call_stack.len() != 1
-            || !self.scene_stack.is_empty()
-            || !self.is_rewrite_plus_active_only_layout("seen01003_m00")
-        {
-            return Ok(false);
-        }
-
-        let seen_scene_no = self.current_scene_no;
-        let seen_scene_name = self.current_scene_name.clone();
-        let seen_line_no = self.current_line_no;
-        let seen_user_cmd_names = self.user_cmd_names.clone();
-        let seen_call_cmd_names = self.call_cmd_names.clone();
-        let specs = legacy_rewrite_plus_map_caller_specs();
-
-        // Loading these streams only resolves their bytecode and labels. It
-        // does not change the active scene; restore the active seen command
-        // maps after collecting the synthetic callers.
-        let mut callers = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let (mut stream, scene_no) = self
-                .load_scene_stream(spec.scene_name, spec.z_no)
-                .with_context(|| {
-                    format!(
-                        "restore Rewrite+ caller scene={} z={}",
-                        spec.scene_name, spec.z_no
-                    )
-                })?;
-            if spec.return_pc >= stream.scn.len() {
-                bail!(
-                    "Rewrite+ caller return PC out of bounds: scene={} z={} pc=0x{:x} scn_len=0x{:x}",
-                    spec.scene_name,
-                    spec.z_no,
-                    spec.return_pc,
-                    stream.scn.len()
-                );
-            }
-            stream.set_prg_cntr(spec.return_pc)?;
-            let user_cmd_names = stream.scn_cmd_name_map.clone();
-            let call_cmd_names = self.call_cmd_names.clone();
-            callers.push((
-                spec,
-                stream,
-                scene_no,
-                user_cmd_names,
-                call_cmd_names,
-            ));
-        }
-
-        let seen_frame = self
-            .call_stack
-            .pop()
-            .ok_or_else(|| anyhow!("legacy Rewrite+ save has no active call frame"))?;
-        let root = callers
-            .first()
-            .ok_or_else(|| anyhow!("legacy Rewrite+ caller chain is empty"))?;
-
-        // The save's one frame is the active seen callee. Add the four caller
-        // frames below it, matching farcall_scene_name_ex()'s shared call
-        // stack layout. CALL.L carries the arguments used by each map scene.
-        let mut call_stack = Vec::with_capacity(callers.len() + 1);
-        let mut base = self.scene_base_call();
-        base.return_pc = root.0.return_pc;
-        base.ret_form = self.cfg.fm_int;
-        base.return_scene_no = Some(root.2);
-        base.return_scene_name = Some(root.0.scene_name.to_string());
-        base.return_line_no = root.0.source_line;
-        call_stack.push(base);
-
-        for (idx, (spec, _, _scene_no, _, _)) in callers.iter().enumerate().skip(1) {
-            let mut frame = self.make_call_frame(
-                self.cfg.fm_int,
-                false,
-                false,
-                spec.int_args.len(),
-                None,
-            );
-            for (arg_idx, value) in spec.int_args.iter().copied().enumerate() {
-                if let Some(slot) = frame.int_args.get_mut(arg_idx) {
-                    *slot = value;
-                }
-            }
-            frame.return_pc = spec.return_pc;
-            frame.ret_form = self.cfg.fm_int;
-            let caller = &callers[idx - 1];
-            frame.return_scene_no = Some(caller.2);
-            frame.return_scene_name = Some(caller.0.scene_name.to_string());
-            frame.return_line_no = caller.0.source_line;
-            call_stack.push(frame);
-        }
-
-        // The active save frame remains the seen callee. Its serialized CALL.L
-        // and user properties are retained exactly as loaded.
-        call_stack.push(seen_frame);
-        self.call_stack = call_stack;
-        self.scene_stack.clear();
-
-        // Each SceneExecFrame owns the caller lexer that must be restored when
-        // its callee returns. The entries are pushed in farcall order, so the
-        // last one restores sys40_mp40 #z50 immediately after seen returns.
-        for (idx, (spec, stream, scene_no, user_cmd_names, call_cmd_names)) in
-            callers.into_iter().enumerate()
-        {
-            self.scene_stack.push(SceneExecFrame {
-                stream,
-                user_cmd_names,
-                call_cmd_names,
-                current_scene_no: Some(scene_no),
-                current_scene_name: Some(spec.scene_name.to_string()),
-                current_line_no: spec.source_line,
-                call_depth: idx + 2,
-            });
-        }
-
-        self.user_cmd_names = seen_user_cmd_names;
-        self.call_cmd_names = seen_call_cmd_names;
-        self.current_scene_no = seen_scene_no;
-        self.current_scene_name = seen_scene_name;
-        self.current_line_no = seen_line_no;
-        if crate::runtime::forms::stage::close_current_mwnd_for_scene_transition(&mut self.ctx) {
-            log::warn!(
-                "[SG_SAVELOAD] closed active Rewrite+ message window before map return"
-            );
-        }
-        self.ctx.current_scene_no = self.current_scene_no.map(|v| v as i64);
-        self.ctx.current_scene_name = self.current_scene_name.clone();
-        self.ctx.current_line_no = self.current_line_no as i64;
-        self.gosub_return_stack.clear();
-        self.legacy_saved_active_only = false;
-        log::warn!(
-            "[SG_SAVELOAD] restored legacy Rewrite+ caller chain scene={:?} call_depth={} scene_stack={}",
-            self.current_scene_name,
-            self.call_stack.len(),
-            self.scene_stack.len()
-        );
-        Ok(true)
     }
 
     fn jump_to_scene_name(&mut self, scene_name: &str, z_no: i32) -> Result<()> {
@@ -13182,75 +12949,6 @@ mod user_command_resolution_tests {
             Some((12, false))
         );
     }
-}
-
-#[cfg(test)]
-mod legacy_save_return_chain_tests {
-    use super::{
-        legacy_rewrite_plus_map_caller_specs, matches_rewrite_plus_active_only_layout, CommandContext,
-        SceneVm,
-    };
-
-    #[test]
-    fn rewrite_plus_chain_restores_callers_in_farcall_order() {
-        let specs = legacy_rewrite_plus_map_caller_specs();
-        assert_eq!(specs.len(), 4);
-        assert_eq!(specs[0].scene_name, "sys40_mp40");
-        assert_eq!(specs[0].z_no, 0);
-        assert_eq!(specs[0].return_pc, 0x5e4);
-        assert_eq!(specs[1].scene_name, "sys40_mp40");
-        assert_eq!(specs[1].z_no, 40);
-        assert_eq!(specs[1].return_pc, 0x2016);
-        assert_eq!(specs[2].scene_name, "sys40_mp50_01003_m00");
-        assert_eq!(specs[2].z_no, 20);
-        assert_eq!(specs[2].return_pc, 0xc71);
-        assert_eq!(specs[3].scene_name, "sys40_mp40");
-        assert_eq!(specs[3].z_no, 50);
-        assert_eq!(specs[3].return_pc, 0x2662);
-    }
-
-    #[test]
-    fn rewrite_plus_chain_preserves_map_event_arguments() {
-        let specs = legacy_rewrite_plus_map_caller_specs();
-        assert!(specs[0].int_args.is_empty());
-        assert_eq!(specs[1].int_args, &[0, 3]);
-        assert_eq!(specs[2].int_args, &[0, 3]);
-        assert_eq!(specs[3].int_args, &[0]);
-    }
-
-    #[test]
-    fn rewrite_plus_layout_guard_requires_exact_scene_identity() {
-        assert!(matches_rewrite_plus_active_only_layout(
-            "seen01003_m00",
-            Some("__va_effect_ss_cmd_particle"),
-            Some(10),
-            Some(125),
-            Some(127),
-        ));
-        assert!(!matches_rewrite_plus_active_only_layout(
-            "seen01004_m00",
-            Some("__va_effect_ss_cmd_particle"),
-            Some(10),
-            Some(125),
-            Some(127),
-        ));
-        assert!(!matches_rewrite_plus_active_only_layout(
-            "seen01003_m00",
-            Some("other_scene_zero"),
-            Some(10),
-            Some(125),
-            Some(127),
-        ));
-        assert!(!matches_rewrite_plus_active_only_layout(
-            "seen01003_m00",
-            Some("__va_effect_ss_cmd_particle"),
-            Some(11),
-            Some(125),
-            Some(127),
-        ));
-    }
-
-
 }
 
 #[cfg(test)]

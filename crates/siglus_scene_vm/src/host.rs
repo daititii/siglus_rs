@@ -41,6 +41,30 @@ fn should_exit_host_frame(
         || (vm_halted && flow_empty && !legacy_saved_active_only)
 }
 
+/// What the host does when the script proc flow is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyFlowAction {
+    /// Ordinary end of flow: stop pumping and keep showing the last frame.
+    Pause,
+    /// After an active-only legacy load the resumed scene runs on its own; an
+    /// empty flow must not end the frame loop that keeps its surface alive.
+    KeepAlive,
+    /// That resumed scene has now stopped. An active-only save serializes no
+    /// caller frames, so nothing can be resumed past its own end: go back to
+    /// the title instead of spinning the frame loop on a halted VM forever.
+    ReturnToTitle,
+}
+
+fn empty_flow_action(legacy_load_frame_loop: bool, vm_halted: bool) -> EmptyFlowAction {
+    if !legacy_load_frame_loop {
+        EmptyFlowAction::Pause
+    } else if vm_halted {
+        EmptyFlowAction::ReturnToTitle
+    } else {
+        EmptyFlowAction::KeepAlive
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct SiglusHostConfig {
@@ -1203,10 +1227,22 @@ impl SiglusHost {
 
         loop {
             let Some(proc) = self.flow.top().cloned() else {
-                if !self.legacy_load_frame_loop {
-                    self.paused = true;
+                match empty_flow_action(self.legacy_load_frame_loop, self.vm.is_halted()) {
+                    EmptyFlowAction::Pause => {
+                        self.paused = true;
+                        break;
+                    }
+                    EmptyFlowAction::KeepAlive => break,
+                    EmptyFlowAction::ReturnToTitle => {
+                        log::warn!(
+                            "[SG_SAVELOAD] legacy active-only load scene flow ended scene={:?} -> return to title",
+                            self.vm.current_scene_name()
+                        );
+                        self.legacy_load_frame_loop = false;
+                        self.flow.push(ProcType::ReturnToMenu, 0);
+                        continue;
+                    }
                 }
-                break;
             };
             if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
                 eprintln!(
@@ -1556,7 +1592,7 @@ pub fn default_frame_interval_ms(dt_ms: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::should_exit_host_frame;
+    use super::{empty_flow_action, should_exit_host_frame, EmptyFlowAction};
 
     #[test]
     fn active_only_legacy_load_keeps_halted_host_alive() {
@@ -1571,5 +1607,24 @@ mod tests {
     #[test]
     fn explicit_exit_always_wins_over_legacy_keepalive() {
         assert!(should_exit_host_frame(true, true, true, true));
+    }
+
+    #[test]
+    fn empty_flow_pauses_without_a_legacy_load() {
+        assert_eq!(empty_flow_action(false, false), EmptyFlowAction::Pause);
+        assert_eq!(empty_flow_action(false, true), EmptyFlowAction::Pause);
+    }
+
+    #[test]
+    fn empty_flow_keeps_running_scene_alive_after_legacy_load() {
+        assert_eq!(empty_flow_action(true, false), EmptyFlowAction::KeepAlive);
+    }
+
+    #[test]
+    fn empty_flow_returns_to_title_once_a_legacy_load_scene_stops() {
+        assert_eq!(
+            empty_flow_action(true, true),
+            EmptyFlowAction::ReturnToTitle
+        );
     }
 }
