@@ -398,6 +398,8 @@ pub struct AsfWmaDecoder<R: Read + Seek> {
     reader: R,
     asf: AsfFile,
     audio_stream_number: u8,
+    audio_format_tag: u16,
+    audio_block_align: u16,
     decoder: AudioCodecDecoder,
     assembler: FrameAssembler,
     last_pts_ms: u32,
@@ -435,6 +437,8 @@ impl<R: Read + Seek> AsfWmaDecoder<R> {
             reader,
             asf,
             audio_stream_number: audio_info.stream_number,
+            audio_format_tag: audio_info.format_tag,
+            audio_block_align: audio_info.block_align,
             decoder,
             assembler: FrameAssembler::default(),
             last_pts_ms: 0,
@@ -485,7 +489,24 @@ impl<R: Read + Seek> AsfWmaDecoder<R> {
                     continue;
                 };
                 self.last_pts_ms = pts_ms;
-                if let Some(frame) = self.decoder.decode_packet(&data, pts_ms)? {
+                let audio_format_tag = self.audio_format_tag;
+                let audio_block_align = self.audio_block_align;
+                let media_object_len = data.len();
+                let frame = self.decoder.decode_packet(&data, pts_ms).map_err(|err| {
+                    let context = format!(
+                        "WMA tag=0x{audio_format_tag:04x} block_align={audio_block_align} media_object_len={media_object_len} pts_ms={pts_ms}",
+                    );
+                    match err {
+                        DecoderError::InvalidData(message) => {
+                            DecoderError::InvalidData(format!("{context}: {message}"))
+                        }
+                        DecoderError::Unsupported(message) => {
+                            DecoderError::Unsupported(format!("{context}: {message}"))
+                        }
+                        other => other,
+                    }
+                })?;
+                if let Some(frame) = frame {
                     return Ok(Some(DecodedAudioFrame { pts_ms, frame }));
                 }
             }

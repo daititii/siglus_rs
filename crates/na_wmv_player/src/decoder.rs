@@ -383,15 +383,16 @@ fn vc1_filter_line(plane: &mut [u8], src: usize, stride: isize, pq: i32) -> bool
             let clip_sign = clip >> 31;
             clip = ((clip ^ clip_sign) - clip_sign) >> 1;
             if clip != 0 {
+                // FFmpeg vc1_filter_line(): d is based on (a0 - a3), and
+                // the correction is applied only when a0 and the edge delta
+                // have opposite signs.  The previous Rust port reversed the
+                // subtraction, converted d to an absolute value, and inverted
+                // the sign test.
                 let a3 = a1.min(a2);
-                let mut d = 5 * (a3 - a0);
-                let mut d_sign = d >> 31;
-                d = ((d ^ d_sign) - d_sign) >> 3;
-                d_sign ^= a0_sign;
-
-                if (d_sign ^ clip_sign) == 0 {
+                let mut d = (5 * (a0 - a3)) >> 3;
+                if (a0_sign ^ clip_sign) != 0 {
                     d = d.min(clip);
-                    d = (d ^ d_sign) - d_sign;
+                    d = (d ^ clip_sign) - clip_sign;
                     let l = (src as isize - stride) as usize;
                     let r = src;
                     plane[l] = (plane[l] as i32 - d).clamp(0, 255) as u8;
@@ -3789,10 +3790,11 @@ impl MacroblockDecoder {
         coeff[0] = dc * vc1_dc_scale(quant);
 
         if coded {
-            // ff_vc1_decode_init() transposes all four WMV1 8x8 scan tables
-            // when RES_FASTTX is set.  The transform and AC-prediction axes are
-            // transposed together; using the untransposed scan with the VC-1
-            // integer transform corrupts every non-DC coefficient.
+            // FFmpeg uses two different scan rules here:
+            // vc1_decode_i_block() (true I/BI pictures) selects zz_8x8[1],
+            // [2], or [3] according to AC prediction, while
+            // vc1_decode_intra_block() (intra MB inside P/B) uses zz_8x8[0]
+            // for progressive Simple/Main profile regardless of ACPRED.
             let scan: &[usize; 64] = if pure_i {
                 if use_pred {
                     if left {
@@ -4043,11 +4045,30 @@ impl MacroblockDecoder {
         let gx = (c * 2 + (n & 1)) as isize;
         let gy = (r * 2 + (n >> 1)) as isize;
 
-        // A = above, B = above-right/above-left according to block number,
-        // C = left. Keep the slots as well as the vectors because VC-1 hybrid
-        // prediction tests the exact A/C block's intra state.
-        let a_slot = self.vc1_luma_slot(gx, gy - 1);
-        let c_slot = self.vc1_luma_slot(gx - 1, gy);
+        // ff_vc1_pred_mv() addresses motion_val through FFmpeg's padded
+        // b8 grid, whose stride is 2 * mb_width + 1.  Do not apply its raw
+        // pointer offsets directly to our compact 2 * mb_width grid: the
+        // first-column 4MV block-0 special case deliberately crosses the
+        // padding cell into the previous b8 row.  Translate the FFmpeg
+        // address back into a compact luma slot instead.
+        let b8_stride = self.width_mb as isize * 2 + 1;
+        let ff_xy = b8_stride * gy + gx - 2;
+        let slot_from_ff_index = |ff_index: isize| -> Option<(usize, usize)> {
+            let shifted = ff_index + 2;
+            let yy = shifted.div_euclid(b8_stride);
+            let xx = shifted.rem_euclid(b8_stride);
+            if yy < 0 || xx >= self.width_mb as isize * 2 {
+                None
+            } else {
+                self.vc1_luma_slot(xx, yy)
+            }
+        };
+
+        // A = above, B = the FFmpeg `off` candidate, C = left.  Keep the
+        // slots as well as the vectors because VC-1 hybrid prediction tests
+        // the exact A/C block's intra state.
+        let a_slot = slot_from_ff_index(ff_xy - b8_stride);
+        let c_slot = slot_from_ff_index(ff_xy - 1);
         let boff: isize = if mv1 {
             if c + 1 >= self.width_mb as usize { -1 } else { 2 }
         } else {
@@ -4055,11 +4076,12 @@ impl MacroblockDecoder {
                 0 => {
                     if seq.res_rtm_flag {
                         if c > 0 { -1 } else { 1 }
+                    } else if c > 0 {
+                        -1
                     } else {
-                        // With our compact 2*mb_width luma grid this is the
-                        // progressive equivalent of FFmpeg's
-                        // 2*mb_width - b8_stride - 1.
-                        -2
+                        // Exact FFmpeg expression:
+                        //   2 * mb_width - b8_stride - 1
+                        2 * self.width_mb as isize - b8_stride - 1
                     }
                 }
                 1 => if c + 1 >= self.width_mb as usize { -1 } else { 1 },
@@ -4067,7 +4089,7 @@ impl MacroblockDecoder {
                 _ => -1,
             }
         };
-        let b_slot = self.vc1_luma_slot(gx + boff, gy - 1);
+        let b_slot = slot_from_ff_index(ff_xy - b8_stride + boff);
 
         let a = a_slot.map(|(mi, bi)| self.vc1_mv4[mi][bi]);
         let b = b_slot.map(|(mi, bi)| self.vc1_mv4[mi][bi]);
@@ -4542,15 +4564,21 @@ impl MacroblockDecoder {
 
         let pred=|hist:&[(i32,i32)]|->(i32,i32){
             let w=self.width_mb as usize;
-            let left=if c>0{Some(hist[idx-1])}else{None};
-            let top=if r>0{Some(hist[idx-w])}else{None};
-            let tr=if r>0{if c+1<w{Some(hist[idx-w+1])}else if c>0{Some(hist[idx-w-1])}else{None}}else{None};
-            match(top,tr,left){
-                (Some(a),Some(b),Some(cc))=>(median3(a.0,b.0,cc.0),median3(a.1,b.1,cc.1)),
-                (Some(a),_,_)=>a,
-                (_,_,Some(cc))=>cc,
-                (_,Some(b),_)=>b,
-                _=>(0,0),
+            if r>0 {
+                let a=hist[idx-w];
+                if w==1 {
+                    return a;
+                }
+                let b=if c+1<w { hist[idx-w+1] } else { hist[idx-w-1] };
+                // ff_vc1_pred_b_mv() sets C to a real zero vector on the
+                // first macroblock column; it does not mark C unavailable.
+                // That zero must therefore participate in median(A,B,C).
+                let cc=if c>0 { hist[idx-1] } else { (0,0) };
+                (median3(a.0,b.0,cc.0),median3(a.1,b.1,cc.1))
+            } else if c>0 {
+                hist[idx-1]
+            } else {
+                (0,0)
             }
         };
 
@@ -4864,6 +4892,23 @@ impl MacroblockDecoder {
                                 false,
                                 false,
                             )?;
+                            // FFmpeg vc1_decode_p_mb(), skipped 4MV path:
+                            // every luma 8x8 block is motion-compensated before
+                            // deriving the single chroma MV.  The previous Rust
+                            // port only predicted/stored the four MVs and ran
+                            // chroma MC, leaving Y as the freshly allocated
+                            // frame contents.
+                            self.vc1_mc_single(
+                                frame,
+                                r,
+                                c,
+                                &reference,
+                                *mv,
+                                pic,
+                                seq,
+                                Some(i),
+                                false,
+                            );
                         }
                         self.vc1_current_mvs[mbi] = mvs[0];
                         self.vc1_chroma_mvs[mbi] = self.vc1_mc_4mv_chroma(
@@ -4907,6 +4952,25 @@ impl MacroblockDecoder {
                             false,
                             md.intra,
                         )?;
+                        // ff_vc1_pred_mv() is immediately followed by
+                        // ff_vc1_mc_4mv_luma() for every non-intra luma block.
+                        // Chroma MC below is not a substitute for this: it only
+                        // fills Cb/Cr.  Missing this call leaves 4MV P-picture
+                        // luma blocks without their reference prediction, so
+                        // residuals alone appear as block-shaped ghosts/trails.
+                        if !md.intra {
+                            self.vc1_mc_single(
+                                frame,
+                                r,
+                                c,
+                                &reference,
+                                mvs[i],
+                                pic,
+                                seq,
+                                Some(i),
+                                false,
+                            );
+                        }
                     }
                     coded[4] = (cbp0 & 2) != 0;
                     coded[5] = (cbp0 & 1) != 0;
@@ -5118,7 +5182,11 @@ impl MacroblockDecoder {
                 if px >= self.width as usize { break; }
                 let i = py * self.width as usize + px;
                 let sum = fy[y * 16 + x] as u16 + frame.y[i] as u16;
-                frame.y[i] = ((sum + if self.vc1_rnd { 0 } else { 1 }) >> 1) as u8;
+                // FFmpeg's avg VC-1 MC operator is always
+                // (dst + clip(pred) + 1) >> 1.  `v->rnd` controls the
+                // interpolation filter that produced `pred`; it does not
+                // change the final forward/backward average.
+                frame.y[i] = ((sum + 1) >> 1) as u8;
             }
         }
         for y in 0..8 {
@@ -5130,9 +5198,8 @@ impl MacroblockDecoder {
                 let i = py * cw + px;
                 let us = fu[y * 8 + x] as u16 + frame.cb[i] as u16;
                 let vs = fv[y * 8 + x] as u16 + frame.cr[i] as u16;
-                let round = if self.vc1_rnd { 0 } else { 1 };
-                frame.cb[i] = ((us + round) >> 1) as u8;
-                frame.cr[i] = ((vs + round) >> 1) as u8;
+                frame.cb[i] = ((us + 1) >> 1) as u8;
+                frame.cr[i] = ((vs + 1) >> 1) as u8;
             }
         }
     }
