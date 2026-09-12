@@ -1898,12 +1898,13 @@ impl App {
                     Ok(true)
                 }
             }
-            SyscomPendingProcKind::OpenConfig => {
+            SyscomPendingProcKind::OpenConfig | SyscomPendingProcKind::OpenConfigDialog => {
                 let opened = {
                     let Some(vm) = self.vm.as_mut() else {
                         return Ok(false);
                     };
-                    vm.call_syscom_configured_scene("CONFIG_SCENE")?
+                    proc.kind == SyscomPendingProcKind::OpenConfig
+                        && vm.call_syscom_configured_scene("CONFIG_SCENE")?
                 };
                 if opened {
                     self.ensure_requested_script_proc();
@@ -3829,6 +3830,66 @@ fn run_headless_capture(args: Args) -> Result<()> {
 #[cfg(test)]
 mod desktop_coordinate_tests {
     use super::App;
+
+    #[test]
+    fn config_subdialogs_preserve_active_script_and_excall() {
+        use super::*;
+        use siglus_scene_vm::runtime::{Value, VmCallMeta};
+        use siglus_scene_vm::runtime::forms::codes::syscom_op::*;
+
+        // No scene assets are needed: attempting to load CONFIG_SCENE must fail,
+        // whereas opening a native subdialog must leave this caller intact.
+        let mut header = [0i32; 33];
+        for index in (1..33).step_by(2).chain(std::iter::once(0)) {
+            header[index] = 33 * 4;
+        }
+        let bytes: Vec<u8> = header.into_iter().flat_map(i32::to_le_bytes).collect();
+        let stream = SceneStream::new(Box::leak(bytes.into_boxed_slice())).unwrap();
+        let mut app = App::new(Args::parse_from(["siglus_engine"]));
+        let mut ctx = CommandContext::new(std::env::temp_dir().join("siglus-subdialog-test"));
+        ctx.tables.gameexe = Some(GameexeConfig::from_text(
+            "#CONFIG_SCENE=\"must_not_be_loaded\",0",
+        ));
+        ctx.excall_state.ready = true;
+        ctx.excall_state.ex_call_flag = true;
+        let form = ctx.ids.form_global_syscom;
+        app.vm = Some(SceneVm::new(stream, ctx));
+        let proc_depth = app.flow.stack.len();
+
+        for op in [
+            CALL_CONFIG_FONT_MENU, CALL_CONFIG_WINDOW_MODE_MENU,
+            CALL_CONFIG_VOLUME_MENU, CALL_CONFIG_BGMFADE_MENU,
+            CALL_CONFIG_KOEMODE_MENU, CALL_CONFIG_CHARAKOE_MENU,
+            CALL_CONFIG_JITAN_MENU, CALL_CONFIG_MESSAGE_SPEED_MENU,
+            CALL_CONFIG_FILTER_COLOR_MENU, CALL_CONFIG_AUTO_MODE_MENU,
+            CALL_CONFIG_SYSTEM_MENU, CALL_CONFIG_MOVIE_MENU,
+        ] {
+            let vm = app.vm.as_mut().unwrap();
+            vm.ctx.vm_call = Some(VmCallMeta {
+                element: vec![form as i32, op],
+                ..Default::default()
+            });
+            assert!(syscom::dispatch(&mut vm.ctx, form, &[] as &[Value]).unwrap());
+            assert!(app.consume_syscom_pending_proc().unwrap());
+            assert!(app.desktop_config_open);
+            assert!(app.desktop_config_request.take().is_some());
+            assert_eq!(app.flow.stack.len(), proc_depth);
+            assert!(app.syscom_suspended_waits.is_empty());
+            let vm = app.vm.as_mut().unwrap();
+            assert!(vm.ctx.excall_state.ready);
+            assert!(vm.ctx.excall_state.ex_call_flag);
+            assert!(!vm.take_script_proc_request());
+            app.desktop_config_open = false;
+        }
+
+        let vm = app.vm.as_mut().unwrap();
+        vm.ctx.vm_call.as_mut().unwrap().element[1] = CALL_CONFIG_MENU;
+        syscom::dispatch(&mut vm.ctx, form, &[]).unwrap();
+        assert_eq!(
+            vm.ctx.globals.syscom.pending_proc.as_ref().unwrap().kind,
+            SyscomPendingProcKind::OpenConfig,
+        );
+    }
 
     #[test]
     fn modal_owner_allows_presentation_but_blocks_game_input() {

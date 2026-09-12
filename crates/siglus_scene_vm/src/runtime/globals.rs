@@ -440,6 +440,8 @@ pub enum SyscomPendingProcKind {
     OpenSave,
     OpenLoad,
     OpenConfig,
+    /// A built-in settings dialog; never re-enter the game's CONFIG_SCENE.
+    OpenConfigDialog,
 }
 
 #[derive(Debug, Clone)]

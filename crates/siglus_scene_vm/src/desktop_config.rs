@@ -956,6 +956,11 @@ mod tests {
         requested.remember_tab_from(&previous);
         assert_eq!(requested.tab, Tab::Screen);
 
+        ctx.globals.syscom.last_menu_call = CALL_CONFIG_FONT_MENU;
+        let mut font = ConfigDialog::new(&ctx);
+        font.remember_tab_from(&previous);
+        assert_eq!(font.tab, Tab::Message);
+
         ctx.globals.syscom.last_menu_call = CALL_CONFIG_MENU;
         ctx.tables.gameexe = Some(GameexeConfig::from_text("#DIALOG_TAB_EXIST.VOLUME=0"));
         let mut hidden = ConfigDialog::new(&ctx);
