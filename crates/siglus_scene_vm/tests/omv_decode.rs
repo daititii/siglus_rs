@@ -85,3 +85,52 @@ fn embedded_ogg_starts_with_ogg_magic() -> Result<()> {
     assert!(fs::metadata(path)?.len() as usize > ogg.len());
     Ok(())
 }
+
+/// Supply the original file externally; do not redistribute game assets.
+#[test]
+#[ignore = "set SIGLUS_OMV_SEEK_TEST_FILE to Summer Pockets RB mov/__sys_day_filter02.omv"]
+fn indexed_seek_discards_back_page_packets_and_matches_sequential_decode() -> Result<()> {
+    use siglus_assets::omv::OmvFile;
+    use siglus_omv_decoder::TheoraVideoStream;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn fingerprint(frame: &[u8]) -> (usize, u64) {
+        let mut hash = DefaultHasher::new();
+        frame.hash(&mut hash);
+        (frame.len(), hash.finish())
+    }
+
+    let path = PathBuf::from(std::env::var("SIGLUS_OMV_SEEK_TEST_FILE")?);
+    let omv = OmvFile::open(&path)?;
+    let point = omv.seek_point_for_frame(40)?;
+    assert_eq!(point.key_frame_packet_no, 32);
+    assert!(point.seek_page_no < point.key_frame_page_no);
+    assert!(omv.pages[point.seek_page_no..point.key_frame_page_no]
+        .iter().any(|page| page.packet_count > 0));
+
+    let mut sequential = TheoraVideoStream::open(omv.open_embedded_ogg_reader(&path)?)?;
+    let mut expected = Vec::new();
+    for _ in 0..66 {
+        let frame = sequential.read_video_frame()?.context("sequential frame")?;
+        expected.push(fingerprint(&frame));
+    }
+
+    // Start with the reported seek, then cover both sides of key frames,
+    // backwards seeks, repeated seeks and sequential playback after each seek.
+    let mut indexed = TheoraVideoStream::open(omv.open_embedded_ogg_reader(&path)?)?;
+    for target in [40, 0, 15, 16, 31, 32, 47, 48, 63, 64, 40, 32, 0] {
+        let point = omv.seek_point_for_frame(target)?;
+        let frame = indexed.seek_to_indexed_frame(
+            point.file_offset,
+            point.key_page_file_offset,
+            point.first_packet_no,
+            point.key_frame_packet_no,
+            point.target_packet_no,
+        )?.context("indexed frame")?;
+        assert_eq!(fingerprint(&frame), expected[target], "seek frame {target}");
+        let next = indexed.read_video_frame()?.context("frame after seek")?;
+        assert_eq!(fingerprint(&next), expected[target + 1], "after seek {target}");
+    }
+    Ok(())
+}
