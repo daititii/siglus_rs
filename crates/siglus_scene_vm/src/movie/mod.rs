@@ -2308,6 +2308,7 @@ fn stream_omv_video_worker(
                 .and_then(|point| {
                     video_tf.seek_to_indexed_frame(
                         point.file_offset,
+                        point.key_page_file_offset,
                         point.first_packet_no,
                         point.key_frame_packet_no,
                         point.target_packet_no,

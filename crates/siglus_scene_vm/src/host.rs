@@ -805,8 +805,10 @@ impl SiglusHost {
                     Ok(true)
                 }
             }
-            SyscomPendingProcKind::OpenConfig => {
-                if self.vm.call_syscom_configured_scene("CONFIG_SCENE")? {
+            SyscomPendingProcKind::OpenConfig | SyscomPendingProcKind::OpenConfigDialog => {
+                if proc.kind == SyscomPendingProcKind::OpenConfig
+                    && self.vm.call_syscom_configured_scene("CONFIG_SCENE")?
+                {
                     self.ensure_requested_script_proc();
                     self.suspend_wait_for_syscom_excall("CONFIG_SCENE");
                     Ok(true)

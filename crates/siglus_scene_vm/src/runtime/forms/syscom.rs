@@ -3062,7 +3062,9 @@ pub fn open_fallback_dialog(ctx: &mut CommandContext, kind: SyscomPendingProcKin
         SyscomPendingProcKind::OpenLoad => {
             open_save_load_fallback(ctx, false, 0, None);
         }
-        SyscomPendingProcKind::OpenConfig => open_config_root_fallback(ctx, None),
+        SyscomPendingProcKind::OpenConfig | SyscomPendingProcKind::OpenConfigDialog => {
+            open_config_root_fallback(ctx, None)
+        }
         _ => {
             log::error!("unsupported Syscom fallback request: {kind:?}");
         }
@@ -5278,8 +5280,11 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             ctx.push(Value::Int(if ok { 1 } else { 0 }));
             return Ok(true);
         }
-        CALL_CONFIG_MENU
-        | CALL_CONFIG_WINDOW_MODE_MENU
+        CALL_CONFIG_MENU => {
+            set_syscom_pending_proc(ctx, SyscomPendingProcKind::OpenConfig);
+            ctx.globals.syscom.last_menu_call = op;
+        }
+        CALL_CONFIG_WINDOW_MODE_MENU
         | CALL_CONFIG_VOLUME_MENU
         | CALL_CONFIG_BGMFADE_MENU
         | CALL_CONFIG_KOEMODE_MENU
@@ -5291,7 +5296,10 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
         | CALL_CONFIG_FONT_MENU
         | CALL_CONFIG_SYSTEM_MENU
         | CALL_CONFIG_MOVIE_MENU => {
-            set_syscom_pending_proc(ctx, SyscomPendingProcKind::OpenConfig);
+            // C++ cmd_syscom opens cfg_wnd_solo_* directly for these calls.
+            // Re-entering CONFIG_SCENE would share the active EXCALL storage;
+            // returning from the inner menu frees the outer menu's objects.
+            set_syscom_pending_proc(ctx, SyscomPendingProcKind::OpenConfigDialog);
             ctx.globals.syscom.last_menu_call = op;
         }
         SET_WINDOW_MODE => cfg_set_int(&mut ctx.globals.syscom, GET_WINDOW_MODE, p_i64(params, 0)),

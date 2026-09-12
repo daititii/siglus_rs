@@ -71,6 +71,9 @@ pub struct OmvSeekPoint {
     /// Absolute file offset of the first Ogg page that must be fed to rebuild
     /// the packet containing the selected key frame.
     pub file_offset: u64,
+    /// Absolute start of the page whose completed packets are numbered from
+    /// `first_packet_no`. Packets completed on earlier back-pages are discarded.
+    pub key_page_file_offset: u64,
     pub seek_page_no: usize,
     /// Data-packet number tona3 assigns after the back-pages have been fed
     /// and drained, i.e. `top_packet_no` of the key-frame page.  The seek page
@@ -289,9 +292,19 @@ impl OmvFile {
             .seek_top
             .checked_add(seek_offset)
             .ok_or_else(|| anyhow!("OMV seek offset overflow for page {seek_page_no}"))?;
+        let key_page_offset = u64::try_from(key_page.seek_offset)
+            .map_err(|_| anyhow!("OMV seek offset is negative for page {key_frame_page_no}"))?;
+        let key_page_file_offset = self
+            .seek_top
+            .checked_add(key_page_offset)
+            .ok_or_else(|| anyhow!("OMV key-page seek offset overflow"))?;
+        if key_page_file_offset < file_offset {
+            bail!("OMV key-frame page precedes its seek page in the file");
+        }
 
         Ok(OmvSeekPoint {
             file_offset,
+            key_page_file_offset,
             seek_page_no,
             first_packet_no,
             key_frame_page_no,
@@ -545,5 +558,6 @@ mod seek_index_tests {
         assert_eq!(point.key_frame_packet_no, 4);
         assert_eq!(point.target_packet_no, 5);
         assert_eq!(point.file_offset, 1_100);
+        assert_eq!(point.key_page_file_offset, 1_200);
     }
 }

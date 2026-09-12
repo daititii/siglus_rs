@@ -62,6 +62,8 @@ pub struct MwndWakuRuntime {
     pub filter_file: Option<String>,
     pub bg_size: Option<(u32, u32)>,
     pub filter_size: Option<(u32, u32)>,
+    pub bg_center: (i32, i32),
+    pub filter_center: (i32, i32),
     pub filter_margin: (i64, i64, i64, i64),
     pub filter_color: (u8, u8, u8, u8),
     pub filter_config_color: bool,
@@ -317,6 +319,7 @@ pub enum MsgBackHitAction {
     Up,
     Down,
     Slider,
+    ReplayKoe(usize),
 }
 
 #[derive(Debug, Default)]
@@ -1536,11 +1539,19 @@ impl UiRuntime {
             .layer_mut(ui_layer)
             .and_then(|l| l.sprite_mut(bg_sprite))
         {
-            s.size_mode = SpriteSizeMode::Explicit {
-                width: rect.w,
-                height: rect.h,
+            // C_elm_mwnd_waku::frame fits both textured layers to their
+            // own texture. WINDOW_SIZE is not a request to stretch the G00
+            // cut, which can be cropped and carry a nonzero origin.
+            s.size_mode = if self.mwnd.waku.bg_image.is_some() {
+                SpriteSizeMode::Intrinsic
+            } else {
+                SpriteSizeMode::Explicit {
+                    width: rect.w,
+                    height: rect.h,
+                }
             };
-            apply_anim(s, rect.x, rect.y, 1_000_000);
+            let (cx, cy) = self.mwnd.waku.bg_center;
+            apply_anim(s, rect.x - cx, rect.y - cy, 1_000_000);
         }
 
         if let Some(s) = layers
@@ -1548,8 +1559,9 @@ impl UiRuntime {
             .and_then(|l| l.sprite_mut(filter_sprite))
         {
             let (ml, mt, mr, mb) = self.mwnd.waku.filter_margin;
-            let fx = rect.x + ml as i32;
-            let fy = rect.y + mt as i32;
+            let (cx, cy) = self.mwnd.waku.filter_center;
+            let fx = rect.x + ml as i32 - cx;
+            let fy = rect.y + mt as i32 - cy;
             if self.mwnd.waku.filter_image.is_some() {
                 s.size_mode = SpriteSizeMode::Intrinsic;
             } else {
@@ -2973,6 +2985,22 @@ impl UiRuntime {
             let (r, g, b, _a) = self.mwnd.waku.filter_color;
             self.mwnd.waku.solid_filter_image = Some(images.solid_rgba((r, g, b, 255)));
         }
+        self.mwnd.waku.bg_center = self
+            .mwnd
+            .waku
+            .bg_image
+            .as_ref()
+            .and_then(|id| images.get(id))
+            .map(|img| (img.center_x, img.center_y))
+            .unwrap_or_default();
+        self.mwnd.waku.filter_center = self
+            .mwnd
+            .waku
+            .filter_image
+            .as_ref()
+            .and_then(|id| images.get(id))
+            .map(|img| (img.center_x, img.center_y))
+            .unwrap_or_default();
     }
 
     fn refresh_face_image(
@@ -3595,6 +3623,24 @@ impl UiRuntime {
             MsgBackHitAction::Down,
         ) {
             return Some(action);
+        }
+        // Entry buttons scroll with the text and use the same clipping rectangle
+        // as their sprites. Cached buttons outside the current projection must
+        // not remain clickable after scrolling.
+        let (dl, dt, dr, db) = projection.disp_margin;
+        if x >= projection.window_x + dl as i32
+            && x < projection.window_x + projection.window_w as i32 - dr as i32
+            && y >= projection.window_y + dt as i32
+            && y < projection.window_y + projection.window_h as i32 - db as i32
+        {
+            for (entry, button) in projection.koe_buttons.iter().zip(&self.msg_back.koe_buttons) {
+                if let Some(action) = Self::msg_back_button_hit(
+                    projection, button, (entry.x, entry.y), x, y,
+                    MsgBackHitAction::ReplayKoe(entry.history_index),
+                ) {
+                    return Some(action);
+                }
+            }
         }
         None
     }
@@ -4288,6 +4334,70 @@ fn message_speed_ms(script: &ScriptRuntimeState, syscom: &SyscomRuntimeState) ->
 #[cfg(test)]
 mod projection_dirty_tests {
     use super::*;
+
+    #[test]
+    fn cropped_waku_and_filter_share_intrinsic_geometry_and_animation_origin() {
+        let mut ui = UiRuntime::default();
+        let mut images = crate::image_manager::ImageManager::new(PathBuf::from("."));
+        let mut layers = crate::layer::LayerManager::new();
+        ui.apply_mwnd_projection(&MwndProjectionState {
+            window_pos: Some((0, 640)),
+            window_size: Some((1280, 320)),
+            ..Default::default()
+        });
+        ui.show_message_bg(true);
+        let image = images.insert_image(crate::assets::RgbaImage {
+            width: 1240,
+            height: 240,
+            center_x: -40,
+            center_y: -80,
+            rgba: vec![255; 1240 * 240 * 4],
+        });
+        ui.set_message_bg(image.clone());
+        ui.set_message_filter(Some(image));
+        ui.refresh_waku_images(&mut images, Path::new("."));
+
+        // Repeated layouts, including a surface resize, must not accumulate
+        // the G00 cut offset or stretch the cut to WINDOW_SIZE.
+        for (w, h) in [(1280, 960), (1920, 1080), (1280, 960)] {
+            ui.sync_layout(&mut layers, w, h);
+            let layer = layers.layer(ui.mwnd.layer.unwrap()).unwrap();
+            for id in [ui.mwnd.waku.bg_sprite, ui.mwnd.waku.filter_sprite] {
+                let sprite = layer.sprite(id.unwrap()).unwrap();
+                assert!(matches!(sprite.size_mode, SpriteSizeMode::Intrinsic));
+                assert_eq!((sprite.x, sprite.y), (40, 720));
+                assert_eq!((sprite.pivot_x, sprite.pivot_y), (600.0, 80.0));
+                let mut scaled = sprite.clone();
+                scaled.scale_x = 0.5;
+                scaled.scale_y = 0.5;
+                let quad = crate::render_math::sprite_quad_points(
+                    &scaled, 40.0, 720.0, 1240.0, 240.0, w as f32, h as f32,
+                )
+                .unwrap();
+                assert_eq!((quad[0].x, quad[0].y), (340.0, 760.0));
+                assert_eq!((quad[2].x, quad[2].y), (960.0, 880.0));
+            }
+        }
+
+        // A solid filter uses the window margins and no previous cut offset.
+        ui.set_message_filter(None);
+        ui.mwnd.waku.filter_margin = (4, 5, 6, 7);
+        ui.refresh_waku_images(&mut images, Path::new("."));
+        ui.sync_layout(&mut layers, 1280, 960);
+        let filter = layers
+            .layer(ui.mwnd.layer.unwrap())
+            .unwrap()
+            .sprite(ui.mwnd.waku.filter_sprite.unwrap())
+            .unwrap();
+        assert_eq!((filter.x, filter.y), (4, 645));
+        assert!(matches!(
+            filter.size_mode,
+            SpriteSizeMode::Explicit {
+                width: 1270,
+                height: 308,
+            }
+        ));
+    }
 
     #[test]
     fn identical_mwnd_projection_does_not_rasterize_text_again() {
