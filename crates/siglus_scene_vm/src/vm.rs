@@ -80,6 +80,14 @@ thread_local! {
     // Per-call/per-return tracing needs its own opt-in: in a map frame loop it emits
     // hundreds of thousands of lines and produced a 350 MB log in a single run.
     static SG_RET_TRACE_ON: bool = std::env::var_os("SG_VM_RET_TRACE").is_some();
+    /// Diagnostic A/B knob: skip the Rewrite+ synthesized caller-chain restore so the
+    /// no-caller fallback path can be observed directly.
+    static SG_NO_LEGACY_CHAIN: bool = std::env::var_os("SG_NO_LEGACY_CHAIN").is_some();
+}
+
+#[inline]
+fn sg_no_legacy_chain() -> bool {
+    SG_NO_LEGACY_CHAIN.with(|v| *v)
 }
 
 #[inline]
@@ -12034,6 +12042,9 @@ impl<'a> SceneVm<'a> {
     }
 
     fn restore_legacy_rewrite_plus_map_call_chain(&mut self) -> Result<bool> {
+        if sg_no_legacy_chain() {
+            return Ok(false);
+        }
         if !self.legacy_saved_active_only
             || !self
                 .current_scene_name
