@@ -7515,6 +7515,10 @@ impl CommandContext {
     }
 
     fn sync_global_movie(&mut self) {
+        /// Polls to wait for a first video frame before treating a clock-less movie as
+        /// unplayable. Generous on purpose: a working decoder presents its first frame long
+        /// before this, so a healthy movie is never cut short.
+        const MOVIE_NO_FRAME_WATCHDOG_POLLS: u32 = 600;
         let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
         let file_name = self.globals.mov.file_name.clone();
 
@@ -7595,6 +7599,29 @@ impl CommandContext {
                 // counters, frame actions, and object events while the decoder warms up.
                 if last_frame_idx.is_none() {
                     self.globals.mov.timer_ms = 0;
+                }
+                // A movie that can neither decode a frame nor run an audio clock has no
+                // media clock at all: `total_ms` is only reported once a frame has been
+                // selected, so the completion check below can never fire and the script
+                // waits forever. That is exactly the Rewrite+ OP/ED: they are WMV and the
+                // WMV3 video decoder is still WIP, while a failed WMA stream detaches the
+                // audio clock by design. Give the decoder a generous warm-up window, then
+                // finish the movie so the script continues instead of hanging on a blank
+                // movie layer.
+                self.globals.mov.polls_without_frame =
+                    self.globals.mov.polls_without_frame.saturating_add(1);
+                if last_frame_idx.is_none()
+                    && self.globals.mov.audio_id.is_none()
+                    && self.globals.mov.audio_start_attempted
+                    && self.globals.mov.polls_without_frame >= MOVIE_NO_FRAME_WATCHDOG_POLLS
+                {
+                    log::warn!(
+                        "[SG_MOV] no decodable video frame and no audio clock after {} polls; \
+                         finishing movie file={} instead of blocking the script",
+                        self.globals.mov.polls_without_frame,
+                        file_name
+                    );
+                    self.globals.mov.playing = false;
                 }
                 return;
             }
