@@ -1903,6 +1903,37 @@ impl Renderer {
         Self::new_from_instance_surface(instance, surface, width, height, scale_factor).await
     }
 
+    /// Re-attach a new platform surface to the existing device/queue.
+    ///
+    /// Android destroys the `ANativeWindow` whenever the activity stops, so a
+    /// background/foreground round trip hands us a new window while the engine
+    /// state (VM, decoded resources) has to survive. The surface format is
+    /// fixed by the platform, so the current configuration is reused and only
+    /// the size changes; callers re-apply their logical viewport afterwards,
+    /// exactly as they do after `resize`.
+    pub unsafe fn replace_surface_from_raw_handles(
+        &mut self,
+        raw_display_handle: raw_window_handle::RawDisplayHandle,
+        raw_window_handle: raw_window_handle::RawWindowHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let surface = instance
+            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle,
+                raw_window_handle,
+            })
+            .context("create_surface_unsafe (replace)")?;
+        self.surface = surface;
+        let scale_factor = self.scale_factor;
+        self.resize_with_scale(width.max(1), height.max(1), scale_factor);
+        Ok(())
+    }
+
     async fn new_from_instance_surface(
         instance: wgpu::Instance,
         surface: wgpu::Surface<'static>,
@@ -2445,10 +2476,23 @@ impl Renderer {
     }
 
     pub fn render_frame(&mut self, images: &ImageManager, frame_plan: &RenderFrame) -> Result<()> {
-        let frame = self
-            .surface
-            .get_current_texture()
-            .context("get_current_texture")?;
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                // Android hands the app a new ANativeWindow whenever the activity
+                // stops, and a reconfigured surface can report Lost/Outdated for a
+                // frame. Recover in place: failing here would surface as an error
+                // from `SiglusHost::step`, which the Android frame loop treats as
+                // "exit" and would freeze the picture.
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                anyhow::bail!("surface out of memory");
+            }
+            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(err) => return Err(err).context("get_current_texture"),
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());

@@ -64,6 +64,12 @@ public final class SiglusGameActivity extends AppCompatActivity
 
     private long handle = 0;
     private boolean running = false;
+    /**
+     * True while {@link #surfaceView} has a usable {@link Surface}. Android destroys the
+     * ANativeWindow whenever the activity stops, so the engine outlives the surface: the frame
+     * loop must not run (and must not render into a dead window) until the surface is re-attached.
+     */
+    private volatile boolean surfaceReady = false;
     private long lastFrameNs = 0;
 
     /** 0x1B is what the host maps to VmKey::Escape, the engine's own cancel/back key. */
@@ -164,7 +170,16 @@ public final class SiglusGameActivity extends AppCompatActivity
 
     @Override
     public void surfaceCreated(@NonNull SurfaceHolder holder) {
-        ensureEngine(holder);
+        if (handle != 0) {
+            // Coming back from the background: Android hands us a new ANativeWindow. Keep the
+            // running engine (the player's progress lives in it) and re-attach the window.
+            int w = holder.getSurfaceFrame() != null ? holder.getSurfaceFrame().width() : surfaceView.getWidth();
+            int h = holder.getSurfaceFrame() != null ? holder.getSurfaceFrame().height() : surfaceView.getHeight();
+            NativeSiglus.setSurface(handle, holder.getSurface(), Math.max(1, w), Math.max(1, h));
+        } else {
+            ensureEngine(holder);
+        }
+        surfaceReady = true;
         maybeStartFrameLoop();
     }
 
@@ -172,6 +187,7 @@ public final class SiglusGameActivity extends AppCompatActivity
     public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
         if (handle == 0) {
             ensureEngine(holder);
+            surfaceReady = true;
         } else {
             // SurfaceChanged fires frequently (format/size). Avoid recreating the WGPU surface here;
             // just resize the existing swapchain. Surface recreation is handled by surfaceCreated/Destroyed.
@@ -181,10 +197,11 @@ public final class SiglusGameActivity extends AppCompatActivity
 
     @Override
     public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
-        // The ANativeWindow behind this Surface is about to become invalid.
+        // The ANativeWindow behind this Surface is about to become invalid, but the engine must
+        // survive: backgrounding the app must not restart the game. Only onDestroy() tears the
+        // engine down, so a background/foreground round trip keeps the current scene.
+        surfaceReady = false;
         stopFrameLoop();
-        destroyEngine();
-        finish();
     }
 
     private void ensureEngine(@NonNull SurfaceHolder holder) {
@@ -217,6 +234,7 @@ public final class SiglusGameActivity extends AppCompatActivity
             return;
         }
         handle = hnd;
+        surfaceReady = true;
         sActivitiesByHandle.put(handle, new WeakReference<>(this));
         NativeSiglus.setNativeMessageboxCallback(handle);
     }
@@ -232,7 +250,7 @@ public final class SiglusGameActivity extends AppCompatActivity
     // ---- Frame loop ----
 
     private void maybeStartFrameLoop() {
-        if (!running && handle != 0) {
+        if (!running && handle != 0 && surfaceReady) {
             running = true;
             lastFrameNs = 0;
             Choreographer.getInstance().postFrameCallback(this);

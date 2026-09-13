@@ -233,12 +233,53 @@ pub unsafe extern "C" fn siglus_android_set_surface(
     surface_width_px: u32,
     surface_height_px: u32,
 ) {
-    // WGPU surface replacement is not exposed by the current renderer.  The safe
-    // host contract is to destroy and recreate when Android gives us a different
-    // ANativeWindow.  Keep this function as a no-op ABI hook so old Java-side
-    // lifecycle code can call it without corrupting renderer state.
-    let _ = (handle, native_window_ptr, surface_width_px, surface_height_px);
-    log::warn!("siglus_android_set_surface: recreate engine instance for a new ANativeWindow");
+    if handle.is_null() {
+        return;
+    }
+    let host = &mut *(handle as *mut SiglusHost);
+    let Some(native_window) = NonNull::new(native_window_ptr) else {
+        log::error!("siglus_android_set_surface: native_window_ptr is null");
+        return;
+    };
+    // Android destroys the ANativeWindow whenever the activity stops, so coming
+    // back from the background means a new window while the running engine (and
+    // therefore the player's progress) has to survive. Attach the new window to
+    // the existing device instead of rebuilding the host.
+    let raw_display_handle = RawDisplayHandle::Android(AndroidDisplayHandle::new());
+    let raw_window_handle = RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(native_window));
+    if let Err(e) = host.renderer_mut().replace_surface_from_raw_handles(
+        raw_display_handle,
+        raw_window_handle,
+        surface_width_px.max(1),
+        surface_height_px.max(1),
+    ) {
+        log::error!("siglus_android_set_surface: {e:?}");
+        return;
+    }
+    let sf = host.renderer_mut().scale_factor();
+    let (logical_w, logical_h) = host.logical_size();
+    let (vx, vy, vw, vh) =
+        aspect_fit_viewport(surface_width_px, surface_height_px, logical_w, logical_h);
+    host.resize_with_logical_viewport(
+        surface_width_px.max(1),
+        surface_height_px.max(1),
+        sf,
+        logical_w,
+        logical_h,
+        vx,
+        vy,
+        vw,
+        vh,
+    );
+    log::warn!(
+        "siglus_android_set_surface: re-attached surface={}x{} viewport={}x{}+{}+{} without rebuilding the engine",
+        surface_width_px,
+        surface_height_px,
+        vw,
+        vh,
+        vx,
+        vy
+    );
 }
 
 #[no_mangle]
