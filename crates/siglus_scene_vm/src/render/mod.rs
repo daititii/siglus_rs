@@ -648,6 +648,15 @@ pub struct SkinnedPoseState {
 #[derive(Debug)]
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
+    /// Kept so that a replacement surface is created from the same instance (and
+    /// therefore the same backend) as `device`. Android re-creates the
+    /// ANativeWindow on every activity stop, and a surface built from a fresh
+    /// instance may land on a different backend (GLES instead of Vulkan), which
+    /// makes `Surface::configure` fail validation against the existing device.
+    pub instance: wgpu::Instance,
+    /// The adapter `device` came from, kept so a replacement surface can be
+    /// checked against the configuration before it is applied.
+    pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -1918,16 +1927,24 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-        let surface = instance
+        let surface = self
+            .instance
             .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle,
                 raw_window_handle,
             })
             .context("create_surface_unsafe (replace)")?;
+        // `Surface::configure` aborts the process on a validation error, so check
+        // the new surface really is usable with this device first. A surface built
+        // from a different instance (different VkInstance) is not.
+        let caps = surface.get_capabilities(&self.adapter);
+        if !caps.formats.contains(&self.config.format) {
+            anyhow::bail!(
+                "replacement surface does not support {:?} (adapter formats: {:?})",
+                self.config.format,
+                caps.formats
+            );
+        }
         self.surface = surface;
         let scale_factor = self.scale_factor;
         self.resize_with_scale(width.max(1), height.max(1), scale_factor);
@@ -2316,6 +2333,8 @@ impl Renderer {
         let surface_viewport = SurfaceViewport::full(config.width, config.height);
         let emote_compositor = emote::EmoteCompositor::new(&device);
         Ok(Self {
+            instance,
+            adapter,
             surface,
             device,
             queue,
