@@ -2537,7 +2537,6 @@ impl Renderer {
                 anyhow::bail!("surface out of memory");
             }
             Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(err) => return Err(err).context("get_current_texture"),
         };
         let view = frame
             .texture
