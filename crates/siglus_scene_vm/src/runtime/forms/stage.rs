@@ -2017,7 +2017,7 @@ fn copy_root_object_for_stage_wipe(
     copy.nested_runtime_slot = None;
     assign_copy_runtime_slots(st, dst_stage, &mut copy, None);
     let backend_slot = copy.runtime_slot_or(dst_idx);
-    duplicate_object_tree_backends_for_copy(ctx, st, dst_stage, &mut copy, backend_slot);
+    duplicate_object_tree_backends_for_copy(ctx, st, false, dst_stage, &mut copy, backend_slot);
     let list = st.object_lists.get_mut(&dst_stage).unwrap();
     list[dst_idx] = copy;
 }
@@ -2066,7 +2066,7 @@ fn clone_embedded_objects_for_stage_wipe(
         copy.nested_runtime_slot = None;
         let slot = nested_object_slot(st, dst_stage, &mut copy);
         assign_copy_runtime_slots(st, dst_stage, &mut copy, Some(slot));
-        duplicate_object_tree_backends_for_copy(ctx, st, dst_stage, &mut copy, slot);
+        duplicate_object_tree_backends_for_copy(ctx, st, true, dst_stage, &mut copy, slot);
         out.push(copy);
     }
     out
@@ -3193,7 +3193,7 @@ fn create_mwnd_face_object(
         clear_failed_gfx_backing(ctx, stage_idx, slot, "MWND face PCT load failure");
     }
     if create_ok {
-        hide_embedded_gfx_backing(ctx, stage_idx, slot);
+        hide_embedded_gfx_backing(ctx, true, stage_idx, slot);
     }
 
     obj.used = true;
@@ -3287,7 +3287,7 @@ fn create_mwnd_template_button_object(
         clear_failed_gfx_backing(ctx, stage_idx, slot, "MWND button PCT load failure");
     }
     if create_ok {
-        hide_embedded_gfx_backing(ctx, stage_idx, slot);
+        hide_embedded_gfx_backing(ctx, true, stage_idx, slot);
     }
 
     obj.used = true;
@@ -3439,7 +3439,15 @@ fn ensure_btnselitem(
     }
 }
 
-fn hide_embedded_gfx_backing(ctx: &mut CommandContext, stage_idx: i64, runtime_slot: usize) {
+fn hide_embedded_gfx_backing(
+    ctx: &mut CommandContext,
+    embedded_tree: bool,
+    stage_idx: i64,
+    runtime_slot: usize,
+) {
+    if !embedded_tree {
+        return;
+    }
     let (gfx, images, layers) = (&mut ctx.gfx, &mut ctx.images, &mut ctx.layers);
     let _ = gfx.object_set_disp(images, layers, stage_idx, runtime_slot as i64, 0);
 }
@@ -3697,6 +3705,7 @@ fn dispatch_embedded_object_child_item_op(
             group_lists,
             rect_layers,
             next_nested_object_slot,
+            embedded_tree: true,
         };
         dispatch_object_state_op(
             ctx,
@@ -3882,6 +3891,7 @@ fn dispatch_embedded_object_item_op(
             group_lists,
             rect_layers,
             next_nested_object_slot,
+            embedded_tree: true,
         };
         dispatch_object_state_op(
             ctx,
@@ -4444,7 +4454,7 @@ fn rebuild_object_after_change_file(
                 Ok(()) => {
                     obj.backend = ObjectBackend::Gfx;
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, runtime_slot);
+                        hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, runtime_slot);
                     }
                     mark_cgtable_look_from_object_create(
                         &mut ctx.tables,
@@ -4601,7 +4611,7 @@ fn rebuild_object_after_change_file(
                         &file,
                     );
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, runtime_slot);
+                        hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, runtime_slot);
                     }
                     sync_special_gfx_sprite_for_object(ctx, stage_idx, runtime_slot, obj);
                     obj.backend = ObjectBackend::Gfx;
@@ -5881,6 +5891,7 @@ fn assign_copy_runtime_slots(
 fn duplicate_object_tree_backends_for_copy_with_layers(
     ctx: &mut CommandContext,
     rect_layers: &mut HashMap<i64, LayerId>,
+    embedded_tree: bool,
     stage_idx: i64,
     obj: &mut ObjectState,
     obj_slot: usize,
@@ -5912,7 +5923,7 @@ fn duplicate_object_tree_backends_for_copy_with_layers(
                 match create_result {
                     Ok(()) => {
                         if obj.nested_runtime_slot.is_some() {
-                            hide_embedded_gfx_backing(ctx, stage_idx, obj_slot);
+                            hide_embedded_gfx_backing(ctx, embedded_tree, stage_idx, obj_slot);
                         }
                         sync_special_gfx_sprite_for_object(ctx, stage_idx, obj_slot, obj);
                         ObjectBackend::Gfx
@@ -5954,7 +5965,14 @@ fn duplicate_object_tree_backends_for_copy_with_layers(
 
     for child in &mut obj.runtime.child_objects {
         if let Some(slot) = child.nested_runtime_slot {
-            duplicate_object_tree_backends_for_copy_with_layers(ctx, rect_layers, stage_idx, child, slot);
+            duplicate_object_tree_backends_for_copy_with_layers(
+                ctx,
+                rect_layers,
+                embedded_tree,
+                stage_idx,
+                child,
+                slot,
+            );
         }
     }
 }
@@ -5962,6 +5980,7 @@ fn duplicate_object_tree_backends_for_copy_with_layers(
 fn duplicate_object_tree_backends_for_copy(
     ctx: &mut CommandContext,
     st: &mut StageFormState,
+    embedded_tree: bool,
     stage_idx: i64,
     obj: &mut ObjectState,
     obj_slot: usize,
@@ -5969,6 +5988,7 @@ fn duplicate_object_tree_backends_for_copy(
     duplicate_object_tree_backends_for_copy_with_layers(
         ctx,
         &mut st.rect_layers,
+        embedded_tree,
         stage_idx,
         obj,
         obj_slot,
@@ -6306,6 +6326,7 @@ fn update_string_backend(
 fn restore_object_backend_after_load(
     ctx: &mut CommandContext,
     st: &mut StageFormState,
+    embedded_tree: bool,
     stage_idx: i64,
     obj_slot: usize,
     obj: &mut ObjectState,
@@ -6398,7 +6419,7 @@ fn restore_object_backend_after_load(
                 } else {
                     obj.backend = ObjectBackend::Gfx;
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, obj_slot);
+                        hide_embedded_gfx_backing(ctx, embedded_tree, stage_idx, obj_slot);
                     }
                 }
             }
@@ -6488,7 +6509,7 @@ fn restore_object_backend_after_load(
                         );
                     } else {
                         if obj.nested_runtime_slot.is_some() {
-                            hide_embedded_gfx_backing(ctx, stage_idx, obj_slot);
+                            hide_embedded_gfx_backing(ctx, embedded_tree, stage_idx, obj_slot);
                         }
                         sync_special_gfx_sprite_for_object(ctx, stage_idx, obj_slot, obj);
                         obj.backend = ObjectBackend::Gfx;
@@ -6635,7 +6656,7 @@ fn restore_object_backend_after_load(
         let child_slot = child
             .nested_runtime_slot
             .unwrap_or_else(|| obj_slot.saturating_add(child_index + 1));
-        restore_object_backend_after_load(ctx, st, stage_idx, child_slot, child);
+        restore_object_backend_after_load(ctx, st, embedded_tree, stage_idx, child_slot, child);
     }
 }
 
@@ -6681,7 +6702,7 @@ pub(crate) fn restore_stage_form_backends_after_load(
         if let Some(mut objects) = st.object_lists.remove(&stage_idx) {
             for (index, obj) in objects.iter_mut().enumerate() {
                 assign_children(obj, &mut next_nested);
-                restore_object_backend_after_load(ctx, st, stage_idx, index, obj);
+                restore_object_backend_after_load(ctx, st, false, stage_idx, index, obj);
             }
             st.object_lists.insert(stage_idx, objects);
         }
@@ -6714,7 +6735,7 @@ pub(crate) fn restore_stage_form_backends_after_load(
                     obj.nested_runtime_slot = Some(slot);
                 }
                 assign_children(obj, next_nested);
-                restore_object_backend_after_load(ctx, st, stage_idx, slot, obj);
+                restore_object_backend_after_load(ctx, st, true, stage_idx, slot, obj);
             }
         }
 
@@ -6818,6 +6839,10 @@ struct ObjectDispatchStage<'a> {
     group_lists: &'a mut HashMap<i64, Vec<GroupState>>,
     rect_layers: &'a mut HashMap<i64, LayerId>,
     next_nested_object_slot: &'a mut HashMap<i64, usize>,
+    /// True when this dispatch belongs to an MWND/BTNSELITEM-owned object tree.
+    /// Ordinary OBJECT.CHILD descendants are not embedded and must retain their
+    /// standalone Gfx backing; embedded descendants inherit this flag.
+    embedded_tree: bool,
 }
 
 impl ObjectDispatchStage<'_> {
@@ -7069,6 +7094,7 @@ fn dispatch_object_op(
         .map(|obj| obj.runtime_slot_or(obj_u))
         .unwrap_or(obj_u);
     ctx.globals.current_stage_object = Some((stage_idx, current_runtime_slot));
+    let embedded_tree = st.is_embedded_object_slot(stage_idx, current_runtime_slot);
 
     // C++ passes C_elm_object* directly.  Resolve COPY_FROM/CHILD assignment
     // sources before borrowing the destination object so the destination can
@@ -7107,6 +7133,7 @@ fn dispatch_object_op(
         group_lists,
         rect_layers,
         next_nested_object_slot,
+        embedded_tree,
     };
 
     dispatch_object_state_op(
@@ -7502,9 +7529,11 @@ fn dispatch_object_state_op(
                 &mut src,
                 dst_nested_runtime_slot,
             );
+            let embedded_tree = stage.embedded_tree;
             duplicate_object_tree_backends_for_copy_with_layers(
                 ctx,
                 &mut *stage.rect_layers,
+                embedded_tree,
                 stage_idx,
                 &mut src,
                 obj_runtime_slot,
@@ -7628,9 +7657,11 @@ fn dispatch_object_state_op(
                             &mut copied,
                             Some(slot),
                         );
+                        let embedded_tree = stage.embedded_tree;
                         duplicate_object_tree_backends_for_copy_with_layers(
                             ctx,
                             &mut *stage.rect_layers,
+                            embedded_tree,
                             stage_idx,
                             &mut copied,
                             slot,
@@ -8474,7 +8505,7 @@ fn dispatch_object_state_op(
             ctx.gfx.object_sprite_binding(stage_idx, obj_runtime_slot as i64)
         );
         if create_ok && obj.nested_runtime_slot.is_some() {
-            hide_embedded_gfx_backing(ctx, stage_idx, obj_runtime_slot);
+            hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, obj_runtime_slot);
         }
         obj.used = true;
         obj.backend = if create_ok {
@@ -8565,7 +8596,7 @@ fn dispatch_object_state_op(
                         );
                     }
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, obj_runtime_slot);
+                        hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, obj_runtime_slot);
                     }
                     obj.set_int_prop(&ctx.ids, op, if b { 1 } else { 0 });
                 }
@@ -11686,7 +11717,7 @@ fn dispatch_object_state_op(
                 );
             }
             if create_ok && obj.nested_runtime_slot.is_some() {
-                hide_embedded_gfx_backing(ctx, stage_idx, obj_runtime_slot);
+                hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, obj_runtime_slot);
             }
             obj.used = true;
             obj.backend = if create_ok {

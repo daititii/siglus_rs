@@ -255,6 +255,9 @@ struct CallFrame {
     return_scene_name: Option<String>,
     return_line_no: i32,
     ret_form: i32,
+    /// Rust-only per-callee continuation for inline user-command/frame-action
+    /// execution. Original C++ saves do not serialize this field; loaded frames
+    /// keep it as None and use the caller-frame continuation.
     return_override: Option<(usize, i32)>,
     excall_proc: bool,
     frame_action_proc: bool,
@@ -1775,6 +1778,7 @@ impl<'a> SceneVm<'a> {
             None,
         );
         call_frame.call_type = 3;
+        call_frame.return_override = Some((return_pc, ret_form));
         self.call_stack.push(call_frame);
         self.stream.set_prg_cntr(offset)?;
 
@@ -2332,6 +2336,14 @@ impl<'a> SceneVm<'a> {
     ) -> Result<bool> {
         let checkpoint = self.inline_exec_checkpoint();
         let saved_scene_no = checkpoint.scene_no;
+        // Frame-action callbacks execute through the same interpreter stacks as
+        // the suspended caller. If the callback consumes an operand that the
+        // caller had already pushed for an unfinished expression, restoring only
+        // stack lengths cannot reconstruct that value. Keep an exact snapshot
+        // and restore it only after a normal callback RETURN.
+        let saved_int_stack = self.int_stack.clone();
+        let saved_str_stack = self.str_stack.clone();
+        let saved_element_points = self.element_points.clone();
         let saved_scene_stack_len = checkpoint.scene_depth;
         let saved_call_depth = checkpoint.call_depth;
 
@@ -2437,6 +2449,11 @@ impl<'a> SceneVm<'a> {
                     run_error.is_some()
                 );
             }
+            if completed_by_return {
+                self.int_stack = saved_int_stack;
+                self.str_stack = saved_str_stack;
+                self.element_points = saved_element_points;
+            }
             self.restore_inline_exec_checkpoint(checkpoint)?;
         }
 
@@ -2486,6 +2503,7 @@ impl<'a> SceneVm<'a> {
             None,
         );
         call_frame.call_type = 3;
+        call_frame.return_override = Some((return_pc, ret_form));
         self.call_stack.push(call_frame);
         self.stream.set_prg_cntr(offset)?;
         if excall_proc {
@@ -11536,13 +11554,15 @@ impl<'a> SceneVm<'a> {
             }
         };
 
-        // C++ `tnm_scene_proc_gosub` persists the continuation on the caller
-        // call frame (`save_call`), then `load_call` restores that caller.
-        // Frame-action/user-command inline calls may run nested gosubs while a
-        // script gosub is waiting, so the authoritative continuation must be
-        // the caller frame here rather than any callee-local scratch state.
-        let return_pc = caller.return_pc;
-        let ret_form = caller.ret_form;
+        // Original C++ persists the continuation on the caller frame. Rust also
+        // has out-of-band inline user-command/frame-action execution that can
+        // temporarily reuse those caller fields while another call is suspended.
+        // Calls created by those Rust paths therefore keep a per-callee copy;
+        // frames loaded from original saves have no override and continue to use
+        // the original caller-frame representation.
+        let (return_pc, ret_form) = callee
+            .return_override
+            .unwrap_or((caller.return_pc, caller.ret_form));
         if self.runtime_options.trace_call_return_pc {
             eprintln!(
                 "[SG_CALL_PC] return depth={} pc=0x{:x} ret_form={} override={:?} args={:?}",
@@ -13130,6 +13150,68 @@ mod call_frame_save_metadata_tests {
             out.extend_from_slice(&word.to_le_bytes());
         }
         out
+    }
+
+    fn test_call_frame(
+        return_pc: usize,
+        ret_form: i32,
+        return_override: Option<(usize, i32)>,
+    ) -> CallFrame {
+        CallFrame {
+            call_type: 3,
+            return_pc,
+            return_scene_no: None,
+            return_scene_name: None,
+            return_line_no: -1,
+            ret_form,
+            return_override,
+            excall_proc: false,
+            frame_action_proc: false,
+            arg_cnt: 0,
+            delayed_ret_form: None,
+            user_props: Vec::new(),
+            int_args: Vec::new(),
+            str_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exec_return_prefers_per_callee_continuation_for_inline_calls() {
+        let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
+        let stream = SceneStream::new(chunk).expect("empty scene stream");
+        let mut vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
+        vm.call_stack.clear();
+        vm.call_stack
+            .push(test_call_frame(8, vm.cfg.fm_void, None));
+        vm.call_stack.push(test_call_frame(
+            0,
+            vm.cfg.fm_void,
+            Some((12, vm.cfg.fm_int)),
+        ));
+
+        assert!(!vm
+            .exec_return(vec![Value::Int(77)])
+            .expect("return from inline call"));
+        assert_eq!(vm.stream.get_prg_cntr(), 12);
+        assert_eq!(vm.pop_int().expect("inline return value"), 77);
+    }
+
+    #[test]
+    fn exec_return_falls_back_to_original_caller_metadata_for_saved_frames() {
+        let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
+        let stream = SceneStream::new(chunk).expect("empty scene stream");
+        let mut vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
+        vm.call_stack.clear();
+        vm.call_stack
+            .push(test_call_frame(16, vm.cfg.fm_int, None));
+        vm.call_stack
+            .push(test_call_frame(0, vm.cfg.fm_void, None));
+
+        assert!(!vm
+            .exec_return(vec![Value::Int(91)])
+            .expect("return from saved-style call"));
+        assert_eq!(vm.stream.get_prg_cntr(), 16);
+        assert_eq!(vm.pop_int().expect("saved-style return value"), 91);
     }
 
     #[test]

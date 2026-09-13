@@ -514,11 +514,6 @@ fn play_decoded_wav_in_slot(
                 StaticSoundData::from_cursor(Cursor::new(wav)).context("kira: decode WAV bytes")?;
             if loop_flag {
                 data = data.loop_region(0.0..);
-            } else {
-                // Short one-shot effects start/stop at sample discontinuities and
-                // pop through the Kira resampler unless a brief built-in ramp is
-                // applied at the beginning (and the end is faded by the handle).
-                data = data.fade_in_tween(Slot::tween_for_ms(4));
             }
             let mut new_handle = audio.play_static(self.track_kind, data)?;
             let amplitude = self.slots[slot].amplitude();
@@ -532,15 +527,10 @@ fn play_decoded_wav_in_slot(
                     Slot::tween_for_ms(fade_in_ms),
                 );
             } else {
+                // Natural one-shot playback stays at the requested amplitude until
+                // EOF. The previous implementation scheduled a zero-volume tween
+                // here, which made long voice lines decay while they were playing.
                 let _ = new_handle.set_volume(Volume::Amplitude(amplitude), Tween::default());
-                if !loop_flag {
-                    if let Some(ms) = duration_ms.filter(|ms| *ms > 40) {
-                        let _ = new_handle.set_volume(
-                            Volume::Amplitude(0.0),
-                            Slot::tween_for_ms((ms as i64) - 12),
-                        );
-                    }
-                }
             }
             handle = Some(new_handle);
         }
