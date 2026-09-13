@@ -1,6 +1,6 @@
 //! Public library API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "uefi")]
 use std::collections::hash_map::DefaultHasher;
 #[cfg(target_os = "uefi")]
@@ -181,15 +181,58 @@ impl Wmv3Decoder {
         seq.height = height;
         seq.display_width = width;
         seq.display_height = height;
+
+        // VC-1 Simple/Main reconstructs a complete macroblock surface, not only
+        // the display rectangle.  FFmpeg likewise sets h_edge_pos/v_edge_pos to
+        // mb_width*16 / mb_height*16.  Those non-display pixels are real coded
+        // reference samples: later P/B motion compensation may legally point
+        // into the final partial macroblock row/column.  Decoding directly into
+        // a width*height surface discards them (e.g. rows 1080..1087 for 1080p)
+        // and turns later MC into visible-edge replication.
+        let coded_width = width
+            .checked_add(15)
+            .ok_or_else(|| DecoderError::InvalidData("WMV3 width overflow".into()))?
+            / 16 * 16;
+        let coded_height = height
+            .checked_add(15)
+            .ok_or_else(|| DecoderError::InvalidData("WMV3 height overflow".into()))?
+            / 16 * 16;
+
         Ok(Self {
             seq,
-            mb_dec: MacroblockDecoder::new(width, height),
-            cur: YuvFrame::new(width, height),
+            mb_dec: MacroblockDecoder::new(coded_width, coded_height),
+            cur: YuvFrame::new(coded_width, coded_height),
         })
     }
 
     pub fn width(&self) -> u32 { self.seq.width }
     pub fn height(&self) -> u32 { self.seq.height }
+
+    fn visible_frame(&self) -> YuvFrame {
+        let width = self.seq.width as usize;
+        let height = self.seq.height as usize;
+        let src_width = self.cur.width as usize;
+        let src_height = self.cur.height as usize;
+        debug_assert!(width <= src_width && height <= src_height);
+
+        let mut out = YuvFrame::new(self.seq.width, self.seq.height);
+        for y in 0..height {
+            let src = y * src_width;
+            let dst = y * width;
+            out.y[dst..dst + width].copy_from_slice(&self.cur.y[src..src + width]);
+        }
+
+        let cw = width / 2;
+        let ch = height / 2;
+        let src_cw = src_width / 2;
+        for y in 0..ch {
+            let src = y * src_cw;
+            let dst = y * cw;
+            out.cb[dst..dst + cw].copy_from_slice(&self.cur.cb[src..src + cw]);
+            out.cr[dst..dst + cw].copy_from_slice(&self.cur.cr[src..src + cw]);
+        }
+        out
+    }
 
     pub fn decode_frame_owned(
         &mut self,
@@ -205,7 +248,9 @@ impl Wmv3Decoder {
             log::debug!("ASF key-frame flag disagrees with WMV3 PTYPE: {:?}", hdr.frame_type);
         }
         self.mb_dec.decode_frame(payload, &hdr, &self.seq, &mut self.cur)?;
-        Ok(Some(self.cur.clone()))
+        // Keep the macroblock-aligned surface internally for future references;
+        // only crop when handing a frame to callers/rendering.
+        Ok(Some(self.visible_frame()))
     }
 }
 
@@ -356,6 +401,11 @@ pub struct AsfWmv2Decoder<R: Read + Seek> {
     asf: AsfFile,
     video_info: VideoStreamInfo,
     assembler: FrameAssembler,
+    /// Completed ASF media objects already returned by `AsfFile::read_packet`
+    /// but not yet consumed by `next_frame`. A single ASF packet may contain
+    /// multiple compressed payloads/media objects; dropping the tail after
+    /// returning the first decoded picture corrupts the VC-1 reference chain.
+    pending_payloads: VecDeque<AsfPayload>,
     decoder: VideoCodecDecoder,
 }
 
@@ -402,6 +452,12 @@ pub struct AsfWmaDecoder<R: Read + Seek> {
     audio_block_align: u16,
     decoder: AudioCodecDecoder,
     assembler: FrameAssembler,
+    /// Completed ASF media objects already returned by `AsfFile::read_packet`
+    /// but not yet consumed by `next_frame`. As with WMV video, one ASF packet
+    /// can contain multiple WMA media objects. Returning one decoded PCM frame
+    /// must not discard the remaining objects because WMA superframes / bit
+    /// reservoir state depends on consuming the stream strictly in order.
+    pending_payloads: VecDeque<AsfPayload>,
     last_pts_ms: u32,
     flushed_eof: bool,
 }
@@ -441,6 +497,7 @@ impl<R: Read + Seek> AsfWmaDecoder<R> {
             audio_block_align: audio_info.block_align,
             decoder,
             assembler: FrameAssembler::default(),
+            pending_payloads: VecDeque::new(),
             last_pts_ms: 0,
             flushed_eof: false,
         })
@@ -463,52 +520,66 @@ impl<R: Read + Seek> AsfWmaDecoder<R> {
     /// Returns `Ok(None)` on end-of-stream.
     pub fn next_frame(&mut self) -> Result<Option<DecodedAudioFrame>> {
         loop {
-            let payloads = match self.asf.read_packet(&mut self.reader) {
-                Ok(p) => p,
-                Err(DecoderError::EndOfStream) => {
-                    if self.flushed_eof {
+            // `AsfFile::read_packet` can complete multiple WMA media objects in
+            // one ASF packet. `next_frame` returns only one PCM frame, so keep
+            // the packet tail across calls exactly like `AsfWmv2Decoder`.
+            // Dropping those objects desynchronizes stateful WMA superframes /
+            // bit reservoir and eventually produces frame-length/bitstream
+            // overflow errors even though the ASF stream itself is valid.
+            let payload = if let Some(payload) = self.pending_payloads.pop_front() {
+                payload
+            } else {
+                let payloads = match self.asf.read_packet(&mut self.reader) {
+                    Ok(p) => p,
+                    Err(DecoderError::EndOfStream) => {
+                        if self.flushed_eof {
+                            return Ok(None);
+                        }
+                        self.flushed_eof = true;
+                        if let Some(frame) = self.decoder.decode_packet(&[], self.last_pts_ms)? {
+                            return Ok(Some(DecodedAudioFrame {
+                                pts_ms: frame.pts_ms,
+                                frame,
+                            }));
+                        }
                         return Ok(None);
                     }
-                    self.flushed_eof = true;
-                    if let Some(frame) = self.decoder.decode_packet(&[], self.last_pts_ms)? {
-                        return Ok(Some(DecodedAudioFrame {
-                            pts_ms: frame.pts_ms,
-                            frame,
-                        }));
-                    }
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            };
-
-            for payload in payloads {
-                if payload.stream_number != self.audio_stream_number {
-                    continue;
-                }
-                let Some((pts_ms, _is_key, data)) = self.assembler.push(payload) else {
+                    Err(e) => return Err(e),
+                };
+                self.pending_payloads.extend(
+                    payloads
+                        .into_iter()
+                        .filter(|payload| payload.stream_number == self.audio_stream_number),
+                );
+                let Some(payload) = self.pending_payloads.pop_front() else {
                     continue;
                 };
-                self.last_pts_ms = pts_ms;
-                let audio_format_tag = self.audio_format_tag;
-                let audio_block_align = self.audio_block_align;
-                let media_object_len = data.len();
-                let frame = self.decoder.decode_packet(&data, pts_ms).map_err(|err| {
-                    let context = format!(
-                        "WMA tag=0x{audio_format_tag:04x} block_align={audio_block_align} media_object_len={media_object_len} pts_ms={pts_ms}",
-                    );
-                    match err {
-                        DecoderError::InvalidData(message) => {
-                            DecoderError::InvalidData(format!("{context}: {message}"))
-                        }
-                        DecoderError::Unsupported(message) => {
-                            DecoderError::Unsupported(format!("{context}: {message}"))
-                        }
-                        other => other,
+                payload
+            };
+
+            let Some((pts_ms, _is_key, data)) = self.assembler.push(payload) else {
+                continue;
+            };
+            self.last_pts_ms = pts_ms;
+            let audio_format_tag = self.audio_format_tag;
+            let audio_block_align = self.audio_block_align;
+            let media_object_len = data.len();
+            let frame = self.decoder.decode_packet(&data, pts_ms).map_err(|err| {
+                let context = format!(
+                    "WMA tag=0x{audio_format_tag:04x} block_align={audio_block_align} media_object_len={media_object_len} pts_ms={pts_ms}",
+                );
+                match err {
+                    DecoderError::InvalidData(message) => {
+                        DecoderError::InvalidData(format!("{context}: {message}"))
                     }
-                })?;
-                if let Some(frame) = frame {
-                    return Ok(Some(DecodedAudioFrame { pts_ms, frame }));
+                    DecoderError::Unsupported(message) => {
+                        DecoderError::Unsupported(format!("{context}: {message}"))
+                    }
+                    other => other,
                 }
+            })?;
+            if let Some(frame) = frame {
+                return Ok(Some(DecodedAudioFrame { pts_ms, frame }));
             }
         }
     }
@@ -560,6 +631,7 @@ impl<R: Read + Seek> AsfWmv2Decoder<R> {
             asf,
             video_info,
             assembler: FrameAssembler::default(),
+            pending_payloads: VecDeque::new(),
             decoder,
         })
     }
@@ -578,27 +650,46 @@ impl<R: Read + Seek> AsfWmv2Decoder<R> {
     /// Returns `Ok(None)` on end-of-stream.
     pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>> {
         loop {
-            let payloads = match self.asf.read_packet(&mut self.reader) {
-                Ok(p) => p,
-                Err(DecoderError::EndOfStream) => return Ok(None),
-                Err(e) => return Err(e),
-            };
-
-            for payload in payloads {
-                if payload.stream_number != self.video_info.stream_number {
-                    continue;
-                }
-                let Some((pts_ms, is_key, data)) = self.assembler.push(payload) else {
+            // `AsfFile::read_packet` returns every completed media object from
+            // one ASF packet. In particular ASF compressed payloads may carry
+            // many tiny WMV pictures in the same packet. `next_frame` returns
+            // only one picture to its caller, so preserve the remaining media
+            // objects here and consume them before reading another ASF packet.
+            //
+            // The old implementation iterated the local `payloads` vector and
+            // returned as soon as the first picture decoded. Rust then dropped
+            // the rest of that vector. Losing even a skip/P picture changes the
+            // VC-1 reference state and makes all following predicted pictures
+            // decode against the wrong anchor.
+            let payload = if let Some(payload) = self.pending_payloads.pop_front() {
+                payload
+            } else {
+                let payloads = match self.asf.read_packet(&mut self.reader) {
+                    Ok(p) => p,
+                    Err(DecoderError::EndOfStream) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                self.pending_payloads.extend(
+                    payloads
+                        .into_iter()
+                        .filter(|payload| payload.stream_number == self.video_info.stream_number),
+                );
+                let Some(payload) = self.pending_payloads.pop_front() else {
                     continue;
                 };
+                payload
+            };
 
-                if let Some(frame) = self.decoder.decode_frame_owned(&data, is_key, pts_ms)? {
-                    return Ok(Some(DecodedFrame {
-                        pts_ms,
-                        is_key_frame: is_key,
-                        frame,
-                    }));
-                }
+            let Some((pts_ms, is_key, data)) = self.assembler.push(payload) else {
+                continue;
+            };
+
+            if let Some(frame) = self.decoder.decode_frame_owned(&data, is_key, pts_ms)? {
+                return Ok(Some(DecodedFrame {
+                    pts_ms,
+                    is_key_frame: is_key,
+                    frame,
+                }));
             }
         }
     }

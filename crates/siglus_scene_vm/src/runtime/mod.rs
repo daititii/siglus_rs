@@ -721,15 +721,6 @@ impl CommandContext {
         // loaded local stream. Wipe before parsing so that snapshot entries that
         // are simply *absent* (the snapshot has no mask list, no editbox, etc.)
         // truly become absent post-load instead of inheriting from the menu.
-        if !self.globals.stage_forms.is_empty() {
-            log::warn!(
-                "[SG_STAGE_FORMS_CLEARED] by=begin_runtime_load_apply scene={:?} scene_no={:?} line={} dropping_forms={:?}",
-                self.current_scene_name,
-                self.current_scene_no,
-                self.current_line_no,
-                self.globals.stage_forms.keys().collect::<Vec<_>>()
-            );
-        }
         self.globals.stage_forms.clear();
         self.globals.screen_forms.clear();
         self.globals.counter_lists.clear();
@@ -2084,22 +2075,6 @@ impl CommandContext {
     /// scene restart and destroyed data that the original engine retains.
     pub fn reset_for_scene_restart(&mut self) {
         use crate::runtime::forms::codes;
-
-        // `reinit_local()` equivalent: this wipes every stage object. The scene
-        // that runs next is expected to rebuild its own stage tree. If a scene
-        // keeps running its per-frame loop across this call, its objects are
-        // gone and subsequent object ops fabricate empty stand-ins (black screen
-        // + unbounded nested-slot growth). Log it so the clearing path can be
-        // attributed from a single reproduction.
-        if !self.globals.stage_forms.is_empty() {
-            log::warn!(
-                "[SG_STAGE_FORMS_CLEARED] by=reset_for_scene_restart scene={:?} scene_no={:?} line={} dropping_forms={:?}",
-                self.current_scene_name,
-                self.current_scene_no,
-                self.current_line_no,
-                self.globals.stage_forms.keys().collect::<Vec<_>>()
-            );
-        }
 
         let append_dir = self.globals.append_dir.clone();
         let append_name = self.globals.append_name.clone();
@@ -5796,6 +5771,34 @@ impl CommandContext {
         self.ui.set_sys_overlay(false, String::new());
     }
 
+    fn replay_msg_back_koe(&mut self, history_index: usize) {
+        let Some(entry) = self.globals.msgbk_forms
+            .get_mut(&self.ids.form_global_msgbk)
+            .and_then(|state| state.history.get_mut(history_index))
+        else {
+            return;
+        };
+        if entry.koe_no_list.is_empty() {
+            return;
+        }
+        // C_elm_msg_back::button_proc cycles through voices on repeated clicks.
+        let index = usize::try_from(entry.koe_play_no)
+            .ok().filter(|index| *index < entry.koe_no_list.len()).unwrap_or(0);
+        let koe_no = entry.koe_no_list[index];
+        let chara_no = entry.chr_no_list.get(index).copied().unwrap_or(-1);
+        entry.koe_play_no = index as i64 + 1;
+
+        // Backlog playback is EXKOE in the original engine: route the selected
+        // character's volume without changing the ongoing message's voice.
+        forms::global::remember_global_koe(self, koe_no, chara_no, true);
+        let jitan_rate = self.koe_jitan_rate(None, true);
+        if let Err(err) = self.koe.play_koe_no_with_rate(
+            &mut self.audio, koe_no, &self.globals.append_dir, jitan_rate,
+        ) {
+            log::error!("MSGBK voice replay failed koe_no={koe_no} chara_no={chara_no}: {err:#}");
+        }
+    }
+
     fn handle_msg_back_key(&mut self, k: input::VmKey) -> bool {
         if !self.globals.syscom.msg_back_open {
             return false;
@@ -5838,6 +5841,7 @@ impl CommandContext {
                     Some(ui::MsgBackHitAction::Close) => self.close_msg_back_proc(),
                     Some(ui::MsgBackHitAction::Up) => self.msg_back_target_up(),
                     Some(ui::MsgBackHitAction::Down) => self.msg_back_target_down(),
+                    Some(ui::MsgBackHitAction::ReplayKoe(index)) => self.replay_msg_back_koe(index),
                     Some(ui::MsgBackHitAction::Slider) => {
                         self.globals.syscom.msg_back_slider_dragging = true;
                         self.globals.syscom.msg_back_slider_drag_start_mouse = self.input.mouse_y;
@@ -7515,29 +7519,7 @@ impl CommandContext {
     }
 
     fn sync_global_movie(&mut self) {
-        // Every movie diagnostic is opt-in (`SG_MOVIE_TRACE=1`). The state probe
-        // below is periodic, and it must not add per-frame logcat traffic on a
-        // device unless someone explicitly asked for a movie trace.
         let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
-        // Periodic state probe: with no movie playing this is the cheapest per-frame hook
-        // that still reports the wait/scene state on a device where env vars cannot be set.
-        static SG_SYNC_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let polls = SG_SYNC_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if trace && polls % 300 == 0 {
-            log::warn!(
-                "[SG_MOV_STATE] playing={} file={:?} reveal={} key={} runtime_poll={} continuous={}",
-                self.globals.mov.playing,
-                self.globals.mov.file_name,
-                self.wait.message_reveal_waiting(),
-                self.wait.waiting_for_key(),
-                self.wait.needs_runtime_poll(),
-                self.wait.needs_continuous_frame()
-            );
-        }
-        /// Polls to wait for a first video frame before treating a clock-less movie as
-        /// unplayable. Generous on purpose: a working decoder presents its first frame long
-        /// before this, so a healthy movie is never cut short.
-        const MOVIE_NO_FRAME_WATCHDOG_POLLS: u32 = 600;
         let file_name = self.globals.mov.file_name.clone();
 
         if !self.globals.mov.playing || file_name.as_deref().unwrap_or("").is_empty() {
@@ -7553,13 +7535,17 @@ impl CommandContext {
             if let Some(position_ms) = self.movie.audio_playback_position_ms(id) {
                 self.globals.mov.timer_ms = position_ms;
                 if self.movie.audio_playback_finished(id) {
+                    // Audio reaching EOF is not MOV reaching EOF.  The native movie
+                    // player owns one A/V timeline, but in this port WMV audio and video
+                    // are decoded by independent workers.  A short/truncated WMA track
+                    // (or an audio stream whose coded duration is slightly shorter than
+                    // the video stream) must not tear down GLOBAL.MOV before the video
+                    // presenter reaches the container/video duration.  Detach the audio
+                    // clock and let GlobalMovieState::tick() resume the media timer from
+                    // the last Kira position; normal video-duration completion below will
+                    // close the movie.
                     self.globals.mov.audio_id = None;
-                    self.globals.mov.audio_start_attempted = false;
-                    if let Some(total_ms) = self.globals.mov.total_ms {
-                        self.globals.mov.timer_ms = total_ms;
-                    }
-                    self.globals.mov.playing = false;
-                    return;
+                    self.globals.mov.audio_start_attempted = true;
                 }
             } else {
                 // A failed streaming audio decoder must not terminate MOV video.
@@ -7617,38 +7603,6 @@ impl CommandContext {
                 // counters, frame actions, and object events while the decoder warms up.
                 if last_frame_idx.is_none() {
                     self.globals.mov.timer_ms = 0;
-                }
-                // A movie that can neither decode a frame nor run an audio clock has no
-                // media clock at all: `total_ms` is only reported once a frame has been
-                // selected, so the completion check below can never fire and the script
-                // waits forever. That is exactly the Rewrite+ OP/ED: they are WMV and the
-                // WMV3 video decoder is still WIP, while a failed WMA stream detaches the
-                // audio clock by design. Give the decoder a generous warm-up window, then
-                // finish the movie so the script continues instead of hanging on a blank
-                // movie layer.
-                self.globals.mov.polls_without_frame =
-                    self.globals.mov.polls_without_frame.saturating_add(1);
-                if trace && self.globals.mov.polls_without_frame % 300 == 1 {
-                    log::warn!(
-                        "[SG_MOV] waiting for first frame: file={} polls={} audio_id={} audio_tried={} total_ms={:?} timer_ms={}",
-                        file_name,
-                        self.globals.mov.polls_without_frame,
-                        self.globals.mov.audio_id.is_some(),
-                        self.globals.mov.audio_start_attempted,
-                        self.globals.mov.total_ms,
-                        self.globals.mov.timer_ms
-                    );
-                }
-                if last_frame_idx.is_none()
-                    && self.globals.mov.polls_without_frame >= MOVIE_NO_FRAME_WATCHDOG_POLLS
-                {
-                    log::warn!(
-                        "[SG_MOV] no decodable video frame after {} polls; finishing movie file={} \
-                         (audio-only playback would otherwise show a blank layer for the whole clip)",
-                        self.globals.mov.polls_without_frame,
-                        file_name
-                    );
-                    self.globals.mov.playing = false;
                 }
                 return;
             }
@@ -9158,11 +9112,16 @@ fn mwnd_button_forced_disabled(
     syscom: &globals::SyscomRuntimeState,
     mwnd_button_idx: Option<usize>,
 ) -> bool {
+    // elm_mwnd_waku.cpp applies these flags only to MWND buttons.
+    // Ordinary OBJECT buttons (including EXCALL menus) remain interactive.
+    let Some(idx) = mwnd_button_idx else {
+        return false;
+    };
     if syscom.mwnd_btn_disable_all {
         return true;
     }
-    mwnd_button_idx
-        .and_then(|idx| syscom.mwnd_btn_disable.get(&(idx as i64)))
+    syscom.mwnd_btn_disable
+        .get(&(idx as i64))
         .copied()
         .unwrap_or(false)
 }
@@ -14917,7 +14876,7 @@ fn apply_button_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) 
             if let Some(objs) = st.object_lists.get(&stage_idx) {
                 for (obj_idx, obj) in objs.iter().enumerate() {
                     collect_button_visuals_recursive(
-                        ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                        ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                     );
                 }
             }
@@ -14931,18 +14890,17 @@ fn apply_button_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) 
                             obj_idx,
                             obj,
                             &mut map,
-                            None,
                             Some(obj_idx),
                         );
                     }
                     for (obj_idx, obj) in m.face_list.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                     for (obj_idx, obj) in m.object_list.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                 }
@@ -14951,12 +14909,12 @@ fn apply_button_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) 
                 for item in items {
                     for (obj_idx, obj) in item.generated_objects.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                     for (obj_idx, obj) in item.object_list.iter().enumerate() {
                         collect_button_visuals_recursive(
-                            ctx, st, stage_idx, obj_idx, obj, &mut map, None, None,
+                            ctx, st, stage_idx, obj_idx, obj, &mut map, None,
                         );
                     }
                 }
@@ -14986,12 +14944,15 @@ fn collect_button_visuals_recursive(
     obj_idx: usize,
     obj: &globals::ObjectState,
     map: &mut HashMap<(LayerId, SpriteId), ButtonVisualState>,
-    inherited_visual: Option<ButtonVisualState>,
     mwnd_button_idx: Option<usize>,
 ) {
     use globals::ObjectBackend;
 
-    let mut effective_visual = inherited_visual;
+    // C_elm_object::frame() processes children before applying this object's
+    // button action. Its texture, cut and action corrections belong only to
+    // its own sprites; passing them to children replaces glyphs and icons
+    // with copies of the parent button's image.
+    let mut effective_visual = None;
     if obj.button.enabled || obj.button.state == TNM_BTN_STATE_DISABLE {
         if !button_syscom_mode_visible(&ctx.globals.syscom, &obj.button) {
             effective_visual = None;
@@ -15101,9 +15062,102 @@ fn collect_button_visuals_recursive(
             child_idx,
             child,
             map,
-            effective_visual.clone(),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod button_visual_ownership_tests {
+    use super::*;
+
+    fn picture(sprite_id: SpriteId, file: &str) -> globals::ObjectState {
+        let mut obj = globals::ObjectState::default();
+        obj.used = true;
+        obj.file_name = Some(file.to_owned());
+        obj.backend = globals::ObjectBackend::Rect {
+            layer_id: 0,
+            sprite_id,
+            width: 360,
+            height: 48,
+        };
+        obj
+    }
+
+    fn visuals(obj: &globals::ObjectState) -> HashMap<(LayerId, SpriteId), ButtonVisualState> {
+        let ctx = CommandContext::new(PathBuf::from("."));
+        let stage = globals::StageFormState::default();
+        let mut map = HashMap::new();
+        collect_button_visuals_recursive(&ctx, &stage, 0, 0, obj, &mut map, None);
+        map
+    }
+
+    #[test]
+    fn save_slot_button_does_not_replace_child_text_digits_or_icons() {
+        let mut slot = picture(0, "_s_data");
+        slot.button.enabled = true;
+        slot.button.action_no = 9;
+
+        let mut text = globals::ObjectState::default();
+        text.used = true;
+        text.backend = globals::ObjectBackend::String {
+            layer_id: 0,
+            shadow_sprite_id: 1,
+            fuchi_sprite_id: 2,
+            sprite_id: 3,
+            shadow_image_id: None,
+            fuchi_image_id: None,
+            image_id: None,
+            glyphs: Vec::new(),
+            mwnd_layer_reps: false,
+            width: 200,
+            height: 22,
+        };
+        let mut number = globals::ObjectState::default();
+        number.used = true;
+        number.backend = globals::ObjectBackend::Number {
+            layer_id: 0,
+            sprite_ids: vec![4, 5],
+        };
+        let mut container = globals::ObjectState::default();
+        container.runtime.child_objects.push(picture(6, "_sl_new"));
+        slot.runtime.child_objects = vec![text, number, container];
+
+        for state in 0..=TNM_BTN_STATE_DISABLE {
+            slot.button.state = state;
+            slot.button.hit = state == TNM_BTN_STATE_HIT;
+            slot.button.pushed = state == TNM_BTN_STATE_PUSH;
+            let map = visuals(&slot);
+            assert_eq!(map.len(), 1, "parent button state {state}");
+            assert_eq!(map[&(0, 0)].file_name.as_deref(), Some("_s_data"));
+        }
+    }
+
+    #[test]
+    fn nested_button_keeps_its_own_action_texture_and_cut() {
+        let ctx = CommandContext::new(PathBuf::from("."));
+        let mut slot = picture(0, "_l_data");
+        slot.button.enabled = true;
+        slot.button.action_no = 9;
+        slot.button.state = TNM_BTN_STATE_DISABLE;
+
+        let mut icon = picture(1, "_sl_new");
+        icon.button.enabled = true;
+        icon.button.action_no = 2;
+        icon.button.hit = true;
+        icon.button.cut_no = 3;
+        icon.set_int_prop(&ctx.ids, ctx.ids.obj_patno, 4);
+        icon.runtime.child_objects.push(picture(2, "child_label"));
+        slot.runtime.child_objects.push(icon);
+
+        let map = visuals(&slot);
+        assert_eq!(map.len(), 2);
+        let icon_visual = &map[&(0, 1)];
+        assert_eq!(icon_visual.state, TNM_BTN_STATE_HIT);
+        assert_eq!(icon_visual.action_no, 2);
+        assert_eq!(icon_visual.file_name.as_deref(), Some("_sl_new"));
+        assert_eq!(icon_visual.base_patno, 4);
+        assert_eq!(icon_visual.cut_no, 3);
     }
 }
 
@@ -16387,5 +16441,87 @@ mod movie_menu_wait_tests {
         ctx.wait.wait_object_movie(form, 1, 0, true, true);
         assert!(!ctx.wait_poll());
         assert_eq!(ctx.stack.pop().and_then(|v| v.as_i64()), Some(0));
+    }
+}
+
+
+#[cfg(test)]
+mod msg_back_voice_tests {
+    use super::*;
+
+    fn backlog_with_button(project: PathBuf, voices: &[(i64, i64)]) -> CommandContext {
+        let mut ctx = CommandContext::new(project);
+        let mut history = globals::MsgBackState::default();
+        for &(voice, character) in voices {
+            history.add_koe(voice, character, 0, 0);
+        }
+        history.add_msg("Backlog voice", "", 0, 0);
+        ctx.globals.msgbk_forms.insert(ctx.ids.form_global_msgbk, history);
+        ctx.globals.syscom.msg_back_open = true;
+        let mut projection = ctx.build_msg_back_projection().unwrap();
+        projection.window_x = 100;
+        projection.window_y = 50;
+        projection.window_w = 320;
+        projection.window_h = 200;
+        projection.disp_margin = (10, 10, 10, 10);
+        projection.koe_buttons = vec![ui::MsgBackEntryButtonProjection {
+            history_index: 0, file: None, x: 30, y: 5,
+        }];
+        ctx.ui.set_msg_back_projection(Some(projection));
+        let image = ctx.images.solid_rgba((255, 255, 255, 255));
+        ctx.ui.msg_back.koe_buttons = vec![ui::MsgBackButtonRuntime {
+            image: Some(image), size: Some((20, 20)), center: Some((4, 3)),
+            ..Default::default()
+        }];
+        ctx
+    }
+
+    #[test]
+    fn backlog_voice_click_cycles_clips_and_preserves_message_voice() {
+        let mut ctx = backlog_with_button(std::env::temp_dir().join("siglus-backlog-click-test"), &[(10, 2), (11, 3)]);
+        ctx.globals.script.cur_koe_no = 99;
+        ctx.globals.script.cur_chr_no = 7;
+        ctx.globals.syscom.replay_koe = Some((99, 7));
+        assert_eq!(ctx.ui.msg_back_hit_action(128, 55), None, "clipped part of icon");
+        assert_eq!(ctx.ui.msg_back_hit_action(128, 62), Some(ui::MsgBackHitAction::ReplayKoe(0)));
+        for (voice, character, next) in [(10, 2, 1), (11, 3, 2), (10, 2, 1)] {
+            ctx.on_mouse_move(128, 62);
+            ctx.on_mouse_down(input::VmMouseButton::Left);
+            ctx.on_mouse_up(input::VmMouseButton::Left);
+            assert!(ctx.koe.is_playing_any(), "click must request voice decoding");
+            assert_eq!(ctx.globals.sound_routing.koe_chara_no, character);
+            assert!(ctx.globals.sound_routing.koe_ex_flag);
+            assert_eq!(ctx.globals.int_props[&(constants::fm::GLOBAL as u32)]
+                [&constants::elm_value::GLOBAL_KOE_CHECK_GET_KOE_NO], voice);
+            assert_eq!(ctx.msg_back_state().unwrap().history[0].koe_play_no, next);
+            assert_eq!(ctx.globals.script.cur_koe_no, 99);
+            assert_eq!(ctx.globals.script.cur_chr_no, 7);
+            assert_eq!(ctx.globals.syscom.replay_koe, Some((99, 7)));
+            assert!(!ctx.globals.syscom.msg_back_content_dragging);
+        }
+        // A scrolled-out entry can retain its cached texture but not its hit area.
+        ctx.ui.msg_back.projection.as_mut().unwrap().koe_buttons.clear();
+        assert_eq!(ctx.ui.msg_back_hit_action(128, 62), None);
+    }
+
+    #[test]
+    #[ignore = "requires audio output, SIGLUS_BACKLOG_TEST_GAME and SIGLUS_BACKLOG_TEST_KOE"]
+    fn backlog_voice_click_reaches_audio_output() {
+        let project = PathBuf::from(std::env::var("SIGLUS_BACKLOG_TEST_GAME").unwrap());
+        let voice: i64 = std::env::var("SIGLUS_BACKLOG_TEST_KOE").unwrap().parse().unwrap();
+        let mut ctx = backlog_with_button(project, &[(voice, 2)]);
+        ctx.on_mouse_move(128, 62);
+        ctx.on_mouse_down(input::VmMouseButton::Left);
+        ctx.on_mouse_up(input::VmMouseButton::Left);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ctx.koe.current_koe_no() != voice && std::time::Instant::now() < deadline {
+            ctx.koe.tick(&mut ctx.audio);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(ctx.koe.current_koe_no(), voice, "voice must decode and start");
+        assert!(ctx.audio.is_enabled(), "requires a working audio output device");
+        assert!(ctx.koe.is_playing_any());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(ctx.koe.current_play_pos_ms() > 0, "audio playback must advance");
     }
 }

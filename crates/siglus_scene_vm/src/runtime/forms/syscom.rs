@@ -992,7 +992,7 @@ fn write_slot_thumb_for_save_no(ctx: &mut CommandContext, save_no: usize) {
     }
     remove_game_file(&path);
     let result = match config.thumb_type {
-        SaveThumbType::Bmp => write_rgba_bmp_standard(&path, &img),
+        SaveThumbType::Bmp => write_rgba_bmp_top_down(&path, &img),
         SaveThumbType::Png => write_rgba_png_opaque(&path, &img),
     };
     if let Err(err) = result {
@@ -3062,7 +3062,9 @@ pub fn open_fallback_dialog(ctx: &mut CommandContext, kind: SyscomPendingProcKin
         SyscomPendingProcKind::OpenLoad => {
             open_save_load_fallback(ctx, false, 0, None);
         }
-        SyscomPendingProcKind::OpenConfig => open_config_root_fallback(ctx, None),
+        SyscomPendingProcKind::OpenConfig | SyscomPendingProcKind::OpenConfigDialog => {
+            open_config_root_fallback(ctx, None)
+        }
         _ => {
             log::error!("unsupported Syscom fallback request: {kind:?}");
         }
@@ -4031,15 +4033,7 @@ fn push_i32_le(out: &mut Vec<u8>, value: i32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// Write a save thumbnail in the layout the original engine itself uses:
-/// bottom-up (positive height), 24bpp BI_RGB, rows padded to a 4-byte boundary.
-///
-/// The previous implementation wrote a *top-down* (`height < 0`) 32bpp image.
-/// That is legal BMP, but SiglusEngine's own reader only accepts the classic
-/// layout: given our file it aborts with a bare `画像ファイル` error box, which
-/// makes the save list unusable and makes every slot look corrupt even though the
-/// `.sav` beside it is perfectly fine.
-fn write_rgba_bmp_standard(path: &Path, img: &RgbaImage) -> Result<()> {
+fn write_rgba_bmp_top_down(path: &Path, img: &RgbaImage) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -4048,41 +4042,33 @@ fn write_rgba_bmp_standard(path: &Path, img: &RgbaImage) -> Result<()> {
     if width == 0 || height == 0 {
         anyhow::bail!("invalid zero-sized bmp image {}x{}", width, height);
     }
-    let row_stride = ((width as usize) * 3 + 3) / 4 * 4;
-    let pixel_size = row_stride.saturating_mul(height as usize);
-    let file_size = 14usize + 40 + pixel_size;
-    let mut out = Vec::with_capacity(file_size);
+    let pixel_size = width.saturating_mul(height).saturating_mul(4);
+    let file_size = 14u32.saturating_add(40).saturating_add(pixel_size);
+    let mut out = Vec::with_capacity(file_size as usize);
 
     out.extend_from_slice(b"BM");
-    push_u32_le(&mut out, file_size as u32);
+    push_u32_le(&mut out, file_size);
     push_u16_le(&mut out, 0);
     push_u16_le(&mut out, 0);
     push_u32_le(&mut out, 14 + 40);
 
     push_u32_le(&mut out, 40);
     push_i32_le(&mut out, width as i32);
-    push_i32_le(&mut out, height as i32);
+    push_i32_le(&mut out, -(height as i32));
     push_u16_le(&mut out, 1);
-    push_u16_le(&mut out, 24);
+    push_u16_le(&mut out, 32);
     push_u32_le(&mut out, 0);
-    push_u32_le(&mut out, pixel_size as u32);
+    push_u32_le(&mut out, 0);
     push_i32_le(&mut out, 0);
     push_i32_le(&mut out, 0);
     push_u32_le(&mut out, 0);
     push_u32_le(&mut out, 0);
 
-    // Bottom-up: the last source row is stored first.
-    for y in (0..height as usize).rev() {
-        let row = y * width as usize * 4;
-        for x in 0..width as usize {
-            let px = &img.rgba[row + x * 4..row + x * 4 + 4];
-            out.push(px[2]);
-            out.push(px[1]);
-            out.push(px[0]);
-        }
-        for _ in width as usize * 3..row_stride {
-            out.push(0);
-        }
+    for px in img.rgba.chunks_exact(4) {
+        out.push(px[2]);
+        out.push(px[1]);
+        out.push(px[0]);
+        out.push(px[3]);
     }
     fs::write(path, out)?;
     mark_game_file_written(path);
@@ -5294,8 +5280,11 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             ctx.push(Value::Int(if ok { 1 } else { 0 }));
             return Ok(true);
         }
-        CALL_CONFIG_MENU
-        | CALL_CONFIG_WINDOW_MODE_MENU
+        CALL_CONFIG_MENU => {
+            set_syscom_pending_proc(ctx, SyscomPendingProcKind::OpenConfig);
+            ctx.globals.syscom.last_menu_call = op;
+        }
+        CALL_CONFIG_WINDOW_MODE_MENU
         | CALL_CONFIG_VOLUME_MENU
         | CALL_CONFIG_BGMFADE_MENU
         | CALL_CONFIG_KOEMODE_MENU
@@ -5307,7 +5296,10 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
         | CALL_CONFIG_FONT_MENU
         | CALL_CONFIG_SYSTEM_MENU
         | CALL_CONFIG_MOVIE_MENU => {
-            set_syscom_pending_proc(ctx, SyscomPendingProcKind::OpenConfig);
+            // C++ cmd_syscom opens cfg_wnd_solo_* directly for these calls.
+            // Re-entering CONFIG_SCENE would share the active EXCALL storage;
+            // returning from the inner menu frees the outer menu's objects.
+            set_syscom_pending_proc(ctx, SyscomPendingProcKind::OpenConfigDialog);
             ctx.globals.syscom.last_menu_call = op;
         }
         SET_WINDOW_MODE => cfg_set_int(&mut ctx.globals.syscom, GET_WINDOW_MODE, p_i64(params, 0)),

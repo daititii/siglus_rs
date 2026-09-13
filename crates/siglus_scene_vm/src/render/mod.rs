@@ -1874,7 +1874,10 @@ fn technique_name_for_pipeline(key: &PipelineKey) -> String {
 }
 
 impl Renderer {
-    pub async fn new(window: &'static Window) -> Result<Self> {
+    pub async fn new<W>(window: W) -> Result<Self>
+    where
+        W: std::ops::Deref<Target = Window> + Into<wgpu::SurfaceTarget<'static>>,
+    {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let backends = wgpu::Backends::GL;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1885,9 +1888,9 @@ impl Renderer {
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window).context("create_surface")?;
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
+        let surface = instance.create_surface(window).context("create_surface")?;
         Self::new_from_instance_surface(instance, surface, size.width, size.height, scale_factor).await
     }
 
@@ -2434,24 +2437,45 @@ impl Renderer {
     }
 
     pub fn resize_with_scale(&mut self, width: u32, height: u32, scale_factor: f32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        let sf = if scale_factor.is_finite() && scale_factor > 0.0 {
+        let sf = Self::valid_scale_factor(scale_factor);
+        self.resize_targets(width, height, sf, width as f32 / sf, height as f32 / sf);
+        self.surface_viewport = SurfaceViewport::full(self.config.width, self.config.height);
+    }
+
+    fn valid_scale_factor(scale_factor: f32) -> f32 {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
             scale_factor
         } else {
             1.0
-        };
-        self.scale_factor = sf;
-        self.logical_width = ((width as f32) / sf).max(1.0);
-        self.logical_height = ((height as f32) / sf).max(1.0);
-        self.surface_viewport = SurfaceViewport::full(width, height);
+        }
+    }
+
+    fn resize_targets(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale_factor: f32,
+        logical_width: f32,
+        logical_height: f32,
+    ) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let surface_changed = self.config.width != width || self.config.height != height;
+        let previous_logical_size = self.logical_size();
+        self.scale_factor = Self::valid_scale_factor(scale_factor);
+        self.logical_width = logical_width.max(1.0);
+        self.logical_height = logical_height.max(1.0);
         self.config.width = width;
         self.config.height = height;
+        // Keep explicit reconfiguration for surface-loss recovery at the same size.
         self.surface.configure(&self.device, &self.config);
-        self.surface_depth =
-            create_depth_texture(&self.device, self.config.width, self.config.height);
-        self.recreate_logical_render_targets();
+        if surface_changed {
+            self.surface_depth = create_depth_texture(&self.device, width, height);
+        }
+        if previous_logical_size != self.logical_size() {
+            self.recreate_logical_render_targets();
+        }
     }
 
     pub fn resize_with_logical_viewport(
@@ -2466,10 +2490,13 @@ impl Renderer {
         viewport_width: u32,
         viewport_height: u32,
     ) {
-        self.resize_with_scale(surface_width, surface_height, scale_factor);
-        self.logical_width = logical_width.max(1) as f32;
-        self.logical_height = logical_height.max(1) as f32;
-        self.recreate_logical_render_targets();
+        self.resize_targets(
+            surface_width,
+            surface_height,
+            scale_factor,
+            logical_width.max(1) as f32,
+            logical_height.max(1) as f32,
+        );
         let max_w = self.config.width;
         let max_h = self.config.height;
         let x = viewport_x.min(max_w.saturating_sub(1));

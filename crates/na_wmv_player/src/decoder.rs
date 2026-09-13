@@ -466,38 +466,139 @@ fn vc1_filter_vertical_boundary(
     }
 }
 
-/// Progressive I/BI/B picture loop filter.  FFmpeg's delayed MB traversal is
-/// only needed because it reconstructs in-place.  Once the full picture is
-/// available, the same ordering is: all horizontal block boundaries first
-/// (vc1_v_loop_filter*), then all vertical boundaries (vc1_h_loop_filter*).
-fn vc1_i_loop_filter_plane(plane: &mut [u8], width: usize, height: usize, pq: i32) {
-    if width < 8 || height < 8 {
-        return;
+/// Filter the horizontal borders owned by one progressive I/BI/B macroblock.
+///
+/// This is the operation FFmpeg calls the "V loop" (the filter runs in the
+/// vertical direction across a horizontal edge).  Outer picture edges are not
+/// filtered; the internal 8-pixel luma edge is always filtered.
+fn vc1_i_v_loop_filter_mb(
+    frame: &mut YuvFrame,
+    mb_row: usize,
+    mb_col: usize,
+    pq: i32,
+) {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let x = mb_col * 16;
+    let y = mb_row * 16;
+
+    if y > 0 {
+        vc1_filter_horizontal_boundary(&mut frame.y, w, h, x, y, 16, pq);
+    }
+    if y + 8 < h {
+        vc1_filter_horizontal_boundary(&mut frame.y, w, h, x, y + 8, 16, pq);
     }
 
-    // Horizontal borders between 8x8 transform blocks.
-    for y in (8..height).step_by(8) {
-        for x in (0..width).step_by(8) {
-            vc1_filter_horizontal_boundary(plane, width, height, x, y, 8, pq);
-        }
-    }
-
-    // Vertical borders between 8x8 transform blocks.
-    for x in (8..width).step_by(8) {
-        for y in (0..height).step_by(8) {
-            vc1_filter_vertical_boundary(plane, width, height, x, y, 8, pq);
-        }
+    let cw = w / 2;
+    let ch = h / 2;
+    let cx = mb_col * 8;
+    let cy = mb_row * 8;
+    if cy > 0 {
+        vc1_filter_horizontal_boundary(&mut frame.cb, cw, ch, cx, cy, 8, pq);
+        vc1_filter_horizontal_boundary(&mut frame.cr, cw, ch, cx, cy, 8, pq);
     }
 }
 
-fn vc1_apply_i_loop_filter(frame: &mut YuvFrame, pq: i32) {
+/// Filter the vertical borders owned by one progressive I/BI/B macroblock.
+///
+/// FFmpeg calls this the "H loop".  It must run after the V loop for the same
+/// macroblock because the integer filter changes samples at edge crossings.
+fn vc1_i_h_loop_filter_mb(
+    frame: &mut YuvFrame,
+    mb_row: usize,
+    mb_col: usize,
+    pq: i32,
+) {
     let w = frame.width as usize;
     let h = frame.height as usize;
+    let x = mb_col * 16;
+    let y = mb_row * 16;
+
+    if x > 0 {
+        vc1_filter_vertical_boundary(&mut frame.y, w, h, x, y, 16, pq);
+    }
+    if x + 8 < w {
+        vc1_filter_vertical_boundary(&mut frame.y, w, h, x + 8, y, 16, pq);
+    }
+
     let cw = w / 2;
     let ch = h / 2;
-    vc1_i_loop_filter_plane(&mut frame.y, w, h, pq);
-    vc1_i_loop_filter_plane(&mut frame.cb, cw, ch, pq);
-    vc1_i_loop_filter_plane(&mut frame.cr, cw, ch, pq);
+    let cx = mb_col * 8;
+    let cy = mb_row * 8;
+    if cx > 0 {
+        vc1_filter_vertical_boundary(&mut frame.cb, cw, ch, cx, cy, 8, pq);
+        vc1_filter_vertical_boundary(&mut frame.cr, cw, ch, cx, cy, 8, pq);
+    }
+}
+
+/// Reproduce the call order of FFmpeg `ff_vc1_i_loop_filter()` after the full
+/// progressive picture has been reconstructed.
+///
+/// It is tempting to run every horizontal edge and then every vertical edge,
+/// but that is not equivalent: FFmpeg deliberately pipelines the two filters
+/// behind overlap reconstruction.  At edge crossings the first filter changes
+/// pixels consumed by the second, so preserving this macroblock wavefront is
+/// required for bit-exact reconstruction.
+fn vc1_apply_i_loop_filter(
+    frame: &mut YuvFrame,
+    pq: i32,
+    mb_width: usize,
+    mb_height: usize,
+) {
+    if mb_width == 0 || mb_height == 0 {
+        return;
+    }
+
+    for cur_y in 0..mb_height {
+        for cur_x in 0..mb_width {
+            // ff_vc1_i_loop_filter(): V loop trails overlap by one row and
+            // one column, with an explicit last-row/last-column flush.
+            if cur_y >= 1 {
+                if cur_x >= 1 {
+                    vc1_i_v_loop_filter_mb(frame, cur_y - 1, cur_x - 1, pq);
+                }
+                if cur_x + 1 == mb_width {
+                    vc1_i_v_loop_filter_mb(frame, cur_y - 1, cur_x, pq);
+                }
+            }
+            if cur_y + 1 == mb_height {
+                if cur_x >= 1 {
+                    vc1_i_v_loop_filter_mb(frame, cur_y, cur_x - 1, pq);
+                }
+                if cur_x + 1 == mb_width {
+                    vc1_i_v_loop_filter_mb(frame, cur_y, cur_x, pq);
+                }
+            }
+
+            // H loop trails the V loop by another row.  Keep the exact
+            // wavefront/flush order used by FFmpeg instead of globally
+            // regrouping filters by orientation.
+            if cur_y >= 2 {
+                if cur_x >= 1 {
+                    vc1_i_h_loop_filter_mb(frame, cur_y - 2, cur_x - 1, pq);
+                }
+                if cur_x + 1 == mb_width {
+                    vc1_i_h_loop_filter_mb(frame, cur_y - 2, cur_x, pq);
+                }
+            }
+            if cur_y + 1 == mb_height {
+                if cur_y >= 1 {
+                    if cur_x >= 1 {
+                        vc1_i_h_loop_filter_mb(frame, cur_y - 1, cur_x - 1, pq);
+                    }
+                    if cur_x + 1 == mb_width {
+                        vc1_i_h_loop_filter_mb(frame, cur_y - 1, cur_x, pq);
+                    }
+                }
+                if cur_x >= 1 {
+                    vc1_i_h_loop_filter_mb(frame, cur_y, cur_x - 1, pq);
+                }
+                if cur_x + 1 == mb_width {
+                    vc1_i_h_loop_filter_mb(frame, cur_y, cur_x, pq);
+                }
+            }
+        }
+    }
 }
 
 // ─── Coefficient decoder ─────────────────────────────────────────────────────
@@ -3249,7 +3350,12 @@ impl MacroblockDecoder {
                 self.decode_intra(payload, pic_hdr, seq, frame)?;
                 self.vc1_finish_i_reconstruction(frame, pic_hdr, seq);
                 if seq.loop_filter {
-                    vc1_apply_i_loop_filter(frame, pic_hdr.pquant as i32);
+                    vc1_apply_i_loop_filter(
+                        frame,
+                        pic_hdr.pquant as i32,
+                        self.width_mb as usize,
+                        self.height_mb as usize,
+                    );
                 }
             }
             FrameType::P => {
@@ -3264,7 +3370,12 @@ impl MacroblockDecoder {
                 // FFmpeg uses the I-picture loop-filter traversal for
                 // progressive B pictures.
                 if seq.loop_filter {
-                    vc1_apply_i_loop_filter(frame, pic_hdr.pquant as i32);
+                    vc1_apply_i_loop_filter(
+                        frame,
+                        pic_hdr.pquant as i32,
+                        self.width_mb as usize,
+                        self.height_mb as usize,
+                    );
                 }
             }
             FrameType::Skipped => {
@@ -3440,17 +3551,17 @@ impl MacroblockDecoder {
         }
     }
 
-    fn vc1_p_loop_filter_plane(
+    #[inline]
+    fn vc1_p_v_loop_filter_block(
         &self,
         plane: &mut [u8],
         width: usize,
         height: usize,
         plane_no: usize,
+        bx: usize,
+        by: usize,
         pq: i32,
     ) {
-        if width < 8 || height < 8 {
-            return;
-        }
         let blocks_w = if plane_no == 0 {
             self.width_mb as usize * 2
         } else {
@@ -3461,125 +3572,266 @@ impl MacroblockDecoder {
         } else {
             self.height_mb as usize
         };
+        if bx >= blocks_w || by >= blocks_h {
+            return;
+        }
 
-        // FFmpeg vc1_p_v_loop_filter(): horizontal boundaries first.  For
-        // each 8x8 block, process its bottom external edge before the internal
-        // 4-pixel transform edge, matching the helper's operation order.
-        for by in 0..blocks_h {
-            let y0 = by * 8;
-            if y0 >= height {
-                break;
-            }
-            for bx in 0..blocks_w {
-                let x0 = bx * 8;
-                if x0 >= width {
-                    break;
+        let x0 = bx * 8;
+        let y0 = by * 8;
+        if x0 >= width || y0 >= height {
+            return;
+        }
+        let top = self.vc1_p_loop_meta(plane_no, bx, by);
+
+        // ff_vc1_p_v_loop_filter(): the 8-pixel edge below this block.
+        if by + 1 < blocks_h && (by + 1) * 8 < height {
+            let bottom = self.vc1_p_loop_meta(plane_no, bx, by + 1);
+            let edge_y = (by + 1) * 8;
+            if top.0 || bottom.0 || top.3 != bottom.3 {
+                vc1_filter_horizontal_boundary(plane, width, height, x0, edge_y, 8, pq);
+            } else {
+                let idx = (top.1 | (bottom.1 >> 2)) & 3;
+                if (idx & 1) != 0 {
+                    vc1_filter_horizontal_boundary(
+                        plane, width, height, x0 + 4, edge_y, 4, pq,
+                    );
                 }
-                let top = self.vc1_p_loop_meta(plane_no, bx, by);
-
-                if by + 1 < blocks_h && (by + 1) * 8 < height {
-                    let bottom = self.vc1_p_loop_meta(plane_no, bx, by + 1);
-                    let edge_y = (by + 1) * 8;
-                    if top.0 || bottom.0 || top.3 != bottom.3 {
-                        vc1_filter_horizontal_boundary(
-                            plane, width, height, x0, edge_y, 8, pq,
-                        );
-                    } else {
-                        let idx = (top.1 | (bottom.1 >> 2)) & 3;
-                        if (idx & 1) != 0 {
-                            vc1_filter_horizontal_boundary(
-                                plane, width, height, x0 + 4, edge_y, 4, pq,
-                            );
-                        }
-                        if (idx & 2) != 0 {
-                            vc1_filter_horizontal_boundary(
-                                plane, width, height, x0, edge_y, 4, pq,
-                            );
-                        }
-                    }
-                }
-
-                if matches!(top.2, TT_4X4 | TT_8X4) {
-                    let edge_y = y0 + 4;
-                    if edge_y < height {
-                        if (top.1 & 5) != 0 {
-                            vc1_filter_horizontal_boundary(
-                                plane, width, height, x0 + 4, edge_y, 4, pq,
-                            );
-                        }
-                        if (top.1 & 10) != 0 {
-                            vc1_filter_horizontal_boundary(
-                                plane, width, height, x0, edge_y, 4, pq,
-                            );
-                        }
-                    }
+                if (idx & 2) != 0 {
+                    vc1_filter_horizontal_boundary(
+                        plane, width, height, x0, edge_y, 4, pq,
+                    );
                 }
             }
         }
 
-        // FFmpeg vc1_p_h_loop_filter(): vertical boundaries after all
-        // horizontal filtering.  Again, external edge precedes internal edge.
-        for by in 0..blocks_h {
-            let y0 = by * 8;
-            if y0 >= height {
-                break;
-            }
-            for bx in 0..blocks_w {
-                let x0 = bx * 8;
-                if x0 >= width {
-                    break;
+        // Internal 4-pixel transform edge of this 8x8 block.
+        if matches!(top.2, TT_4X4 | TT_8X4) {
+            let edge_y = y0 + 4;
+            if edge_y < height {
+                if (top.1 & 5) != 0 {
+                    vc1_filter_horizontal_boundary(
+                        plane, width, height, x0 + 4, edge_y, 4, pq,
+                    );
                 }
-                let left = self.vc1_p_loop_meta(plane_no, bx, by);
-
-                if bx + 1 < blocks_w && (bx + 1) * 8 < width {
-                    let right = self.vc1_p_loop_meta(plane_no, bx + 1, by);
-                    let edge_x = (bx + 1) * 8;
-                    if left.0 || right.0 || left.3 != right.3 {
-                        vc1_filter_vertical_boundary(
-                            plane, width, height, edge_x, y0, 8, pq,
-                        );
-                    } else {
-                        let idx = (left.1 | (right.1 >> 1)) & 5;
-                        if (idx & 1) != 0 {
-                            vc1_filter_vertical_boundary(
-                                plane, width, height, edge_x, y0 + 4, 4, pq,
-                            );
-                        }
-                        if (idx & 4) != 0 {
-                            vc1_filter_vertical_boundary(
-                                plane, width, height, edge_x, y0, 4, pq,
-                            );
-                        }
-                    }
-                }
-
-                if matches!(left.2, TT_4X4 | TT_4X8) {
-                    let edge_x = x0 + 4;
-                    if edge_x < width {
-                        if (left.1 & 3) != 0 {
-                            vc1_filter_vertical_boundary(
-                                plane, width, height, edge_x, y0 + 4, 4, pq,
-                            );
-                        }
-                        if (left.1 & 12) != 0 {
-                            vc1_filter_vertical_boundary(
-                                plane, width, height, edge_x, y0, 4, pq,
-                            );
-                        }
-                    }
+                if (top.1 & 10) != 0 {
+                    vc1_filter_horizontal_boundary(
+                        plane, width, height, x0, edge_y, 4, pq,
+                    );
                 }
             }
         }
     }
 
-    fn vc1_apply_p_loop_filter(&self, frame: &mut YuvFrame, pq: i32) {
+    #[inline]
+    fn vc1_p_h_loop_filter_block(
+        &self,
+        plane: &mut [u8],
+        width: usize,
+        height: usize,
+        plane_no: usize,
+        bx: usize,
+        by: usize,
+        pq: i32,
+    ) {
+        let blocks_w = if plane_no == 0 {
+            self.width_mb as usize * 2
+        } else {
+            self.width_mb as usize
+        };
+        let blocks_h = if plane_no == 0 {
+            self.height_mb as usize * 2
+        } else {
+            self.height_mb as usize
+        };
+        if bx >= blocks_w || by >= blocks_h {
+            return;
+        }
+
+        let x0 = bx * 8;
+        let y0 = by * 8;
+        if x0 >= width || y0 >= height {
+            return;
+        }
+        let left = self.vc1_p_loop_meta(plane_no, bx, by);
+
+        // ff_vc1_p_h_loop_filter(): the 8-pixel edge right of this block.
+        if bx + 1 < blocks_w && (bx + 1) * 8 < width {
+            let right = self.vc1_p_loop_meta(plane_no, bx + 1, by);
+            let edge_x = (bx + 1) * 8;
+            if left.0 || right.0 || left.3 != right.3 {
+                vc1_filter_vertical_boundary(plane, width, height, edge_x, y0, 8, pq);
+            } else {
+                let idx = (left.1 | (right.1 >> 1)) & 5;
+                if (idx & 1) != 0 {
+                    vc1_filter_vertical_boundary(
+                        plane, width, height, edge_x, y0 + 4, 4, pq,
+                    );
+                }
+                if (idx & 4) != 0 {
+                    vc1_filter_vertical_boundary(
+                        plane, width, height, edge_x, y0, 4, pq,
+                    );
+                }
+            }
+        }
+
+        // Internal 4-pixel transform edge of this 8x8 block.
+        if matches!(left.2, TT_4X4 | TT_4X8) {
+            let edge_x = x0 + 4;
+            if edge_x < width {
+                if (left.1 & 3) != 0 {
+                    vc1_filter_vertical_boundary(
+                        plane, width, height, edge_x, y0 + 4, 4, pq,
+                    );
+                }
+                if (left.1 & 12) != 0 {
+                    vc1_filter_vertical_boundary(
+                        plane, width, height, edge_x, y0, 4, pq,
+                    );
+                }
+            }
+        }
+    }
+
+    fn vc1_p_v_loop_filter_mb(
+        &self,
+        frame: &mut YuvFrame,
+        mb_row: usize,
+        mb_col: usize,
+        pq: i32,
+    ) {
         let w = frame.width as usize;
         let h = frame.height as usize;
+        for local_y in 0..2 {
+            for local_x in 0..2 {
+                self.vc1_p_v_loop_filter_block(
+                    &mut frame.y,
+                    w,
+                    h,
+                    0,
+                    mb_col * 2 + local_x,
+                    mb_row * 2 + local_y,
+                    pq,
+                );
+            }
+        }
+
         let cw = w / 2;
         let ch = h / 2;
-        self.vc1_p_loop_filter_plane(&mut frame.y, w, h, 0, pq);
-        self.vc1_p_loop_filter_plane(&mut frame.cb, cw, ch, 1, pq);
-        self.vc1_p_loop_filter_plane(&mut frame.cr, cw, ch, 2, pq);
+        self.vc1_p_v_loop_filter_block(
+            &mut frame.cb, cw, ch, 1, mb_col, mb_row, pq,
+        );
+        self.vc1_p_v_loop_filter_block(
+            &mut frame.cr, cw, ch, 2, mb_col, mb_row, pq,
+        );
+    }
+
+    fn vc1_p_h_loop_filter_mb(
+        &self,
+        frame: &mut YuvFrame,
+        mb_row: usize,
+        mb_col: usize,
+        pq: i32,
+    ) {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        for local_y in 0..2 {
+            for local_x in 0..2 {
+                self.vc1_p_h_loop_filter_block(
+                    &mut frame.y,
+                    w,
+                    h,
+                    0,
+                    mb_col * 2 + local_x,
+                    mb_row * 2 + local_y,
+                    pq,
+                );
+            }
+        }
+
+        let cw = w / 2;
+        let ch = h / 2;
+        self.vc1_p_h_loop_filter_block(
+            &mut frame.cb, cw, ch, 1, mb_col, mb_row, pq,
+        );
+        self.vc1_p_h_loop_filter_block(
+            &mut frame.cr, cw, ch, 2, mb_col, mb_row, pq,
+        );
+    }
+
+    /// Reproduce the macroblock wavefront used by FFmpeg
+    /// `ff_vc1_p_loop_filter()`.  P filtering trails overlap by two rows/two
+    /// columns; running all V edges and then all H edges changes the samples at
+    /// edge crossings and is not bit-exact.
+    fn vc1_apply_p_loop_filter(&self, frame: &mut YuvFrame, pq: i32) {
+        let mb_width = self.width_mb as usize;
+        let mb_height = self.height_mb as usize;
+        if mb_width == 0 || mb_height == 0 {
+            return;
+        }
+
+        for cur_y in 0..mb_height {
+            for cur_x in 0..mb_width {
+                // V-loop portion of ff_vc1_p_loop_filter().
+                if cur_y >= 2 {
+                    if cur_x >= 1 {
+                        self.vc1_p_v_loop_filter_mb(frame, cur_y - 2, cur_x - 1, pq);
+                    }
+                    if cur_x + 1 == mb_width {
+                        self.vc1_p_v_loop_filter_mb(frame, cur_y - 2, cur_x, pq);
+                    }
+                }
+                if cur_y + 1 == mb_height {
+                    if cur_x >= 1 {
+                        if cur_y >= 1 {
+                            self.vc1_p_v_loop_filter_mb(frame, cur_y - 1, cur_x - 1, pq);
+                        }
+                        self.vc1_p_v_loop_filter_mb(frame, cur_y, cur_x - 1, pq);
+                    }
+                    if cur_x + 1 == mb_width {
+                        if cur_y >= 1 {
+                            self.vc1_p_v_loop_filter_mb(frame, cur_y - 1, cur_x, pq);
+                        }
+                        self.vc1_p_v_loop_filter_mb(frame, cur_y, cur_x, pq);
+                    }
+                }
+
+                // H-loop portion.  It trails by one additional MB column.
+                if cur_y >= 2 {
+                    if cur_x >= 2 {
+                        self.vc1_p_h_loop_filter_mb(frame, cur_y - 2, cur_x - 2, pq);
+                    }
+                    if cur_x + 1 == mb_width {
+                        if cur_x >= 1 {
+                            self.vc1_p_h_loop_filter_mb(frame, cur_y - 2, cur_x - 1, pq);
+                        }
+                        self.vc1_p_h_loop_filter_mb(frame, cur_y - 2, cur_x, pq);
+                    }
+                }
+                if cur_y + 1 == mb_height {
+                    if cur_y >= 1 {
+                        if cur_x >= 2 {
+                            self.vc1_p_h_loop_filter_mb(frame, cur_y - 1, cur_x - 2, pq);
+                        }
+                        if cur_x + 1 == mb_width {
+                            if cur_x >= 1 {
+                                self.vc1_p_h_loop_filter_mb(frame, cur_y - 1, cur_x - 1, pq);
+                            }
+                            self.vc1_p_h_loop_filter_mb(frame, cur_y - 1, cur_x, pq);
+                        }
+                    }
+                    if cur_x >= 2 {
+                        self.vc1_p_h_loop_filter_mb(frame, cur_y, cur_x - 2, pq);
+                    }
+                    if cur_x + 1 == mb_width {
+                        if cur_x >= 1 {
+                            self.vc1_p_h_loop_filter_mb(frame, cur_y, cur_x - 1, pq);
+                        }
+                        self.vc1_p_h_loop_filter_mb(frame, cur_y, cur_x, pq);
+                    }
+                }
+            }
+        }
     }
 
     #[inline]

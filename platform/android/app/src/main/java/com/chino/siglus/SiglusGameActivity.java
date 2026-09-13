@@ -122,7 +122,7 @@ public final class SiglusGameActivity extends AppCompatActivity
             @Override
             public void handleOnBackPressed() {
                 long now = SystemClock.uptimeMillis();
-                if (now - lastBackMs <= BACK_EXIT_WINDOW_MS) {
+                if (lastBackMs != 0L && now - lastBackMs <= BACK_EXIT_WINDOW_MS) {
                     setEnabled(false);
                     getOnBackPressedDispatcher().onBackPressed();
                     return;
@@ -281,9 +281,16 @@ public final class SiglusGameActivity extends AppCompatActivity
         if (dtMs < 0) dtMs = 0;
         if (dtMs > 250) dtMs = 250; // clamp (pause/background)
 
-        int exit = NativeSiglus.step(handle, dtMs);
-        if (exit != 0) {
+        int stepStatus = NativeSiglus.step(handle, dtMs);
+        if (stepStatus > 0) {
             finish();
+            return;
+        }
+        if (stepStatus < 0) {
+            // Native VM errors are not normal game exits. Stop this frame loop so
+            // the same failing instruction is not retried every vsync, but keep
+            // the Activity and last frame alive for logcat/debugging.
+            running = false;
             return;
         }
 

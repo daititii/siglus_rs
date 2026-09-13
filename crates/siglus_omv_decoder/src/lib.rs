@@ -158,15 +158,20 @@ impl<R: Read + Seek> TheoraVideoStream<R> {
     /// the key-frame page's `top_packet_no`: this is where tona3 starts its
     /// decode packet counter after feeding/draining the back-pages.  In
     /// particular, the seek page itself is allowed to have `top_packet_no=-1`.
-    /// The retained decoder context then decodes the key frame through
+    /// Packets completed before `key_page_file_offset` must be drained without
+    /// advancing that counter. The retained decoder context decodes the key frame through
     /// `target_packet_no`.
     pub fn seek_to_indexed_frame(
         &mut self,
         file_offset: u64,
+        key_page_file_offset: u64,
         first_packet_no: usize,
         key_frame_packet_no: usize,
         target_packet_no: usize,
     ) -> Result<Option<Vec<u8>>> {
+        if key_page_file_offset < file_offset {
+            bail!("Theora key-frame page precedes seek page");
+        }
         if first_packet_no > key_frame_packet_no {
             bail!(
                 "Theora seek packet {} follows key packet {}",
@@ -187,11 +192,24 @@ impl<R: Read + Seek> TheoraVideoStream<R> {
             .context("seek indexed Ogg page")?;
 
         let mut data_packet_no = first_packet_no;
+        let mut reached_key_page = false;
         while let Some(pkt) = self
             .reader
             .read_packet()
             .context("ogg packet read after indexed seek")?
         {
+            if !reached_key_page {
+                // PacketReader drains all completed packets from a page before
+                // reading the next page. Its reader position is the end of the
+                // page completing this packet, including for spanning packets.
+                // Back-pages can complete unrelated packets as well as start
+                // the key packet; tona3 discards those before numbering packets
+                // from the key page's top_packet_no.
+                if self.reader.get_mut().stream_position()? <= key_page_file_offset {
+                    continue;
+                }
+                reached_key_page = true;
+            }
             if pkt.stream_serial() != self.video_serial {
                 continue;
             }
