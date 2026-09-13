@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 use kira::tween::Tween;
-use kira::{StartTime, Volume};
+use kira::Volume;
 
 use crate::audio::bgm::{
     decode_bgm_to_wav_bytes, decode_ovk_entry_by_no_to_wav_bytes, resolve_koe_source, KoeSource,
@@ -514,11 +514,6 @@ fn play_decoded_wav_in_slot(
                 StaticSoundData::from_cursor(Cursor::new(wav)).context("kira: decode WAV bytes")?;
             if loop_flag {
                 data = data.loop_region(0.0..);
-            } else {
-                // Short one-shot effects start/stop at sample discontinuities and
-                // pop through the Kira resampler unless a brief built-in ramp is
-                // applied at the beginning (and the end is faded by the handle).
-                data = data.fade_in_tween(Slot::tween_for_ms(4));
             }
             let mut new_handle = audio.play_static(self.track_kind, data)?;
             let amplitude = self.slots[slot].amplitude();
@@ -532,27 +527,10 @@ fn play_decoded_wav_in_slot(
                     Slot::tween_for_ms(fade_in_ms),
                 );
             } else {
+                // Natural one-shot playback stays at the requested amplitude until
+                // EOF. The previous implementation scheduled a zero-volume tween
+                // here, which made long voice lines decay while they were playing.
                 let _ = new_handle.set_volume(Volume::Amplitude(amplitude), Tween::default());
-                if !loop_flag {
-                    if let Some(ms) = duration_ms.filter(|ms| *ms > 40) {
-                        // Anti-pop tail fade. A tween with no start time ramps
-                        // from the start amplitude to zero across the *whole*
-                        // clip, i.e. a constant decay: on a long one-shot such
-                        // as a message voice line that is plainly audible as
-                        // the voice getting quieter and quieter. Keep full
-                        // volume for the clip and ramp only the final 12 ms,
-                        // which still removes the end discontinuity.
-                        let tail_ms = (ms as i64).saturating_sub(12).max(0) as u64;
-                        let _ = new_handle.set_volume(
-                            Volume::Amplitude(0.0),
-                            Tween {
-                                start_time: StartTime::Delayed(Duration::from_millis(tail_ms)),
-                                duration: Duration::from_millis(12),
-                                ..Tween::default()
-                            },
-                        );
-                    }
-                }
             }
             handle = Some(new_handle);
         }

@@ -1819,47 +1819,7 @@ fn with_stage_state<R>(
     form_id: u32,
     f: impl FnOnce(&mut CommandContext, &mut StageFormState) -> R,
 ) -> R {
-    // Taking the entry out for the duration of `f` is deliberate (it lets the
-    // closure borrow `ctx` again), but it has two consequences worth watching:
-    //
-    //  * inside `f`, `ctx.globals.stage_forms` looks EMPTY. Any diagnostic that
-    //    inspects the stage table from an object-op handler is therefore reading
-    //    a lie - `keys=[]` there does not mean the table was cleared.
-    //  * `unwrap_or_default()` silently substitutes a brand-new empty stage form
-    //    when the entry is absent. If something really did clear the table
-    //    (`reset_for_scene_restart` / `begin_runtime_load_apply`), every object
-    //    the script keeps touching afterwards is fabricated from scratch, which
-    //    is exactly the "ghost object" failure mode: the renderer has nothing to
-    //    draw (black screen) while object ops keep allocating nested slots.
-    //
-    // Log the first time a form has to be resurrected so the clearing path can
-    // be identified from a single reproduction.
-    let present = ctx.globals.stage_forms.contains_key(&form_id);
     let mut st = ctx.globals.stage_forms.remove(&form_id).unwrap_or_default();
-    if !present {
-        static MISSING: OnceLock<std::sync::Mutex<std::collections::BTreeSet<(u32, u64, i64)>>> =
-            OnceLock::new();
-        let key = (
-            form_id,
-            ctx.current_scene_no.unwrap_or(-1) as u64,
-            ctx.current_line_no,
-        );
-        let first = MISSING
-            .get_or_init(|| std::sync::Mutex::new(Default::default()))
-            .lock()
-            .map(|mut s| s.insert(key))
-            .unwrap_or(false);
-        if first {
-            log::warn!(
-                "[SG_STAGE_FORM_MISSING] form={} scene={:?} scene_no={:?} line={} entries_now={:?}",
-                form_id,
-                ctx.current_scene_name,
-                ctx.current_scene_no,
-                ctx.current_line_no,
-                ctx.globals.stage_forms.keys().collect::<Vec<_>>()
-            );
-        }
-    }
     ensure_stage_form_initialized_from_gameexe(ctx, form_id, &mut st);
     let r = f(ctx, &mut st);
     ctx.globals.stage_forms.insert(form_id, st);
@@ -2057,7 +2017,7 @@ fn copy_root_object_for_stage_wipe(
     copy.nested_runtime_slot = None;
     assign_copy_runtime_slots(st, dst_stage, &mut copy, None);
     let backend_slot = copy.runtime_slot_or(dst_idx);
-    duplicate_object_tree_backends_for_copy(ctx, st, dst_stage, &mut copy, backend_slot);
+    duplicate_object_tree_backends_for_copy(ctx, st, false, dst_stage, &mut copy, backend_slot);
     let list = st.object_lists.get_mut(&dst_stage).unwrap();
     list[dst_idx] = copy;
 }
@@ -2106,7 +2066,7 @@ fn clone_embedded_objects_for_stage_wipe(
         copy.nested_runtime_slot = None;
         let slot = nested_object_slot(st, dst_stage, &mut copy);
         assign_copy_runtime_slots(st, dst_stage, &mut copy, Some(slot));
-        duplicate_object_tree_backends_for_copy(ctx, st, dst_stage, &mut copy, slot);
+        duplicate_object_tree_backends_for_copy(ctx, st, true, dst_stage, &mut copy, slot);
         out.push(copy);
     }
     out
@@ -3233,7 +3193,7 @@ fn create_mwnd_face_object(
         clear_failed_gfx_backing(ctx, stage_idx, slot, "MWND face PCT load failure");
     }
     if create_ok {
-        hide_embedded_gfx_backing(ctx, stage_idx, slot);
+        hide_embedded_gfx_backing(ctx, true, stage_idx, slot);
     }
 
     obj.used = true;
@@ -3327,7 +3287,7 @@ fn create_mwnd_template_button_object(
         clear_failed_gfx_backing(ctx, stage_idx, slot, "MWND button PCT load failure");
     }
     if create_ok {
-        hide_embedded_gfx_backing(ctx, stage_idx, slot);
+        hide_embedded_gfx_backing(ctx, true, stage_idx, slot);
     }
 
     obj.used = true;
@@ -3479,31 +3439,17 @@ fn ensure_btnselitem(
     }
 }
 
-/// Hide the standalone gfx sprite of an object that its owning form draws itself.
-///
-/// This is only correct for MWND/embedded slots. `ObjectState::nested_runtime_slot`
-/// marks *both* MWND-owned objects and plain `OBJECT.CHILD` descendants
-/// (see the field comment in globals.rs), but only the former are registered in
-/// `StageFormState::embedded_object_slots_by_stage`. A CHILD descendant owns its
-/// own render node, so hiding it removes that node from the submitted frame:
-/// `build_render_list_pre_wipe` ends with
-/// `list.retain(render_sprite_visible_for_submit)`, which requires
-/// `sprite.visible`, and `GfxRuntime::sync_object_sprite` derives that from the
-/// object's `disp`. Every Rewrite+ map/title menu entry is an
-/// `object[..].child[..]` tree, which is why those screens never appeared.
-fn hide_embedded_gfx_backing(ctx: &mut CommandContext, stage_idx: i64, runtime_slot: usize) {
-    if !is_embedded_render_slot(ctx, stage_idx, runtime_slot) {
+fn hide_embedded_gfx_backing(
+    ctx: &mut CommandContext,
+    embedded_tree: bool,
+    stage_idx: i64,
+    runtime_slot: usize,
+) {
+    if !embedded_tree {
         return;
     }
     let (gfx, images, layers) = (&mut ctx.gfx, &mut ctx.images, &mut ctx.layers);
     let _ = gfx.object_set_disp(images, layers, stage_idx, runtime_slot as i64, 0);
-}
-
-fn is_embedded_render_slot(ctx: &CommandContext, stage_idx: i64, runtime_slot: usize) -> bool {
-    ctx.globals
-        .stage_forms
-        .values()
-        .any(|st| st.is_embedded_object_slot(stage_idx, runtime_slot))
 }
 
 fn next_embedded_object_slot(st: &mut StageFormState, stage_idx: i64, key: &str) -> usize {
@@ -3759,6 +3705,7 @@ fn dispatch_embedded_object_child_item_op(
             group_lists,
             rect_layers,
             next_nested_object_slot,
+            embedded_tree: true,
         };
         dispatch_object_state_op(
             ctx,
@@ -3944,6 +3891,7 @@ fn dispatch_embedded_object_item_op(
             group_lists,
             rect_layers,
             next_nested_object_slot,
+            embedded_tree: true,
         };
         dispatch_object_state_op(
             ctx,
@@ -4506,7 +4454,7 @@ fn rebuild_object_after_change_file(
                 Ok(()) => {
                     obj.backend = ObjectBackend::Gfx;
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, runtime_slot);
+                        hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, runtime_slot);
                     }
                     mark_cgtable_look_from_object_create(
                         &mut ctx.tables,
@@ -4663,7 +4611,7 @@ fn rebuild_object_after_change_file(
                         &file,
                     );
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, runtime_slot);
+                        hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, runtime_slot);
                     }
                     sync_special_gfx_sprite_for_object(ctx, stage_idx, runtime_slot, obj);
                     obj.backend = ObjectBackend::Gfx;
@@ -5943,6 +5891,7 @@ fn assign_copy_runtime_slots(
 fn duplicate_object_tree_backends_for_copy_with_layers(
     ctx: &mut CommandContext,
     rect_layers: &mut HashMap<i64, LayerId>,
+    embedded_tree: bool,
     stage_idx: i64,
     obj: &mut ObjectState,
     obj_slot: usize,
@@ -5974,7 +5923,7 @@ fn duplicate_object_tree_backends_for_copy_with_layers(
                 match create_result {
                     Ok(()) => {
                         if obj.nested_runtime_slot.is_some() {
-                            hide_embedded_gfx_backing(ctx, stage_idx, obj_slot);
+                            hide_embedded_gfx_backing(ctx, embedded_tree, stage_idx, obj_slot);
                         }
                         sync_special_gfx_sprite_for_object(ctx, stage_idx, obj_slot, obj);
                         ObjectBackend::Gfx
@@ -6016,7 +5965,14 @@ fn duplicate_object_tree_backends_for_copy_with_layers(
 
     for child in &mut obj.runtime.child_objects {
         if let Some(slot) = child.nested_runtime_slot {
-            duplicate_object_tree_backends_for_copy_with_layers(ctx, rect_layers, stage_idx, child, slot);
+            duplicate_object_tree_backends_for_copy_with_layers(
+                ctx,
+                rect_layers,
+                embedded_tree,
+                stage_idx,
+                child,
+                slot,
+            );
         }
     }
 }
@@ -6024,6 +5980,7 @@ fn duplicate_object_tree_backends_for_copy_with_layers(
 fn duplicate_object_tree_backends_for_copy(
     ctx: &mut CommandContext,
     st: &mut StageFormState,
+    embedded_tree: bool,
     stage_idx: i64,
     obj: &mut ObjectState,
     obj_slot: usize,
@@ -6031,6 +5988,7 @@ fn duplicate_object_tree_backends_for_copy(
     duplicate_object_tree_backends_for_copy_with_layers(
         ctx,
         &mut st.rect_layers,
+        embedded_tree,
         stage_idx,
         obj,
         obj_slot,
@@ -6368,6 +6326,7 @@ fn update_string_backend(
 fn restore_object_backend_after_load(
     ctx: &mut CommandContext,
     st: &mut StageFormState,
+    embedded_tree: bool,
     stage_idx: i64,
     obj_slot: usize,
     obj: &mut ObjectState,
@@ -6460,7 +6419,7 @@ fn restore_object_backend_after_load(
                 } else {
                     obj.backend = ObjectBackend::Gfx;
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, obj_slot);
+                        hide_embedded_gfx_backing(ctx, embedded_tree, stage_idx, obj_slot);
                     }
                 }
             }
@@ -6550,7 +6509,7 @@ fn restore_object_backend_after_load(
                         );
                     } else {
                         if obj.nested_runtime_slot.is_some() {
-                            hide_embedded_gfx_backing(ctx, stage_idx, obj_slot);
+                            hide_embedded_gfx_backing(ctx, embedded_tree, stage_idx, obj_slot);
                         }
                         sync_special_gfx_sprite_for_object(ctx, stage_idx, obj_slot, obj);
                         obj.backend = ObjectBackend::Gfx;
@@ -6697,7 +6656,7 @@ fn restore_object_backend_after_load(
         let child_slot = child
             .nested_runtime_slot
             .unwrap_or_else(|| obj_slot.saturating_add(child_index + 1));
-        restore_object_backend_after_load(ctx, st, stage_idx, child_slot, child);
+        restore_object_backend_after_load(ctx, st, embedded_tree, stage_idx, child_slot, child);
     }
 }
 
@@ -6743,7 +6702,7 @@ pub(crate) fn restore_stage_form_backends_after_load(
         if let Some(mut objects) = st.object_lists.remove(&stage_idx) {
             for (index, obj) in objects.iter_mut().enumerate() {
                 assign_children(obj, &mut next_nested);
-                restore_object_backend_after_load(ctx, st, stage_idx, index, obj);
+                restore_object_backend_after_load(ctx, st, false, stage_idx, index, obj);
             }
             st.object_lists.insert(stage_idx, objects);
         }
@@ -6776,7 +6735,7 @@ pub(crate) fn restore_stage_form_backends_after_load(
                     obj.nested_runtime_slot = Some(slot);
                 }
                 assign_children(obj, next_nested);
-                restore_object_backend_after_load(ctx, st, stage_idx, slot, obj);
+                restore_object_backend_after_load(ctx, st, true, stage_idx, slot, obj);
             }
         }
 
@@ -6880,6 +6839,10 @@ struct ObjectDispatchStage<'a> {
     group_lists: &'a mut HashMap<i64, Vec<GroupState>>,
     rect_layers: &'a mut HashMap<i64, LayerId>,
     next_nested_object_slot: &'a mut HashMap<i64, usize>,
+    /// True when this dispatch belongs to an MWND/BTNSELITEM-owned object tree.
+    /// Ordinary OBJECT.CHILD descendants are not embedded and must retain their
+    /// standalone Gfx backing; embedded descendants inherit this flag.
+    embedded_tree: bool,
 }
 
 impl ObjectDispatchStage<'_> {
@@ -7085,148 +7048,6 @@ fn object_op_chain_needs_source_snapshot(
     false
 }
 
-/// Diagnostic for an OBJECT element whose opcode `resolve_object_op` cannot
-/// classify.
-///
-/// Must be called from `dispatch_object_op` (not from `ObjectOpKind::Unknown`)
-/// because `with_stage_state` takes the stage form out of
-/// `ctx.globals.stage_forms` for the whole dispatch, so the arm can only ever
-/// see an empty table.
-///
-/// The element is walked over the *existing* object tree with no auto-create, so
-/// the report says what is really there:
-///   `MISSING (parent_kids=N)` means the script asked for a child index the
-///   parent does not have - i.e. the runtime is about to fabricate one.
-/// Diagnostic payload for the next `ObjectOpKind::Unknown` hit.
-///
-/// `dispatch_object_op` captures it - the only place the real object tree `st`
-/// is reachable, because `with_stage_state` removes the stage form from
-/// `ctx.globals.stage_forms` for the whole dispatch - and the `Unknown` arm
-/// consumes it. `resolve_object_op` classifies many perfectly handled ops as
-/// `Unknown` (DISP / ORDER / LAYER / CHILD are dispatched by the `ids.*` checks
-/// further down), so the capture must not log by itself; the arm decides.
-thread_local! {
-    static UNKNOWN_OP_WALK: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// One-time (per element) capture of what the element child chain really
-/// resolves to, with no auto-create.
-fn capture_unknown_op_walk(
-    ctx: &CommandContext,
-    st: &StageFormState,
-    stage_idx: i64,
-    obj_u: usize,
-    op: i32,
-    tail: &[i32],
-    al_id: Option<i64>,
-    ret_form: Option<i64>,
-) {
-    let raw_element: Vec<i32> = ctx
-        .vm_call
-        .as_ref()
-        .map(|m| m.element.clone())
-        .unwrap_or_default();
-    // Bounded on purpose. This runs for every dispatch that `resolve_object_op`
-    // classifies as `Unknown`, which includes the hottest ops (DISP / CHILD /
-    // LAYER / ORDER ...), so an unbounded set of element vectors grows with the
-    // whole session - it once pushed the desktop build past 1.6 GB and made the
-    // window unusable. Sixteen distinct shapes is far more than enough to
-    // identify a call site.
-    const MAX_REPORTED: usize = 16;
-    static REPORTED: OnceLock<std::sync::Mutex<std::collections::BTreeSet<(i32, Vec<i32>)>>> =
-        OnceLock::new();
-    let first = REPORTED
-        .get_or_init(|| std::sync::Mutex::new(Default::default()))
-        .lock()
-        .map(|mut s| {
-            if s.len() >= MAX_REPORTED {
-                return false;
-            }
-            s.insert((op, raw_element.clone()))
-        })
-        .unwrap_or(false);
-    if !first {
-        return;
-    }
-
-    let mut walked = format!(
-        " | op={} scene={:?} line={} obj={} stage={} slots={} tail={:?} al_id={:?} ret_form={:?} raw={:?}",
-        op,
-        ctx.current_scene_name,
-        ctx.current_line_no,
-        obj_u,
-        stage_idx,
-        st.object_lists.get(&stage_idx).map(|l| l.len()).unwrap_or(0),
-        tail,
-        al_id,
-        ret_form,
-        raw_element
-    );
-    let mut cur: Option<&ObjectState> = None;
-    let mut level = 0usize;
-    let mut i = 0usize;
-    while i + 2 < raw_element.len() {
-        let (code, arr, idx) = (raw_element[i], raw_element[i + 1], raw_element[i + 2]);
-        if code == crate::runtime::forms::codes::elm_value::OBJECT_CHILD
-            && arr == crate::runtime::forms::codes::ELM_ARRAY
-        {
-            let child = cur.and_then(|o| o.runtime.child_objects.get(idx as usize));
-            walked.push_str(&format!(
-                " | L{} child[{}] -> {}",
-                level,
-                idx,
-                match child {
-                    None => format!(
-                        "MISSING (parent_kids={})",
-                        cur.map(|o| o.runtime.child_objects.len()).unwrap_or(0)
-                    ),
-                    Some(c) => format!(
-                        "used={} type={} file={} kids={}",
-                        c.used,
-                        c.object_type,
-                        c.file_name.as_deref().unwrap_or("-"),
-                        c.runtime.child_objects.len()
-                    ),
-                }
-            ));
-            cur = child;
-            level += 1;
-            i += 3;
-            continue;
-        }
-        if code == crate::runtime::forms::codes::STAGE_ELM_OBJECT
-            && arr == crate::runtime::forms::codes::ELM_ARRAY
-            && cur.is_none()
-        {
-            let root = st
-                .object_lists
-                .get(&stage_idx)
-                .and_then(|l| l.get(idx as usize));
-            walked.push_str(&format!(
-                " | root object[{}] -> {}",
-                idx,
-                match root {
-                    None => "MISSING".to_string(),
-                    Some(o) => format!(
-                        "used={} type={} file={} kids={}",
-                        o.used,
-                        o.object_type,
-                        o.file_name.as_deref().unwrap_or("-"),
-                        o.runtime.child_objects.len()
-                    ),
-                }
-            ));
-            cur = root;
-            i += 3;
-            continue;
-        }
-        i += 1;
-    }
-
-    UNKNOWN_OP_WALK.with(|w| *w.borrow_mut() = Some(walked));
-}
-
 fn dispatch_object_op(
     ctx: &mut CommandContext,
     st: &mut StageFormState,
@@ -7273,23 +7094,7 @@ fn dispatch_object_op(
         .map(|obj| obj.runtime_slot_or(obj_u))
         .unwrap_or(obj_u);
     ctx.globals.current_stage_object = Some((stage_idx, current_runtime_slot));
-
-    // `ObjectOpKind::Unknown` cannot report anything useful by itself:
-    // `with_stage_state` removes the stage form from `ctx.globals.stage_forms`
-    // for the whole dispatch, so a walk done from that arm only ever sees an
-    // empty table. Capture the walk here - the last point where the real object
-    // tree (`st`) is reachable - and hand it over through a thread-local.
-    //
-    // `resolve_object_op` also classifies plenty of *handled* ops as `Unknown`
-    // (DISP / ORDER / LAYER / CHILD are matched by the `ids.*` checks further
-    // down), so the capture must not log on its own AND must not survive a
-    // dispatch that never reaches the arm. Otherwise a later genuine unknown op
-    // would report a stale element.
-    if resolve_object_op(&ctx.ids, op) == ObjectOpKind::Unknown {
-        capture_unknown_op_walk(ctx, st, stage_idx, obj_u, op, tail, al_id, ret_form);
-    } else {
-        UNKNOWN_OP_WALK.with(|w| *w.borrow_mut() = None);
-    }
+    let embedded_tree = st.is_embedded_object_slot(stage_idx, current_runtime_slot);
 
     // C++ passes C_elm_object* directly.  Resolve COPY_FROM/CHILD assignment
     // sources before borrowing the destination object so the destination can
@@ -7328,9 +7133,10 @@ fn dispatch_object_op(
         group_lists,
         rect_layers,
         next_nested_object_slot,
+        embedded_tree,
     };
 
-    let handled = dispatch_object_state_op(
+    dispatch_object_state_op(
         ctx,
         &mut stage,
         stage_idx,
@@ -7343,12 +7149,7 @@ fn dispatch_object_op(
         rhs,
         al_id,
         &mut source_snapshot,
-    );
-    // Drop an unconsumed capture: reaching here without the `Unknown` arm having
-    // taken it means this op was handled after all, and leaving the payload
-    // behind would mis-attribute a later genuine unknown op.
-    UNKNOWN_OP_WALK.with(|w| *w.borrow_mut() = None);
-    handled
+    )
 }
 
 fn split_object_frame_action_chain(
@@ -7728,9 +7529,11 @@ fn dispatch_object_state_op(
                 &mut src,
                 dst_nested_runtime_slot,
             );
+            let embedded_tree = stage.embedded_tree;
             duplicate_object_tree_backends_for_copy_with_layers(
                 ctx,
                 &mut *stage.rect_layers,
+                embedded_tree,
                 stage_idx,
                 &mut src,
                 obj_runtime_slot,
@@ -7854,9 +7657,11 @@ fn dispatch_object_state_op(
                             &mut copied,
                             Some(slot),
                         );
+                        let embedded_tree = stage.embedded_tree;
                         duplicate_object_tree_backends_for_copy_with_layers(
                             ctx,
                             &mut *stage.rect_layers,
+                            embedded_tree,
                             stage_idx,
                             &mut copied,
                             slot,
@@ -8700,7 +8505,7 @@ fn dispatch_object_state_op(
             ctx.gfx.object_sprite_binding(stage_idx, obj_runtime_slot as i64)
         );
         if create_ok && obj.nested_runtime_slot.is_some() {
-            hide_embedded_gfx_backing(ctx, stage_idx, obj_runtime_slot);
+            hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, obj_runtime_slot);
         }
         obj.used = true;
         obj.backend = if create_ok {
@@ -8791,7 +8596,7 @@ fn dispatch_object_state_op(
                         );
                     }
                     if obj.nested_runtime_slot.is_some() {
-                        hide_embedded_gfx_backing(ctx, stage_idx, obj_runtime_slot);
+                        hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, obj_runtime_slot);
                     }
                     obj.set_int_prop(&ctx.ids, op, if b { 1 } else { 0 });
                 }
@@ -11912,7 +11717,7 @@ fn dispatch_object_state_op(
                 );
             }
             if create_ok && obj.nested_runtime_slot.is_some() {
-                hide_embedded_gfx_backing(ctx, stage_idx, obj_runtime_slot);
+                hide_embedded_gfx_backing(ctx, stage.embedded_tree, stage_idx, obj_runtime_slot);
             }
             obj.used = true;
             obj.backend = if create_ok {
@@ -12341,24 +12146,10 @@ fn dispatch_object_state_op(
             true
         }
         ObjectOpKind::Unknown => {
-            // Unhandled OBJECT elements must not abort the host process. The
-            // runtime already treats undispatchable element chains as
-            // "warn once, count, skip" (see the `unknown_forms` note in vm.rs);
-            // panicking here turned one unmodelled Rewrite+ element into a
-            // `panic in a function that cannot unwind` -> SIGABRT that killed
-            // the Android activity. The diagnostic that identifies the call
-            // site is captured by `capture_unknown_op_walk` from
-            // `dispatch_object_op`; it cannot run from here because
-            // `with_stage_state` has the stage form removed from
-            // `ctx.globals.stage_forms` for the whole dispatch.
-            if let Some(walked) = UNKNOWN_OP_WALK.with(|w| w.borrow_mut().take()) {
-                log::warn!("[SG_UNSUPPORTED_OBJECT_OP]{}", walked);
-            }
-            match ret_form {
-                Some(rf) => ctx.stack.push(default_for_ret_form(rf)),
-                None => ctx.stack.push(Value::Int(0)),
-            }
-            true
+            panic!(
+                "unsupported OBJECT op {} tail={:?} al_id={:?}",
+                op, tail, al_id
+            );
         }
         _ => false,
     }
